@@ -134,13 +134,33 @@ in design discussion and the design is worth keeping, but it is a later
 phase, contingent on the 4-device hub/Ethernet work above landing first —
 not something to build alongside it.
 
-**Scaffolded as its own library, not yet wired into this firmware**: local
-sibling project `../GAACE_Script` (not yet pushed to GitHub). The VM core,
-opcode encoding, and syscall boundary described below are implemented and
-tested there (native unit tests, plus example builds verified to succeed
-unmodified on both Teensy 4.1 and an Adafruit Feather M0/SAMD21).
-USBrepeater does not depend on it yet — that's the "not yet decided" list
-below.
+**Scaffolded as its own library, now wired into this firmware as a real
+(parallel) demo, not just an isolated example**: local sibling project
+`../GAACE_Script`, pushed to
+[GitHub](https://github.com/GordonAnderson/GAACE_Script). The VM core,
+opcode encoding, syscall boundary, and now a host-side compiler
+(`tools/gsc.py` — a small C-like language with variables, `if`/`else`,
+bounded `while`, and `var` declarations for state that persists across
+`vmRun()` calls) are implemented and tested there.
+
+**Real integration, running alongside `ADCThread` (Section 6b in
+`src/USBrepeater.cpp`)**: `gaace_scripts/adc_demo.gs` compiles to
+`include/ScriptBytecode.h` and runs on its own thread (`ScriptThread`),
+driving the actual downstream link (`userial`), the actual calibration
+fields (`AdcPin`/`AdcScaleM`/`AdcScaleB`/`AdcCmdName`), and the same
+guard/swallow state `ADCUpdate()` uses — via three syscalls (`link_ready`,
+`read_adc`, `scale_send`). Unlike `ADCUpdate()`'s unconditional every-tick
+send, the script only sends when the reading has moved more than a
+threshold since the last send, using a `var`-declared slot that persists
+across ticks. New commands: `?SCRIPTEN`, `GSCRIPTINT`/`SSCRIPTINT`,
+`GSCRIPTST`. Defaults off — this is a parallel demonstration, not a
+replacement; enabling it alongside `ADCEN` against the same downstream
+command would double-send. Verified: builds successfully for `teensy41`
+(GAACE_Script fetched from GitHub via `lib_deps`, same as `GAACE_Core`/
+`ArduinoThread`); the script's compiled bytecode was also dry-run against a
+simulated reading sequence through the real VM before being embedded, to
+confirm the threshold/persistence logic behaves as intended. Not yet tested
+on real hardware — no downstream device attached during this work.
 
 **Motivation**: today's `ADCThread` is a single fixed pattern (read ADC ->
 scale -> send one command to one device). With 4 persistently-connected
@@ -254,14 +274,27 @@ a new constraint.
       — the pattern `ArduinoThread`/`GAACE_Core` use for their hardware
       examples — did not reliably expose headers/sources to the `native`
       test env; the `lib/` symlink works uniformly for all environments)
-- [ ] Syscall table contents for USBrepeater specifically (which primitives:
-      send/read per device, ADC, settings, others?)
-- [ ] Script storage: RAM only, or persisted through `SAVE`/`RESTORE` too?
-- [ ] Host-side compiler: syntax design and implementation (Python tool,
-      most likely)
+- [x] Syscall table contents for USBrepeater specifically — decided and
+      implemented for the ADC demo (`link_ready`, `read_adc`, `scale_send`);
+      a different feature would still need its own table designed
+- [x] Host-side compiler — `tools/gsc.py` in `GAACE_Script`: variables,
+      `if`/`else`, bounded `while`, `var` declarations, syscall
+      declarations, bin/hex/carray output, a disassembler
+- [x] Push `GAACE_Script` to GitHub — done,
+      [github.com/GordonAnderson/GAACE_Script](https://github.com/GordonAnderson/GAACE_Script)
+- [ ] Script storage: still compile-time only (`gaace_scripts/adc_demo.gs`
+      -> `include/ScriptBytecode.h`, checked in, flashed with the firmware).
+      Runtime host-downloadable scripts (a `LOADPROG`-style command writing
+      bytecode into RAM/EEPROM instead of recompiling firmware) is still
+      undone — the current demo proves the VM/compiler/syscall pipeline
+      works, not the "download without reflashing" motivation from the
+      original design discussion
 - [ ] License for the new `GAACE_Script` repo — placeholder `MIT` in
       `library.json` for now; existing GAACE libraries aren't consistent
       (`GAACE_Core` is GPLv3, `ArduinoThread` is Public Domain), so this
       needs an actual decision, not just carrying the placeholder forward
-- [ ] Push `GAACE_Script` to GitHub (currently local-only at
-      `../GAACE_Script`) once ready to treat it as a real dependency
+- [ ] Real-hardware validation — the ADC demo (Section 6b) only builds
+      cleanly so far; no downstream device was attached during this work,
+      so the threshold/persistence logic is only verified by dry-running
+      the compiled bytecode through the VM against simulated readings, not
+      against a real downstream device

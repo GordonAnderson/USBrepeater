@@ -95,6 +95,9 @@ Data DefaultData =
   1.0f,           // AdcScaleM   — value = counts (identity scale) until calibrated
   0.0f,           // AdcScaleB
 
+  false,          // ScriptEnabled — off; see Section 6b, and the note on double-sending
+  1000,           // ScriptInterval — 1000 mS
+
   SIGNATURE       // Signature — always last
 };
 
@@ -134,6 +137,10 @@ void HousekeepingUpdate(void)
 // forward declaration is needed.
 Thread ADCThread = Thread();
 
+// ScriptUpdate — runs the GAACE_Script ADC demo. Implemented in Section 6b,
+// same wiring pattern as ADCThread above.
+Thread ScriptThread = Thread();
+
 // =============================================================================
 //  SECTION 4 — MODE DISPATCH TABLE
 // =============================================================================
@@ -169,6 +176,9 @@ static void cmdGetLink(void);
 static void cmdGetAdcInterval(void);
 static void cmdSetAdcInterval(void);
 static void cmdGetAdc(void);
+static void cmdGetScriptInterval(void);
+static void cmdSetScriptInterval(void);
+static void cmdGetScriptStatus(void);
 
 Command cmds[] =
 {
@@ -198,6 +208,15 @@ Command cmds[] =
   {"?ADCM",    CMDfloat,    -1, (void *)&data.AdcScaleM,   NULL, "ADC scale slope: value = M * counts + B"},
   {"?ADCB",    CMDfloat,    -1, (void *)&data.AdcScaleB,   NULL, "ADC scale offset: value = M * counts + B"},
   {"GADC",     CMDfunction,  0, (void *)cmdGetAdc,         NULL, "Read ADC now: raw counts and scaled value"},
+
+  // ── GAACE_Script ADC demo (Section 6b) ──────────────────────────────────
+  //  Runs gaace_scripts/adc_demo.gs on ScriptThread, alongside ADCThread.
+  //  Reuses ?ADCPIN/?ADCM/?ADCB/?ADCCMD above. Don't enable both this and
+  //  ADCEN against the same downstream command — they'd double-send.
+  {"?SCRIPTEN",   CMDbool,     -1, (void *)&data.ScriptEnabled, NULL, "GAACE_Script ADC-demo enabled, TRUE or FALSE"},
+  {"GSCRIPTINT",  CMDfunction, -1, (void *)cmdGetScriptInterval, NULL, "Get script update interval, mS"},
+  {"SSCRIPTINT",  CMDfunction, -1, (void *)cmdSetScriptInterval, NULL, "Set script update interval, mS"},
+  {"GSCRIPTST",   CMDfunction,  0, (void *)cmdGetScriptStatus,   NULL, "Last script vmRun() status code (1=halted OK)"},
 
   {NULL}  // Sentinel — must remain as the last entry
 };
@@ -292,6 +311,45 @@ static void cmdGetAdc(void)
   cp.print(counts);
   cp.print(",");
   cp.println(value);
+}
+
+// -----------------------------------------------------------------------------
+// GSCRIPTINT / SSCRIPTINT,<mS> — get/set the script update interval. Same
+// function-pair pattern as GADCINT/SADCINT, for the same reason (ScriptThread's
+// own interval needs updating too, which a plain CMDint field can't do).
+// -----------------------------------------------------------------------------
+static void cmdGetScriptInterval(void)
+{
+  if (!cp.checkExpectedArgs(0)) return;
+  cp.sendACK(false);
+  cp.println((uint32_t)data.ScriptInterval);
+}
+
+static void cmdSetScriptInterval(void)
+{
+  if (!cp.checkExpectedArgs(1)) return;
+
+  uint32_t ms;
+  if (!cp.getValue(&ms, 1, 3600000))   // 1 mS .. 1 hour
+  {
+    cp.sendNAK(ERR_BADARG);
+    return;
+  }
+
+  data.ScriptInterval = ms;
+  ScriptThread.setInterval((unsigned long)ms);
+  cp.sendACK();
+}
+
+// -----------------------------------------------------------------------------
+// GSCRIPTST — last vmRun() status from ScriptUpdate() (Section 6b). See
+// GAACEScript.h's Status enum: 1 = VM_HALTED (ran to completion normally).
+// -----------------------------------------------------------------------------
+static void cmdGetScriptStatus(void)
+{
+  extern uint8_t lastScriptStatus;  // defined in Section 6b
+  cp.sendACK(false);
+  cp.println((int)lastScriptStatus);
 }
 
 // =============================================================================
@@ -427,6 +485,85 @@ void ADCUpdate(void)
 }
 
 // =============================================================================
+//  SECTION 6b — GAACE_SCRIPT ADC DEMO
+// =============================================================================
+//
+//  Runs gaace_scripts/adc_demo.gs (compiled to include/ScriptBytecode.h — see
+//  that file's header for the regeneration command) on ScriptThread,
+//  alongside ADCThread. This is a real integration, not a standalone toy: the
+//  syscalls below drive the actual downstream link (userial), the actual
+//  calibration fields (AdcPin/AdcScaleM/AdcScaleB/AdcCmdName), and the same
+//  guard/swallow state (lastPcToDeviceMs/adcSwallowUntilMs) ADCUpdate() uses,
+//  so the two features can't collide with ordinary repeater traffic any
+//  differently than ADCUpdate() already doesn't.
+//
+//  This is a demonstration, not a replacement for ADCThread — the two do the
+//  same conceptual job (read the ADC, send a scaled value downstream), so
+//  data.ScriptEnabled defaults to off. Enabling both against the same
+//  downstream command would double-send. What the script demonstrates that
+//  ADCUpdate() doesn't: conditional logic living in the script instead of
+//  hardcoded in C++ — it only sends when the reading has moved more than a
+//  threshold since the last send, using a `var`-declared slot (see
+//  gaace_scripts/adc_demo.gs) that persists across ticks because ScriptUpdate()
+//  below only resets pc/sp between calls, not vmInit()'s full reset.
+//
+//  Syscall ids (must match vmRegisterSyscall() call order in setup(), and the
+//  `syscall NAME(...) = ID;` declarations in gaace_scripts/adc_demo.gs):
+//    0 = link_ready()      — userial connected AND quiet-guard elapsed
+//    1 = read_adc()         — analogRead(data.AdcPin)
+//    2 = scale_send(counts) — AdcScaleM*counts+AdcScaleB, sent downstream
+
+#include <GAACEScript.h>
+#include "ScriptBytecode.h"
+
+using namespace GAACEScript;
+
+static VM scriptVm;
+
+// Not static — read by GSCRIPTST (Section 5) via extern.
+uint8_t lastScriptStatus = 0;
+
+static int32_t sys_link_ready(int32_t *args, uint8_t argc)
+{
+  (void)args; (void)argc;
+  if (!(bool)userial) return 0;                                    // nothing connected
+  if ((millis() - lastPcToDeviceMs) < ADC_QUIET_GUARD_MS) return 0; // link busy
+  return 1;
+}
+
+static int32_t sys_read_adc(int32_t *args, uint8_t argc)
+{
+  (void)args; (void)argc;
+  return (int32_t)analogRead(data.AdcPin);
+}
+
+static int32_t sys_scale_send(int32_t *args, uint8_t argc)
+{
+  (void)argc;
+  float value = data.AdcScaleM * (float)args[0] + data.AdcScaleB;
+
+  char cmdLine[48];
+  int  len = snprintf(cmdLine, sizeof(cmdLine), "%s,%.3f\n", data.AdcCmdName, value);
+  if (len <= 0) return 0;
+  if (len >= (int)sizeof(cmdLine)) len = sizeof(cmdLine) - 1;  // truncated; still send what fits
+
+  userial.write((uint8_t *)cmdLine, len);
+  adcSwallowUntilMs = millis() + ADC_SWALLOW_WINDOW_MS;
+  return 1;
+}
+
+void ScriptUpdate(void)
+{
+  if (!data.ScriptEnabled) return;
+
+  // No vmInit() here — only pc/sp reset, so the script's `var prev` slot
+  // carries its value from one tick to the next.
+  scriptVm.pc = 0;
+  scriptVm.sp = 0;
+  lastScriptStatus = (uint8_t)vmRun(scriptVm, 500);
+}
+
+// =============================================================================
 //  SECTION 7 — SETTINGS PERSISTENCE (EEPROM)
 // =============================================================================
 
@@ -495,6 +632,16 @@ void setup()
   ADCThread.onRun(ADCUpdate);
   ADCThread.setInterval(data.AdcInterval);
   control.add(&ADCThread);
+
+  vmInit(scriptVm, scriptDemo, scriptDemo_len);
+  vmRegisterSyscall(scriptVm, sys_link_ready);   // id 0 — see Section 6b
+  vmRegisterSyscall(scriptVm, sys_read_adc);     // id 1
+  vmRegisterSyscall(scriptVm, sys_scale_send);   // id 2
+
+  ScriptThread.setName("ScriptUpdate");
+  ScriptThread.onRun(ScriptUpdate);
+  ScriptThread.setInterval(data.ScriptInterval);
+  control.add(&ScriptThread);
 
   // ── 5. Active mode ───────────────────────────────────────────────────────────
   modeTable[currentMode].setup();

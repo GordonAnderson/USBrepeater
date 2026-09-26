@@ -16,8 +16,8 @@
 // SIGNATURE is written into EEPROM so we can detect un-initialised storage.
 // Change this value if you ever change the layout of the Data struct — doing
 // so forces a reset to defaults on the next boot rather than reading garbage.
-// Bumped from 0xAA55A5A5 when the ADC-update fields were added below.
-#define SIGNATURE  0xAA55A5A6
+// Bumped from 0xAA55A5A6 when the script-demo fields were added below.
+#define SIGNATURE  0xAA55A5A7
 
 // ── Operating modes ───────────────────────────────────────────────────────
 //  Add new modes by appending to this enum (before NUM_MODES) and adding a
@@ -55,6 +55,15 @@ typedef struct
   float         AdcScaleM;      // value = AdcScaleM * counts + AdcScaleB
   float         AdcScaleB;
 
+  // ── GAACE_Script ADC demo (see USBrepeater.cpp Section 6b) ──────────────
+  //  Runs gaace_scripts/adc_demo.gs on its own thread, alongside ADCThread.
+  //  Reuses AdcPin/AdcScaleM/AdcScaleB/AdcCmdName above — it's the same
+  //  conceptual feature, demonstrated via script instead of hardcoded C++.
+  //  Defaults off: enabling both this and AdcEnabled against the same
+  //  downstream command would double-send.
+  bool          ScriptEnabled;  // Master enable, settable via SSCRIPTEN,TRUE|FALSE
+  uint32_t      ScriptInterval; // Update period in mS, settable via SSCRIPTINT
+
   unsigned int  Signature;      // Must equal SIGNATURE for the struct to be considered valid
 } Data;
 
@@ -66,3 +75,4 @@ void RepeaterModeSetup(void);
 void RepeaterModeLoop(void);
 
 void ADCUpdate(void);
+void ScriptUpdate(void);

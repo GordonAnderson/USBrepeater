@@ -92,6 +92,30 @@ Both are heuristics sized for short ASCII command/reply traffic, not a real
 bus-arbitration protocol — widen them if your downstream device replies
 slowly.
 
+### GAACE_Script ADC demo
+
+[GAACE_Script](https://github.com/GordonAnderson/GAACE_Script) — a minimal
+bytecode VM built alongside this project for host-downloadable control
+scripts (see [TODO.md](TODO.md) for the design discussion) — runs a real
+example on its own thread (`ScriptThread`/`ScriptUpdate()`), alongside
+`ADCThread`. It does the same conceptual job as the ADC feature above (read
+the ADC, send a scaled value downstream), but the decision of *when* to send
+lives in [gaace_scripts/adc_demo.gs](gaace_scripts/adc_demo.gs) instead of
+being hardcoded in C++: it only sends when the reading has moved more than a
+threshold since the last send, using a script-level variable that persists
+across ticks.
+
+This is a demonstration running in parallel, not a replacement — enabling
+both `SADCEN,TRUE` and `SSCRIPTEN,TRUE` against the same downstream command
+would double-send. It reuses the same `AdcPin`/`AdcScaleM`/`AdcScaleB`/
+`AdcCmdName` settings and the same guard/swallow state as `ADCUpdate()`.
+
+Editing the script requires recompiling it (see
+[gaace_scripts/adc_demo.gs](gaace_scripts/adc_demo.gs)'s header comment for
+the exact command) and committing the regenerated
+[include/ScriptBytecode.h](include/ScriptBytecode.h) — there's no build-time
+codegen step yet.
+
 ### Persistence
 
 Settings live in the `Data` struct (`include/USBrepeater.h`), saved to and
@@ -122,6 +146,9 @@ every registered command and its help string, `HELP,<cmd>` looks up one.
 | `GADCM` / `SADCM,<m>` | ADC scale slope |
 | `GADCB` / `SADCB,<b>` | ADC scale offset |
 | `GADC` | Read ADC now (raw counts + scaled value), no send |
+| `?SCRIPTEN` / `SSCRIPTEN,TRUE\|FALSE` | GAACE_Script ADC-demo enable (see below; don't combine with `ADCEN`) |
+| `GSCRIPTINT` / `SSCRIPTINT,<mS>` | Script update interval |
+| `GSCRIPTST` | Last script `vmRun()` status code (`1` = halted OK) |
 | `GCMDS` | List all commands and help strings |
 | `HELP,<cmd>` | Help for one command |
 | `TLIST` / `?TENA` / `?TINT` / `TTRIG` / `TDELAY` / `TSTOPALL` / `TSTARTALL` / `TREM` | Thread introspection/control (see GAACE_Core's `threadCommands`) |
@@ -133,7 +160,7 @@ pio run                # build
 pio run -t upload      # build and flash (upload_protocol = teensy-cli)
 ```
 
-Dependencies (`GAACE_Core`, `ArduinoThread`) are fetched automatically by
+Dependencies (`GAACE_Core`, `ArduinoThread`, `GAACE_Script`) are fetched automatically by
 PlatformIO from their GitHub repos per `platformio.ini`'s `lib_deps` — no
 manual vendoring required.
 
