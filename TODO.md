@@ -127,10 +127,10 @@ enough spare Teensy headroom to eventually run control algorithms against all
 - [ ] Confirm power budget / recommend a specific powered hub part in
       hardware docs once hardware is sourced
 
-## Future option (not committed): uLisp scripting layer
+## Future option (not committed): custom bytecode VM scripting layer
 
 **Not part of the settled design above.** Captured here because it came up
-in design discussion and the research is worth keeping, but it is a later
+in design discussion and the design is worth keeping, but it is a later
 phase, contingent on the 4-device hub/Ethernet work above landing first —
 not something to build alongside it.
 
@@ -139,56 +139,105 @@ scale -> send one command to one device). With 4 persistently-connected
 devices and per-device ring buffers already in place, the Teensy has real
 spare headroom to run actual host-downloaded control logic against multiple
 devices — conditionals, loops, math — instead of only ever the one hardcoded
-ADC-injection behavior. A small Lisp interpreter is one way to get that
-without shipping raw native machine code to the device (see below for why
-raw code download was rejected: no MPU/OS process isolation, so malformed
-downloaded machine code can corrupt or hang the whole device).
+ADC-injection behavior.
 
-**Library**: [uLisp](http://www.ulisp.com/), specifically
-[technoblogy/ulisp-arm](https://github.com/technoblogy/ulisp-arm) — its
-README explicitly lists Teensy 4.0/4.1 as a supported board, confirmed by
-downloading and inspecting `ulisp-arm.ino` directly.
+**Superseded direction: uLisp.** [uLisp](http://www.ulisp.com/)
+(`technoblogy/ulisp-arm`) was researched first and does run on Teensy 4.0/4.1
+(and, for what it's worth, already has ready-made support for common
+SAMD21/SAMD51 Arduino boards too). But its default Teensy 4.x heap
+(`WORKSPACESIZE 60000` objects x 8 bytes = ~469 KB) would overflow this
+project's primary RAM bank even after shrinking it, its GC introduces
+non-deterministic pauses that sit awkwardly next to this firmware's existing
+timing-sensitive guards (ADC quiet guard / swallow window), and it's a much
+bigger, more general piece of machinery than a fixed control-script use case
+actually needs. Decided against it in favor of a minimal custom VM, sized to
+exactly what's needed and small enough to be a reusable library rather than
+a per-project integration exercise.
 
-**RAM finding (checked against the actual source, not assumed)**: for
-`ARDUINO_TEENSY40`/`ARDUINO_TEENSY41`, uLisp defaults to
-`WORKSPACESIZE 60000` objects at 8 bytes each — a ~469 KB heap (`Workspace[]`
-array) — placed in the same default RAM bank as everything else on this
-board (the `MEMBANK` override to `DMAMEM` that other boards in the same file
-use is not enabled for Teensy 4.x). Added to this project's current ~135 KB
-usage in that same bank, the stock configuration would overflow it before
-counting ring buffers, Ethernet, or anything else. Two independent fixes,
-either or both:
-- Shrink `WORKSPACESIZE` — it's a compile-time `#define`; a control-script
-  use case (not general-purpose Lisp programs) likely only needs a few
-  thousand objects (e.g. 4,000-8,000 objects = 32-64 KB).
-- Relocate `Workspace[]` into Teensy 4.1's second, mostly-unused 512 KB RAM
-  bank via `#define MEMBANK DMAMEM` — the same pattern the file already uses
-  for other boards, just not wired up for Teensy 4.x by default.
+**Core design — a small stack machine, not an interpreter with a heap**:
 
-**Extending it with GAACE/device-specific functions**: uLisp's dispatch is a
-`tbl_entry_t *tables[] = {lookup_table, NULL};` — the built-in functions are
-`tables[0]`; the `NULL` second slot exists specifically so a project can
-plug in its own function table without editing uLisp's own source. Each
-custom function needs: a C function
-`object *fn_name(object *args, object *env)` that unpacks Lisp args and
-calls into existing GAACE code (e.g. send a command to `userialN`, read a
-device's ring buffer, read the ADC), a name string, a doc string, and one
-`tbl_entry_t` row referencing them (name, function pointer, packed min/max
-arg-count byte, doc pointer) — e.g. a `(send-dev n cmd)` function exposed to
-host-downloaded scripts. New primitives are added by appending rows to this
-project's own table, never touching uLisp's core file.
+```c
+struct VM {
+  int32_t stack[32];      // operand stack
+  int32_t vars[16];       // local variable slots
+  const uint8_t *code;    // script bytecode
+  uint16_t pc, sp;
+};
+```
 
-**Rough effort estimate** (from a standing start, after the 4-device
-hub/Ethernet design above is already implemented and working — not a
-guarantee, just a planning-level order of magnitude as of 2026-09-25):
-- Bare integration (vendor `ulisp-arm`, fix `WORKSPACESIZE`/`MEMBANK`,
-  confirm it builds and a basic script runs): ~1 day.
-- A useful set of GAACE-specific primitives (send/read per device, read ADC,
-  persistence hooks) plus a control-port command to load/store/run a script:
-  ~3-5 days.
-- Hardening/testing against real hardware and the existing timing-sensitive
-  guards (quiet guard / swallow window, cooperative `ThreadController`
-  scheduling): hard to size without the hardware in hand; budget at least a
-  few more days once the hub/Ethernet hardware exists to test against.
-- Total: roughly **1-2 weeks** of focused firmware work for a solid first
-  version, on top of (not overlapping) the settled 4-device design above.
+No dynamic allocation, no garbage collector — total footprint per running
+script is under ~1 KB, vs. uLisp's ~469 KB default heap. This is the "not a
+big footprint solution" requirement.
+
+**Opcode set** (~20 opcodes; `IF`/`WHILE` are not opcodes — they compile down
+to plain jumps, same as any real compiler's control-flow lowering):
+
+| Category | Opcodes |
+| --- | --- |
+| Stack | `PUSH_I32 <i32>`, `DUP`, `POP` |
+| Variables | `LOAD <slot>`, `STORE <slot>` |
+| Arithmetic | `ADD SUB MUL DIV MOD NEG` |
+| Compare | `EQ NE LT LE GT GE` (push 1/0) |
+| Logic | `AND OR NOT` |
+| Control flow | `JMP <offset>`, `JZ <offset>`, `JNZ <offset>` |
+| Extension | `CALL <syscall_id> <argc>`, `HALT` |
+
+Example lowering (confirms loop and if/then/else are covered, as required):
+
+```
+if (a > b) { send(0, X) } else { send(1, Y) }       while (cond) { body }
+---------------------------------------------        --------------------
+LOAD a                                                loop:
+LOAD b                                                  <cond>
+GT                                                      JZ  end
+JZ  else                                                <body>
+  <then body>                                           JMP loop
+  JMP end                                              end:
+else:
+  <else body>
+end:
+```
+
+**The syscall boundary — this is what makes it a reusable library, not a
+one-off**: `CALL` invokes a function pointer from a table the *embedding
+project* supplies, not anything the VM core knows about:
+
+```c
+typedef int32_t (*syscall_fn)(int32_t *args, uint8_t argc);
+```
+
+The VM core (opcode enum, `struct VM`, `vmRun()`) has zero hardware-specific
+code in it — no `Serial`, no `USBHost_t36`, no Teensy headers anywhere.
+USBrepeater registers its own syscall table (`read_adc`, `send_device`,
+`read_ring_buffer`, `get_setting`, `set_setting`, ...); a future SAM-based
+GAACE project would register a completely different table suited to its own
+hardware, against the identical VM core. Ship it as its own repo
+(`GAACE_Script` or similar) pulled in via `lib_deps`, exactly like
+`GAACE_Core`/`ArduinoThread` are shared across projects today.
+
+**Compiler lives on the host, not the device** — the Teensy only ever needs
+the ~20-opcode interpreter loop; there's no parser on-device. A small
+PC-side tool compiles a readable script into the bytecode array and sends it
+over the existing control port with a new command (e.g.
+`LOADPROG,<n>,<hexbytes>`) — the same ASCII-line transport already used for
+everything else.
+
+**Constraint carried over from the existing cooperative-threading design**:
+`vmRun()` must return promptly each time it's invoked (called periodically
+from a `Thread`, same as `ADCThread` today) — loops inside a script must be
+bounded (fixed iteration counts), not "loop forever." Same no-blocking
+discipline the rest of the codebase already follows for `ArduinoThread`, not
+a new constraint.
+
+### Open implementation details (not yet decided)
+
+- [ ] Full opcode encoding (fixed-width vs. variable-width instructions,
+      exact byte layout)
+- [ ] Number of variable slots / stack depth actually needed
+- [ ] Syscall table contents for USBrepeater specifically (which primitives:
+      send/read per device, ADC, settings, others?)
+- [ ] Script storage: RAM only, or persisted through `SAVE`/`RESTORE` too?
+- [ ] Host-side compiler: syntax design and implementation (Python tool,
+      most likely)
+- [ ] Repo/library structure and naming (`GAACE_Script`?) so it's reusable
+      by future SAM-based GAACE projects from day one, not retrofitted later
