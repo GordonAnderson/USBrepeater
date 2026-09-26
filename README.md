@@ -95,20 +95,27 @@ slowly.
 ### GAACE_Script ADC demo
 
 [GAACE_Script](https://github.com/GordonAnderson/GAACE_Script) — a minimal
-bytecode VM built alongside this project for host-downloadable control
-scripts (see [TODO.md](TODO.md) for the design discussion) — runs a real
-example on its own thread (`ScriptThread`/`ScriptUpdate()`), alongside
-`ADCThread`. It does the same conceptual job as the ADC feature above (read
-the ADC, send a scaled value downstream), but the decision of *when* to send
-lives in [gaace_scripts/adc_demo.gs](gaace_scripts/adc_demo.gs) instead of
-being hardcoded in C++: it only sends when the reading has moved more than a
+bytecode VM (plus a standard N-slot runtime, `GAACEScript::ScriptRuntime`)
+built alongside this project for host-downloadable control scripts (see
+[TODO.md](TODO.md) for the design discussion) — runs a real example in
+slot 0 ("Script0") of `scripts`, alongside `ADCThread`. It does the same
+conceptual job as the ADC feature above (read the ADC, send a scaled value
+downstream), but the decision of *when* to send lives in
+[gaace_scripts/adc_demo.gs](gaace_scripts/adc_demo.gs) instead of being
+hardcoded in C++: it only sends when the reading has moved more than a
 threshold since the last send, using a script-level variable that persists
 across ticks.
 
-This is a demonstration running in parallel, not a replacement — enabling
-both `SADCEN,TRUE` and `SSCRIPTEN,TRUE` against the same downstream command
-would double-send. It reuses the same `AdcPin`/`AdcScaleM`/`AdcScaleB`/
-`AdcCmdName` settings and the same guard/swallow state as `ADCUpdate()`.
+This is a demonstration running in parallel, not a replacement, so
+`Script0` starts **disabled**. Enable it with `STENA,Script0,TRUE` — but
+not at the same time as `ADCEN,TRUE` against the same downstream command,
+which would double-send. It reuses the same `AdcPin`/`AdcScaleM`/
+`AdcScaleB`/`AdcCmdName` settings and the same guard/swallow state as
+`ADCUpdate()`. Change its rate with `STINT,Script0,<mS>` — starting,
+stopping, and rate all come from GAACE_Core's `threadCommands`
+(`?TENA`/`?TINT`), not from anything specific to this feature; see
+[GAACE_Script's README](https://github.com/GordonAnderson/GAACE_Script)
+for why.
 
 Editing the script requires recompiling it (see
 [gaace_scripts/adc_demo.gs](gaace_scripts/adc_demo.gs)'s header comment for
@@ -146,12 +153,12 @@ every registered command and its help string, `HELP,<cmd>` looks up one.
 | `GADCM` / `SADCM,<m>` | ADC scale slope |
 | `GADCB` / `SADCB,<b>` | ADC scale offset |
 | `GADC` | Read ADC now (raw counts + scaled value), no send |
-| `?SCRIPTEN` / `SSCRIPTEN,TRUE\|FALSE` | GAACE_Script ADC-demo enable (see below; don't combine with `ADCEN`) |
-| `GSCRIPTINT` / `SSCRIPTINT,<mS>` | Script update interval |
-| `GSCRIPTST` | Last script `vmRun()` status code (`1` = halted OK) |
+| `SCRIPTLOAD,<slot>,<hex>` | Load a compiled script (`gsc.py --format hex`) into a `GAACE_Script` slot |
+| `GSCRIPTLIMITS` | `slots,maxCodeLen,stackSize,varSlots,maxSyscalls` for the script runtime |
+| `GSCRIPTST,<slot>` | `loaded(0\|1),lastStatus` for one script slot |
 | `GCMDS` | List all commands and help strings |
 | `HELP,<cmd>` | Help for one command |
-| `TLIST` / `?TENA` / `?TINT` / `TTRIG` / `TDELAY` / `TSTOPALL` / `TSTARTALL` / `TREM` | Thread introspection/control (see GAACE_Core's `threadCommands`) |
+| `TLIST` / `?TENA` / `?TINT` / `TTRIG` / `TDELAY` / `TSTOPALL` / `TSTARTALL` / `TREM` | Thread introspection/control (see GAACE_Core's `threadCommands`) — also how the ADC demo's `Script0` is started/stopped/re-timed: `?TENA,Script0,...` / `?TINT,Script0,...` |
 
 ## Building
 

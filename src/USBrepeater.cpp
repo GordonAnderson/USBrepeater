@@ -54,6 +54,7 @@
 #include <EEPROM.h>
 #include <USBHost_t36.h>
 #include <stdio.h>   // snprintf() — used by ADCUpdate() (Section 6a)
+#include <string.h>  // memcpy() — used by setup() to preload a default script
 
 //  GAACE_Core — command processor, ring buffer, arena allocator, error codes.
 //  Fetched by PlatformIO from https://github.com/GordonAnderson/GAACE_Core.git
@@ -71,6 +72,13 @@
 //  TSTARTALL, TREM, ...). Compiles to nothing unless GAACE_THREAD_CMDS is
 //  defined (see platformio.ini build_flags).
 #include <threadCommands.h>
+
+//  GAACE_Script — standard N-slot scripting runtime (Section 6b). Each slot
+//  is its own named Thread added to `control` below, so ?TENA/?TINT above
+//  already give start/stop/rate control per script; this module only adds
+//  SCRIPTLOAD/GSCRIPTLIMITS/GSCRIPTST. Fetched from
+//  https://github.com/GordonAnderson/GAACE_Script.git
+#include <GAACEScriptRuntime.h>
 
 // =============================================================================
 //  SECTION 2 — GLOBAL STATE
@@ -95,9 +103,6 @@ Data DefaultData =
   1.0f,           // AdcScaleM   — value = counts (identity scale) until calibrated
   0.0f,           // AdcScaleB
 
-  false,          // ScriptEnabled — off; see Section 6b, and the note on double-sending
-  1000,           // ScriptInterval — 1000 mS
-
   SIGNATURE       // Signature — always last
 };
 
@@ -119,6 +124,13 @@ ThreadController control;               // Root scheduler
 threadCommands   tcmds(&cp, &control);  // TLIST / ?TENA / ?TINT / ... over cp
 #endif
 
+// GAACE_Script runtime (Section 6b) — GAACE_SCRIPT_SLOTS slots (default 4),
+// each its own named Thread ("Script0".."Script<N-1>") added to `control`.
+// Must be declared after cp/control above (constructor takes their address
+// and calls control.add()); C++ constructs same-file globals in declaration
+// order, same as tcmds above.
+GAACEScript::ScriptRuntime scripts(&cp, &control);
+
 // Housekeeping — placeholder periodic thread for future low-frequency work
 // (link supervision, status polling, etc.). Currently a no-op: fill in
 // HousekeepingUpdate() when a real periodic task is needed. Kept slow (250 ms)
@@ -136,10 +148,6 @@ void HousekeepingUpdate(void)
 // setup() (Section 8), which comes after Section 6a in this file, so no
 // forward declaration is needed.
 Thread ADCThread = Thread();
-
-// ScriptUpdate — runs the GAACE_Script ADC demo. Implemented in Section 6b,
-// same wiring pattern as ADCThread above.
-Thread ScriptThread = Thread();
 
 // =============================================================================
 //  SECTION 4 — MODE DISPATCH TABLE
@@ -176,9 +184,6 @@ static void cmdGetLink(void);
 static void cmdGetAdcInterval(void);
 static void cmdSetAdcInterval(void);
 static void cmdGetAdc(void);
-static void cmdGetScriptInterval(void);
-static void cmdSetScriptInterval(void);
-static void cmdGetScriptStatus(void);
 
 Command cmds[] =
 {
@@ -210,13 +215,14 @@ Command cmds[] =
   {"GADC",     CMDfunction,  0, (void *)cmdGetAdc,         NULL, "Read ADC now: raw counts and scaled value"},
 
   // ── GAACE_Script ADC demo (Section 6b) ──────────────────────────────────
-  //  Runs gaace_scripts/adc_demo.gs on ScriptThread, alongside ADCThread.
-  //  Reuses ?ADCPIN/?ADCM/?ADCB/?ADCCMD above. Don't enable both this and
-  //  ADCEN against the same downstream command — they'd double-send.
-  {"?SCRIPTEN",   CMDbool,     -1, (void *)&data.ScriptEnabled, NULL, "GAACE_Script ADC-demo enabled, TRUE or FALSE"},
-  {"GSCRIPTINT",  CMDfunction, -1, (void *)cmdGetScriptInterval, NULL, "Get script update interval, mS"},
-  {"SSCRIPTINT",  CMDfunction, -1, (void *)cmdSetScriptInterval, NULL, "Set script update interval, mS"},
-  {"GSCRIPTST",   CMDfunction,  0, (void *)cmdGetScriptStatus,   NULL, "Last script vmRun() status code (1=halted OK)"},
+  //  SCRIPTLOAD/GSCRIPTLIMITS/GSCRIPTST come from GAACEScriptRuntime.h
+  //  (registered in setup() via cp.registerCommands(scripts.scriptCmdList())).
+  //  Starting/stopping the demo (slot "Script0") and changing its rate use
+  //  GAACE_Core's own threadCommands instead of a dedicated command here:
+  //  GTENA,Script0 / STENA,Script0,TRUE|FALSE and GTINT,Script0 /
+  //  STINT,Script0,<mS>. Reuses ?ADCPIN/?ADCM/?ADCB/?ADCCMD above. Don't
+  //  enable both Script0 and ADCEN against the same downstream command —
+  //  they'd double-send.
 
   {NULL}  // Sentinel — must remain as the last entry
 };
@@ -311,45 +317,6 @@ static void cmdGetAdc(void)
   cp.print(counts);
   cp.print(",");
   cp.println(value);
-}
-
-// -----------------------------------------------------------------------------
-// GSCRIPTINT / SSCRIPTINT,<mS> — get/set the script update interval. Same
-// function-pair pattern as GADCINT/SADCINT, for the same reason (ScriptThread's
-// own interval needs updating too, which a plain CMDint field can't do).
-// -----------------------------------------------------------------------------
-static void cmdGetScriptInterval(void)
-{
-  if (!cp.checkExpectedArgs(0)) return;
-  cp.sendACK(false);
-  cp.println((uint32_t)data.ScriptInterval);
-}
-
-static void cmdSetScriptInterval(void)
-{
-  if (!cp.checkExpectedArgs(1)) return;
-
-  uint32_t ms;
-  if (!cp.getValue(&ms, 1, 3600000))   // 1 mS .. 1 hour
-  {
-    cp.sendNAK(ERR_BADARG);
-    return;
-  }
-
-  data.ScriptInterval = ms;
-  ScriptThread.setInterval((unsigned long)ms);
-  cp.sendACK();
-}
-
-// -----------------------------------------------------------------------------
-// GSCRIPTST — last vmRun() status from ScriptUpdate() (Section 6b). See
-// GAACEScript.h's Status enum: 1 = VM_HALTED (ran to completion normally).
-// -----------------------------------------------------------------------------
-static void cmdGetScriptStatus(void)
-{
-  extern uint8_t lastScriptStatus;  // defined in Section 6b
-  cp.sendACK(false);
-  cp.println((int)lastScriptStatus);
 }
 
 // =============================================================================
@@ -489,39 +456,36 @@ void ADCUpdate(void)
 // =============================================================================
 //
 //  Runs gaace_scripts/adc_demo.gs (compiled to include/ScriptBytecode.h — see
-//  that file's header for the regeneration command) on ScriptThread,
-//  alongside ADCThread. This is a real integration, not a standalone toy: the
-//  syscalls below drive the actual downstream link (userial), the actual
-//  calibration fields (AdcPin/AdcScaleM/AdcScaleB/AdcCmdName), and the same
-//  guard/swallow state (lastPcToDeviceMs/adcSwallowUntilMs) ADCUpdate() uses,
-//  so the two features can't collide with ordinary repeater traffic any
-//  differently than ADCUpdate() already doesn't.
+//  that file's header for the regeneration command) in slot 0 of `scripts`
+//  (the GAACEScript::ScriptRuntime declared in Section 3), alongside
+//  ADCThread. This is a real integration, not a standalone toy: the syscalls
+//  below drive the actual downstream link (userial), the actual calibration
+//  fields (AdcPin/AdcScaleM/AdcScaleB/AdcCmdName), and the same guard/swallow
+//  state (lastPcToDeviceMs/adcSwallowUntilMs) ADCUpdate() uses, so the two
+//  features can't collide with ordinary repeater traffic any differently
+//  than ADCUpdate() already doesn't.
 //
 //  This is a demonstration, not a replacement for ADCThread — the two do the
 //  same conceptual job (read the ADC, send a scaled value downstream), so
-//  data.ScriptEnabled defaults to off. Enabling both against the same
-//  downstream command would double-send. What the script demonstrates that
+//  slot 0 ("Script0") starts disabled (see setup(), Section 8). Enabling it
+//  (STENA,Script0,TRUE) at the same time as ADCEN, against the same
+//  downstream command, would double-send. What the script demonstrates that
 //  ADCUpdate() doesn't: conditional logic living in the script instead of
 //  hardcoded in C++ — it only sends when the reading has moved more than a
 //  threshold since the last send, using a `var`-declared slot (see
-//  gaace_scripts/adc_demo.gs) that persists across ticks because ScriptUpdate()
-//  below only resets pc/sp between calls, not vmInit()'s full reset.
+//  gaace_scripts/adc_demo.gs) that persists across ticks because
+//  ScriptSlot::run() (GAACE_Script's runtime module) only resets pc/sp
+//  between calls, not vmInit()'s full reset.
 //
-//  Syscall ids (must match vmRegisterSyscall() call order in setup(), and the
-//  `syscall NAME(...) = ID;` declarations in gaace_scripts/adc_demo.gs):
+//  Syscall ids (must match scripts.registerSyscall() call order in setup(),
+//  and the `syscall NAME(...) = ID;` declarations in gaace_scripts/adc_demo.gs):
 //    0 = link_ready()      — userial connected AND quiet-guard elapsed
 //    1 = read_adc()         — analogRead(data.AdcPin)
 //    2 = scale_send(counts) — AdcScaleM*counts+AdcScaleB, sent downstream
 
-#include <GAACEScript.h>
 #include "ScriptBytecode.h"
 
 using namespace GAACEScript;
-
-static VM scriptVm;
-
-// Not static — read by GSCRIPTST (Section 5) via extern.
-uint8_t lastScriptStatus = 0;
 
 static int32_t sys_link_ready(int32_t *args, uint8_t argc)
 {
@@ -550,17 +514,6 @@ static int32_t sys_scale_send(int32_t *args, uint8_t argc)
   userial.write((uint8_t *)cmdLine, len);
   adcSwallowUntilMs = millis() + ADC_SWALLOW_WINDOW_MS;
   return 1;
-}
-
-void ScriptUpdate(void)
-{
-  if (!data.ScriptEnabled) return;
-
-  // No vmInit() here — only pc/sp reset, so the script's `var prev` slot
-  // carries its value from one tick to the next.
-  scriptVm.pc = 0;
-  scriptVm.sp = 0;
-  lastScriptStatus = (uint8_t)vmRun(scriptVm, 500);
 }
 
 // =============================================================================
@@ -619,10 +572,13 @@ void setup()
   // ── 3. Command registration ─────────────────────────────────────────────────
   cp.registerCommands(&cmdList);
   #if defined(GAACE_THREAD_CMDS)
-  cp.registerCommands(tcmds.threadCmdList());
+  cp.registerCommands(tcmds.threadCmdList());  // TLIST / ?TENA / ?TINT / ...
   #endif
+  cp.registerCommands(scripts.scriptCmdList()); // SCRIPTLOAD / GSCRIPTLIMITS / GSCRIPTST
 
   // ── 4. Thread scheduler ─────────────────────────────────────────────────────
+  //  scripts' own slot threads ("Script0".."Script<N-1>") were already added
+  //  to `control` by ScriptRuntime's constructor (Section 3).
   HousekeepingThread.setName("Housekeeping");
   HousekeepingThread.onRun(HousekeepingUpdate);
   HousekeepingThread.setInterval(250);   // ms between HousekeepingUpdate() calls
@@ -633,15 +589,19 @@ void setup()
   ADCThread.setInterval(data.AdcInterval);
   control.add(&ADCThread);
 
-  vmInit(scriptVm, scriptDemo, scriptDemo_len);
-  vmRegisterSyscall(scriptVm, sys_link_ready);   // id 0 — see Section 6b
-  vmRegisterSyscall(scriptVm, sys_read_adc);     // id 1
-  vmRegisterSyscall(scriptVm, sys_scale_send);   // id 2
+  // Preload the ADC demo (Section 6b) into slot 0, the same way a project
+  // preloads any default script: fill code[]/codeLen, vmInit(), loaded=true.
+  // Starts disabled -- see Section 6b for why (double-send risk with
+  // ADCThread); enable with STENA,Script0,TRUE once ready to compare them.
+  scripts.registerSyscall(sys_link_ready);   // id 0 — see Section 6b
+  scripts.registerSyscall(sys_read_adc);     // id 1
+  scripts.registerSyscall(sys_scale_send);   // id 2
 
-  ScriptThread.setName("ScriptUpdate");
-  ScriptThread.onRun(ScriptUpdate);
-  ScriptThread.setInterval(data.ScriptInterval);
-  control.add(&ScriptThread);
+  memcpy(scripts.slots[0].code, scriptDemo, scriptDemo_len);
+  scripts.slots[0].codeLen = scriptDemo_len;
+  vmInit(scripts.slots[0].vm, scripts.slots[0].code, scripts.slots[0].codeLen);
+  scripts.slots[0].loaded  = true;
+  scripts.slots[0].enabled = false;
 
   // ── 5. Active mode ───────────────────────────────────────────────────────────
   modeTable[currentMode].setup();

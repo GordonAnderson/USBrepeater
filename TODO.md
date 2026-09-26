@@ -138,29 +138,59 @@ not something to build alongside it.
 (parallel) demo, not just an isolated example**: local sibling project
 `../GAACE_Script`, pushed to
 [GitHub](https://github.com/GordonAnderson/GAACE_Script). The VM core,
-opcode encoding, syscall boundary, and now a host-side compiler
-(`tools/gsc.py` — a small C-like language with variables, `if`/`else`,
-bounded `while`, and `var` declarations for state that persists across
-`vmRun()` calls) are implemented and tested there.
+opcode encoding, syscall boundary, host-side compiler (`tools/gsc.py` —
+variables, `if`/`else`, bounded `while`, `var` declarations for state that
+persists across `vmRun()` calls), and a standardized N-slot runtime
+(`GAACEScript::ScriptRuntime`, see below) are implemented and tested there.
 
-**Real integration, running alongside `ADCThread` (Section 6b in
-`src/USBrepeater.cpp`)**: `gaace_scripts/adc_demo.gs` compiles to
-`include/ScriptBytecode.h` and runs on its own thread (`ScriptThread`),
-driving the actual downstream link (`userial`), the actual calibration
-fields (`AdcPin`/`AdcScaleM`/`AdcScaleB`/`AdcCmdName`), and the same
-guard/swallow state `ADCUpdate()` uses — via three syscalls (`link_ready`,
-`read_adc`, `scale_send`). Unlike `ADCUpdate()`'s unconditional every-tick
-send, the script only sends when the reading has moved more than a
-threshold since the last send, using a `var`-declared slot that persists
-across ticks. New commands: `?SCRIPTEN`, `GSCRIPTINT`/`SSCRIPTINT`,
-`GSCRIPTST`. Defaults off — this is a parallel demonstration, not a
-replacement; enabling it alongside `ADCEN` against the same downstream
-command would double-send. Verified: builds successfully for `teensy41`
-(GAACE_Script fetched from GitHub via `lib_deps`, same as `GAACE_Core`/
-`ArduinoThread`); the script's compiled bytecode was also dry-run against a
-simulated reading sequence through the real VM before being embedded, to
-confirm the threshold/persistence logic behaves as intended. Not yet tested
-on real hardware — no downstream device attached during this work.
+**Standardized runtime, not a one-off** — decided this should become the
+default way *any* GAACE project embeds scripting, not a per-project
+reinvention each time (see design discussion: N script slots and per-VM
+limits are per-project `#define`s with defaults, since resources vary
+system to system; starting/stopping a script and changing its rate reuse
+GAACE_Core's existing `threadCommands` rather than inventing new commands,
+because each script slot is just another named `Thread`; the only
+genuinely new commands are loading a script and querying limits/status).
+Implemented in `GAACE_Script` as `ScriptRuntime` (constructor takes
+`(&cp, &control)`, mirrors `threadCommands`'s own shape exactly):
+- `SCRIPTLOAD,<slot>,<hex>` / `GSCRIPTLIMITS` / `GSCRIPTST,<slot>` — the new
+  commands. Bytecode travels as hex over the existing ASCII line protocol
+  (`gsc.py --format hex` already produces exactly this).
+- `?TENA,Script<n>,...` / `?TINT,Script<n>,...` — start/stop/rate, free
+  from `threadCommands`, since each slot is a named `Thread`
+  ("Script0".."Script<N-1>") added to the project's `ThreadController`.
+- `GAACE_SCRIPT_SLOTS`, `GAACE_SCRIPT_MAX_CODE_LEN`,
+  `GAACE_SCRIPT_STACK_SIZE`, `GAACE_SCRIPT_VAR_SLOTS`,
+  `GAACE_SCRIPT_MAX_SYSCALLS` — the per-project defines, all with defaults.
+
+Found and fixed a real bug along the way: `commandProcessor::getValue(int*,
+ll, ul)` treats `ll==0 && ul==0` as "skip the range check" by convention,
+which would have silently disabled slot-index bounds checking whenever
+`GAACE_SCRIPT_SLOTS==1` — a very plausible configuration on a tight board.
+Both `SCRIPTLOAD` and `GSCRIPTST` validate the slot index explicitly
+instead of relying on that convention.
+
+**USBrepeater migrated onto it (Section 6b/8 in `src/USBrepeater.cpp`)**:
+`gaace_scripts/adc_demo.gs` (compiled to `include/ScriptBytecode.h`) is
+preloaded into slot 0 ("Script0") at boot, alongside `ADCThread`. The old
+bespoke `?SCRIPTEN`/`GSCRIPTINT`/`SSCRIPTINT`/`GSCRIPTST` commands and the
+hand-rolled `ScriptThread`/`scriptVm` are gone — replaced by the
+standardized commands above, net removing code rather than adding it. The
+three syscalls (`link_ready`, `read_adc`, `scale_send`) are unchanged: they
+still drive the real downstream link, calibration fields, and guard/swallow
+state `ADCUpdate()` uses. Slot 0 starts disabled (`Thread::enabled`, not a
+persisted `Data` field anymore — see the open item below); enable with
+`STENA,Script0,TRUE`. Not at the same time as `ADCEN,TRUE` against the same
+downstream command — still double-sends.
+
+Verified: builds successfully for `teensy41`; `GAACE_Script`'s own
+`ScriptRuntime` was proven to actually link (not dead-code-eliminated) by
+building its `BasicScript` example for both Teensy 4.1 and an Adafruit
+Feather M0 (SAMD21) with real memory-usage deltas. The demo script's
+compiled bytecode was dry-run against a simulated reading sequence through
+the real VM before being embedded, confirming the threshold/persistence
+logic behaves as intended. Not yet tested on real hardware — no downstream
+device attached during this work.
 
 **Motivation**: today's `ADCThread` is a single fixed pattern (read ADC ->
 scale -> send one command to one device). With 4 persistently-connected
@@ -282,13 +312,26 @@ a new constraint.
       declarations, bin/hex/carray output, a disassembler
 - [x] Push `GAACE_Script` to GitHub — done,
       [github.com/GordonAnderson/GAACE_Script](https://github.com/GordonAnderson/GAACE_Script)
-- [ ] Script storage: still compile-time only (`gaace_scripts/adc_demo.gs`
-      -> `include/ScriptBytecode.h`, checked in, flashed with the firmware).
-      Runtime host-downloadable scripts (a `LOADPROG`-style command writing
-      bytecode into RAM/EEPROM instead of recompiling firmware) is still
-      undone — the current demo proves the VM/compiler/syscall pipeline
-      works, not the "download without reflashing" motivation from the
-      original design discussion
+- [x] Runtime host-downloadable scripts — `SCRIPTLOAD,<slot>,<hex>` now
+      exists and works (RAM-only; see the still-open persistence item
+      below). USBrepeater's own ADC demo still preloads slot 0 at compile
+      time (`gaace_scripts/adc_demo.gs` -> `include/ScriptBytecode.h`)
+      rather than exercising `SCRIPTLOAD` live, but the capability itself —
+      the original "download without reflashing" motivation — is real now,
+      not just proposed
+- [x] Standard command set for load/start/stop/rate/limits, and whether N
+      and per-VM limits should be per-project defines — all decided and
+      implemented in `GAACE_Script`'s `ScriptRuntime` (see above): `N`
+      (`GAACE_SCRIPT_SLOTS`), max script size, stack/var/syscall counts are
+      all `#define`s with defaults; start/stop/rate reuse `threadCommands`
+      rather than adding new commands
+- [ ] Script *persistence* across reboot — still RAM-only. The
+      filesystem-based save/load/load-on-boot idea (for platforms that have
+      one, e.g. Teensy 4.1's LittleFS) is still just an idea, not built
+- [ ] A general "device just rebooted" notification — raised during design
+      discussion as a real gap (a host has no way to know a script's state
+      was lost to an unexpected reset), but it's a GAACE_Core-level concern
+      independent of scripting specifically, not started
 - [ ] License for the new `GAACE_Script` repo — placeholder `MIT` in
       `library.json` for now; existing GAACE libraries aren't consistent
       (`GAACE_Core` is GPLv3, `ArduinoThread` is Public Domain), so this
