@@ -134,6 +134,14 @@ in design discussion and the design is worth keeping, but it is a later
 phase, contingent on the 4-device hub/Ethernet work above landing first —
 not something to build alongside it.
 
+**Scaffolded as its own library, not yet wired into this firmware**: local
+sibling project `../GAACE_Script` (not yet pushed to GitHub). The VM core,
+opcode encoding, and syscall boundary described below are implemented and
+tested there (native unit tests, plus example builds verified to succeed
+unmodified on both Teensy 4.1 and an Adafruit Feather M0/SAMD21).
+USBrepeater does not depend on it yet — that's the "not yet decided" list
+below.
+
 **Motivation**: today's `ADCThread` is a single fixed pattern (read ADC ->
 scale -> send one command to one device). With 4 persistently-connected
 devices and per-device ring buffers already in place, the Teensy has real
@@ -231,13 +239,29 @@ a new constraint.
 
 ### Open implementation details (not yet decided)
 
-- [ ] Full opcode encoding (fixed-width vs. variable-width instructions,
-      exact byte layout)
-- [ ] Number of variable slots / stack depth actually needed
+- [x] Full opcode encoding — settled in `GAACE_Script`: 1 opcode byte +
+      little-endian operand bytes (`PUSH_I32`=5B, `LOAD`/`STORE`=2B,
+      `JMP`/`JZ`/`JNZ`=3B absolute target, `CALL`=3B, everything else 1B)
+- [x] Number of variable slots / stack depth — 16 vars, 32-deep operand
+      stack in the current scaffold; revisit only if a real script needs
+      more
+- [x] Repo/library structure and naming — `GAACE_Script`, laid out like
+      `GAACE_Core`/`ArduinoThread` (`library.json` + `src/` at repo root),
+      plus `examples/`, `test/test_vm/` (native Unity tests), and a
+      `lib/GAACE_Script_core -> ../src` symlink so PlatformIO's Library
+      Dependency Finder picks up the core under every environment,
+      including `native` (a self-referential `lib_deps = symlink://.`
+      — the pattern `ArduinoThread`/`GAACE_Core` use for their hardware
+      examples — did not reliably expose headers/sources to the `native`
+      test env; the `lib/` symlink works uniformly for all environments)
 - [ ] Syscall table contents for USBrepeater specifically (which primitives:
       send/read per device, ADC, settings, others?)
 - [ ] Script storage: RAM only, or persisted through `SAVE`/`RESTORE` too?
 - [ ] Host-side compiler: syntax design and implementation (Python tool,
       most likely)
-- [ ] Repo/library structure and naming (`GAACE_Script`?) so it's reusable
-      by future SAM-based GAACE projects from day one, not retrofitted later
+- [ ] License for the new `GAACE_Script` repo — placeholder `MIT` in
+      `library.json` for now; existing GAACE libraries aren't consistent
+      (`GAACE_Core` is GPLv3, `ArduinoThread` is Public Domain), so this
+      needs an actual decision, not just carrying the placeholder forward
+- [ ] Push `GAACE_Script` to GitHub (currently local-only at
+      `../GAACE_Script`) once ready to treat it as a real dependency
