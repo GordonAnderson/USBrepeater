@@ -74,9 +74,25 @@ command — independent of the active mode, so it keeps running during REPEATER
 mode:
 
 ```
-scaledValue = AdcScaleM * analogRead(AdcPin) + AdcScaleB
+counts      = readAdcCounts(AdcPin)   // 12-bit, hardware + software averaged
+scaledValue = AdcScaleM * counts + AdcScaleB
 downstream device <- "<AdcCmdName>,<scaledValue>\n"
 ```
+
+`readAdcCounts()` (`src/USBrepeater.cpp`, Section 5) is the single point of
+truth for reading the ADC: 12-bit resolution and 32x hardware oversampling
+(`analogReadResolution()`/`analogReadAveraging()`, configured once in
+`setup()`), plus a 16-sample software average on top — all three tunable
+via `#define`s (`ADC_RESOLUTION_BITS`/`ADC_HW_AVERAGING`/`ADC_SW_SAMPLES`).
+Every reader — `ADCUpdate()`, `GADC`, and the script `read_adc()` syscall —
+goes through it, so there's exactly one averaging behavior to reason about.
+
+**Upgrading from an older build**: earlier firmware read the ADC at
+Teensy's default 10-bit resolution (0–1023 counts) with no averaging at
+all. The same physical input now reads roughly **4x higher** in raw counts
+at 12-bit resolution (0–4095) — any `AdcScaleM`/`AdcScaleB` calibrated and
+saved under that older firmware is 4x off and needs recalibrating, not
+just reusing as-is.
 
 Because this writes to the same link the repeater pumps PC<->device traffic
 over, two guards keep it from colliding with ordinary passthrough traffic
@@ -102,9 +118,10 @@ slot 0 ("Script0") of `scripts`, alongside `ADCThread`. It does the same
 conceptual job as the ADC feature above (read the ADC, send a scaled value
 downstream), but the decision of *when* to send lives in
 [gaace_scripts/adc_demo.gs](gaace_scripts/adc_demo.gs) instead of being
-hardcoded in C++: it only sends when the reading has moved more than a
-threshold since the last send, using a script-level variable that persists
-across ticks.
+hardcoded in C++: it only sends when the reading has moved more than 20 raw
+counts since the last send (20, not the original 5, because the ADC read
+is now 12-bit instead of 10-bit — see above), using a script-level variable
+that persists across ticks.
 
 This is a demonstration running in parallel, not a replacement, so
 `Script0` starts **disabled**. Enable it with `STENA,Script0,TRUE` — but
@@ -152,7 +169,7 @@ every registered command and its help string, `HELP,<cmd>` looks up one.
 | `GADCCMD` / `SADCCMD,<name>` | Command name sent to the downstream device |
 | `GADCM` / `SADCM,<m>` | ADC scale slope |
 | `GADCB` / `SADCB,<b>` | ADC scale offset |
-| `GADC` | Read ADC now (raw counts + scaled value), no send |
+| `GADC` | Read ADC now: averaged counts (2 decimals) + scaled value (4 decimals), no send |
 | `SCRIPTLOAD,<slot>,<hex>` | Load a compiled script (`gsc.py --format hex`) into a `GAACE_Script` slot |
 | `GSCRIPTLIMITS` | `slots,maxCodeLen,stackSize,varSlots,maxSyscalls` for the script runtime |
 | `GSCRIPTST,<slot>` | `loaded(0\|1),lastStatus` for one script slot |

@@ -55,6 +55,7 @@
 #include <USBHost_t36.h>
 #include <stdio.h>   // snprintf() — used by ADCUpdate() (Section 6a)
 #include <string.h>  // memcpy() — used by setup() to preload a default script
+#include <math.h>    // lroundf() — used by sys_read_adc() (Section 6b)
 
 //  GAACE_Core — command processor, ring buffer, arena allocator, error codes.
 //  Fetched by PlatformIO from https://github.com/GordonAnderson/GAACE_Core.git
@@ -107,7 +108,7 @@ Data DefaultData =
 };
 
 // Version string returned by the GVER command.
-const char *Version = "USBrepeater, version 1.0 Sept 24, 2026";
+const char *Version = "USBrepeater, version 1.1 Sept 27, 2026";
 
 // Currently active mode. Mirrors data.Mode but kept as a separate runtime
 // variable so a mode change can be applied live without requiring SAVE.
@@ -212,7 +213,7 @@ Command cmds[] =
   {"?ADCCMD",  CMDstr,      -1, (void *)&data.AdcCmdName,  NULL, "Command name sent to the downstream device"},
   {"?ADCM",    CMDfloat,    -1, (void *)&data.AdcScaleM,   NULL, "ADC scale slope: value = M * counts + B"},
   {"?ADCB",    CMDfloat,    -1, (void *)&data.AdcScaleB,   NULL, "ADC scale offset: value = M * counts + B"},
-  {"GADC",     CMDfunction,  0, (void *)cmdGetAdc,         NULL, "Read ADC now: raw counts and scaled value"},
+  {"GADC",     CMDfunction,  0, (void *)cmdGetAdc,         NULL, "Read ADC now: averaged counts (2dp) and scaled value (4dp)"},
 
   // ── GAACE_Script ADC demo (Section 6b) ──────────────────────────────────
   //  SCRIPTLOAD/GSCRIPTLIMITS/GSCRIPTST come from GAACEScriptRuntime.h
@@ -303,20 +304,55 @@ static void cmdSetAdcInterval(void)
 }
 
 // -----------------------------------------------------------------------------
-// GADC — read the ADC pin right now and report both the raw counts and the
-// scaled value, without waiting for the next ADCThread cycle or sending
+// readAdcCounts — single point of truth for reading the ADC, per the
+// carrier-board design guide §5.6.2. Hardware oversampling
+// (analogReadAveraging(), configured once in setup() alongside
+// analogReadResolution()) plus a software average on top smooths out noise
+// further than either alone. Every reader — ADCUpdate(), GADC, and the
+// script read_adc() syscall — goes through this, so there's exactly one
+// averaging behavior to reason about. Returns counts as a float (not
+// rounded) so AdcScaleM*counts+AdcScaleB keeps full precision; a caller
+// that needs an integer (sys_read_adc(), Section 6b — the VM is int32)
+// rounds it itself.
+//
+// NOTE: this runs at 12-bit resolution (0-4095 counts). Earlier builds read
+// the ADC at Teensy's default 10-bit resolution (0-1023) with no averaging
+// at all — the same physical input now reads ~4x higher in raw counts, so
+// any AdcScaleM/AdcScaleB calibrated and saved under that older firmware is
+// 4x off until recalibrated, not just reusable as-is.
+//
+// Tuning values below are #defines, not hardcoded in the function body, so
+// they can be adjusted without touching the averaging logic itself.
+// -----------------------------------------------------------------------------
+#define ADC_RESOLUTION_BITS  12   // analogReadResolution() — 0..4095 counts
+#define ADC_HW_AVERAGING     32   // analogReadAveraging() — hardware oversampling
+#define ADC_SW_SAMPLES       16   // additional software average on top of the above
+
+static float readAdcCounts(void)
+{
+  uint32_t sum = 0;
+  for (uint8_t i = 0; i < ADC_SW_SAMPLES; i++)
+  {
+    sum += analogRead(data.AdcPin);
+  }
+  return (float)sum / (float)ADC_SW_SAMPLES;
+}
+
+// -----------------------------------------------------------------------------
+// GADC — read the ADC pin right now and report both the averaged counts and
+// the scaled value, without waiting for the next ADCThread cycle or sending
 // anything to the downstream device. Useful for checking AdcScaleM/AdcScaleB
 // before enabling ADCEN.
 // -----------------------------------------------------------------------------
 static void cmdGetAdc(void)
 {
-  int   counts = analogRead(data.AdcPin);
-  float value  = data.AdcScaleM * (float)counts + data.AdcScaleB;
+  float counts = readAdcCounts();
+  float value  = data.AdcScaleM * counts + data.AdcScaleB;
 
   cp.sendACK(false);
-  cp.print(counts);
+  cp.print(counts, 2);
   cp.print(",");
-  cp.println(value);
+  cp.println(value, 4);
 }
 
 // =============================================================================
@@ -439,8 +475,8 @@ void ADCUpdate(void)
 
   if ((millis() - lastPcToDeviceMs) < ADC_QUIET_GUARD_MS) return;  // link busy, try next cycle
 
-  int   counts = analogRead(data.AdcPin);
-  float value  = data.AdcScaleM * (float)counts + data.AdcScaleB;
+  float counts = readAdcCounts();
+  float value  = data.AdcScaleM * counts + data.AdcScaleB;
 
   char cmdLine[48];
   int  len = snprintf(cmdLine, sizeof(cmdLine), "%s,%.3f\n", data.AdcCmdName, value);
@@ -480,7 +516,9 @@ void ADCUpdate(void)
 //  Syscall ids (must match scripts.registerSyscall() call order in setup(),
 //  and the `syscall NAME(...) = ID;` declarations in gaace_scripts/adc_demo.gs):
 //    0 = link_ready()      — userial connected AND quiet-guard elapsed
-//    1 = read_adc()         — analogRead(data.AdcPin)
+//    1 = read_adc()         — readAdcCounts() rounded to int32 via lroundf()
+//                             (the VM is int32-only; see readAdcCounts()'s
+//                             own comment in Section 5 for the averaging)
 //    2 = scale_send(counts) — AdcScaleM*counts+AdcScaleB, sent downstream
 
 #include "ScriptBytecode.h"
@@ -498,7 +536,7 @@ static int32_t sys_link_ready(int32_t *args, uint8_t argc)
 static int32_t sys_read_adc(int32_t *args, uint8_t argc)
 {
   (void)args; (void)argc;
-  return (int32_t)analogRead(data.AdcPin);
+  return lroundf(readAdcCounts());
 }
 
 static int32_t sys_scale_send(int32_t *args, uint8_t argc)
@@ -563,20 +601,27 @@ void setup()
   currentMode = data.Mode;
   if (currentMode >= NUM_MODES) currentMode = MODE_REPEATER;
 
-  // ── 2. Command / control USB port ───────────────────────────────────────────
+  // ── 2. ADC hardware configuration ───────────────────────────────────────────
+  //  Once, here — not per-read. See readAdcCounts() (Section 5) for the full
+  //  averaging story (hardware oversampling here, plus a software average on
+  //  top in readAdcCounts() itself) and the 10-bit-vs-12-bit calibration note.
+  analogReadResolution(ADC_RESOLUTION_BITS);
+  analogReadAveraging(ADC_HW_AVERAGING);
+
+  // ── 3. Command / control USB port ───────────────────────────────────────────
   //  Kept separate from Serial (see the port-layout note at the top of this
   //  file) so the two never collide.
   SerialUSB1.begin(115200);
   cp.registerStream(&SerialUSB1);
 
-  // ── 3. Command registration ─────────────────────────────────────────────────
+  // ── 4. Command registration ─────────────────────────────────────────────────
   cp.registerCommands(&cmdList);
   #if defined(GAACE_THREAD_CMDS)
   cp.registerCommands(tcmds.threadCmdList());  // TLIST / ?TENA / ?TINT / ...
   #endif
   cp.registerCommands(scripts.scriptCmdList()); // SCRIPTLOAD / GSCRIPTLIMITS / GSCRIPTST
 
-  // ── 4. Thread scheduler ─────────────────────────────────────────────────────
+  // ── 5. Thread scheduler ─────────────────────────────────────────────────────
   //  scripts' own slot threads ("Script0".."Script<N-1>") were already added
   //  to `control` by ScriptRuntime's constructor (Section 3).
   HousekeepingThread.setName("Housekeeping");
@@ -603,7 +648,7 @@ void setup()
   scripts.slots[0].loaded  = true;
   scripts.slots[0].enabled = false;
 
-  // ── 5. Active mode ───────────────────────────────────────────────────────────
+  // ── 6. Active mode ───────────────────────────────────────────────────────────
   modeTable[currentMode].setup();
 }
 
