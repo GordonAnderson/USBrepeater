@@ -36,9 +36,10 @@ settings without ever touching the data stream.
 
 The USB Manufacturer string (`GAA Custom Electronics, LLC`) and Product string
 (`USBrepeater`) are shared by both ports — see
-[scripts/patch_usb_desc.py](scripts/patch_usb_desc.py) for why (Teensyduino's
-`USB_DUAL_SERIAL` descriptor has one Manufacturer/Product string for the whole
-composite device, not one per port) and how it's applied at build time.
+`board_vendor` / `board_build.usb_product` in `platformio.ini` and
+[scripts/usb_name.py](scripts/usb_name.py) (Teensyduino's `USB_DUAL_SERIAL`
+descriptor has one Manufacturer/Product string for the whole composite device,
+not one per port; the script applies the values to the Teensy core at build time).
 
 ## Architecture
 
