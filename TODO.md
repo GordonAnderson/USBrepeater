@@ -34,13 +34,28 @@ button to force HalfKay bootloader mode before uploading, which then
 succeeded reliably. Documented in the README's Building section. Not
 investigated further (cable/hub-side, not a firmware issue).
 
-- [ ] TCP reachability for `EthCtrlPort`/`EthDataPort` — not yet confirmed.
-      Blocked by the dev machine's own LAN routing (its Ethernet interface
-      had a stale link-local address, no route to the Teensy's
-      `192.168.68.0/24` DHCP lease), not by anything on the device side.
-      Retry once a machine with an actual route to that subnet is available.
-- [ ] Passthrough to a real downstream device — not yet tested; none was
-      connected during this session (`GLINK` correctly reported `FALSE`).
+**Full end-to-end validation (2026-10-06)**: both items above are now
+resolved — a real downstream MIPS device was connected and a second machine
+with an actual route to the Teensy's subnet was available. All four paths
+confirmed on real hardware in one session:
+
+- [x] USB passthrough — `GVER` sent into `Serial` was relayed to the MIPS
+      device over `userial`; its reply (`Version 1.267,Sept 1,2026`) came
+      back correctly.
+- [x] TCP control port (`EthCtrlPort`) — `GVER` over TCP got the identical
+      `commandProcessor` response as `SerialUSB1`.
+- [x] TCP passthrough port (`EthDataPort`) — `GVER` over TCP was relayed to
+      the same MIPS device and its reply came back over that TCP
+      connection — the Ethernet-to-serial-converter use case this was
+      built for, confirmed working.
+- [x] Reply routing (`pcSide`, "last speaker wins") — switches correctly in
+      both directions: after the Ethernet test, a follow-up USB request
+      correctly got its reply back on USB, not the (by then closed)
+      Ethernet connection.
+
+Nothing left unverified from the original single-device design discussion.
+Remaining open work in this file is specifically the multi-device
+generalization (per-device ring buffers, `SDEV`, one TCP port per device).
 
 ## Settled design: 4 downstream devices via hub + Ethernet
 

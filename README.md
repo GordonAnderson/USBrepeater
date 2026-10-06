@@ -72,16 +72,30 @@ always reflects live state (link up/down, DHCP vs. static, current IP,
 whether each TCP port has a connected client) regardless of pending config
 changes.
 
-**Hardware status (verified 2026-10-05)**: tested on real hardware with the
-magjack installed — `GETHSTAT` reported `LINKUP,DHCP,192.168.68.61,FALSE,FALSE`
-after boot, confirming link detection, DHCP, and `Ethernet.begin()` all work
-as implemented, with no crash anywhere in setup() (GAACE_Script's preload and
-EthernetSetup() both survived first contact with real silicon). `GVER`/
-`GLINK`/`GBAUD`/`GSCRIPTST,0` all round-tripped correctly over `SerialUSB1`
-in the same session. **Not yet verified**: a TCP client actually reaching
-`EthCtrlPort`/`EthDataPort` (blocked by the test machine's own LAN routing,
-not a device issue — see TODO.md) and passthrough to a real downstream
-device (none was connected during this test).
+**Hardware status (fully verified 2026-10-06)**: tested end-to-end on real
+hardware with the magjack installed, a real downstream MIPS device attached,
+and a second machine actually reachable on the Teensy's network:
+
+- Link detection, DHCP lease acquisition, and `setup()` completing without a
+  crash (confirmed 2026-10-05 — `GAACE_Script`'s preload and
+  `EthernetSetup()` both survived first contact with real silicon).
+- **USB passthrough**: `GVER` sent into `Serial` was relayed to the
+  downstream MIPS device over `userial` and its reply (`Version
+  1.267,Sept 1,2026`) came back correctly.
+- **TCP control port** (`EthCtrlPort`): `GVER` over a plain TCP connection
+  got the same `commandProcessor` response as `SerialUSB1` — the
+  Stream-based design works exactly as intended, no special-casing needed.
+- **TCP passthrough port** (`EthDataPort`): `GVER` sent over TCP was
+  relayed to the same downstream device and its reply came back over that
+  TCP connection, confirming the Ethernet-to-serial-converter use case this
+  was built for.
+- **Reply routing (`pcSide`, "last speaker wins")**: after the Ethernet
+  passthrough test, a follow-up USB request correctly got its reply back on
+  USB, not on the now-closed Ethernet connection — the arbitration switches
+  cleanly in both directions, not just once.
+
+Nothing left unverified from the original design discussion for a single
+downstream device.
 
 **Licensing**: QNEthernet is AGPL-3.0-or-later, unlike `GAACE_Core` (GPLv3)
 or `ArduinoThread` (Public Domain) — AGPL carries network-use
