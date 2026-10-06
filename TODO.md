@@ -3,9 +3,44 @@
 Design notes and open decisions for planned USBrepeater features. The
 architecture below (4-device hub + Ethernet) is a **settled design as of
 2026-09-25** — captured from design discussion so implementation can start
-without re-deriving the reasoning. Not implemented yet: blocked on sourcing
-the hardware (4-port hub, Ethernet magjack module). The current single-device
-build works as-is and remains usable for testing in the meantime.
+without re-deriving the reasoning.
+
+**Status update (2026-10-05)**: the Ethernet *half* of this design is now
+implemented for the current single downstream device — see
+`src/USBrepeater.cpp` Section 6c and the README's Ethernet section. That
+covers: QNEthernet bring-up (DHCP or static), a control-port TCP server
+mirroring `SerialUSB1`, a data-port TCP server as a second passthrough
+source, "last speaker wins" reply routing shared with `Serial` via `pcSide`,
+and `GBAUD`/`SBAUD` for the baud-rate gap called out below. **Not yet
+implemented**: the 4-device hub expansion itself (still blocked on sourcing
+the 4-port hub) and everything below that's specifically about *multiple*
+devices — per-device ring buffers, `SDEV` USB switching, one TCP port per
+device instead of the single pair that exists now.
+
+**Real-hardware validation (2026-10-05)**: tested on the actual Teensy 4.1
+with the magjack installed. Confirmed working: link detection, DHCP lease
+acquisition (`GETHSTAT` -> `LINKUP,DHCP,192.168.68.61,FALSE,FALSE`), and —
+just as importantly — `setup()` completing without a crash on first contact
+with real silicon (this was the real risk; `EthernetSetup()` and
+`GAACE_Script`'s slot-0 preload had only ever been build-verified before
+this). `GVER`/`GLINK`/`GBAUD`/`GSCRIPTST,0` all round-tripped correctly over
+`SerialUSB1` in the same session.
+
+Found one real, unrelated hardware/workflow issue along the way:
+`pio run -t upload` intermittently failed to find the board automatically
+(timeout, then one "error writing to Teensy" mid-programming on this dev
+machine/cable) — resolved by manually double-tapping the Teensy's reset
+button to force HalfKay bootloader mode before uploading, which then
+succeeded reliably. Documented in the README's Building section. Not
+investigated further (cable/hub-side, not a firmware issue).
+
+- [ ] TCP reachability for `EthCtrlPort`/`EthDataPort` — not yet confirmed.
+      Blocked by the dev machine's own LAN routing (its Ethernet interface
+      had a stale link-local address, no route to the Teensy's
+      `192.168.68.0/24` DHCP lease), not by anything on the device side.
+      Retry once a machine with an actual route to that subnet is available.
+- [ ] Passthrough to a real downstream device — not yet tested; none was
+      connected during this session (`GLINK` correctly reported `FALSE`).
 
 ## Settled design: 4 downstream devices via hub + Ethernet
 
@@ -13,6 +48,14 @@ build works as-is and remains usable for testing in the meantime.
 Teensy's host port, reachable from the PC over both USB and Ethernet, with
 enough spare Teensy headroom to eventually run control algorithms against all
 4 devices — not just the current single-device ADC-injection feature.
+
+**Note**: the Ethernet mechanics described below (QNEthernet, Stream-based
+`cp.registerStream()`, last-speaker-wins reply routing, the baud-rate gap)
+are no longer purely prospective — they're implemented for one device today
+(see the status update above). What's left here is specifically the
+multi-device generalization: one TCP port *per device* instead of today's
+single data port, and the USB-side `SDEV` switching since USB can't give
+every device its own port the way Ethernet can.
 
 ### Device (downstream) side
 
@@ -336,8 +379,11 @@ a new constraint.
       `library.json` for now; existing GAACE libraries aren't consistent
       (`GAACE_Core` is GPLv3, `ArduinoThread` is Public Domain), so this
       needs an actual decision, not just carrying the placeholder forward
-- [ ] Real-hardware validation — the ADC demo (Section 6b) only builds
-      cleanly so far; no downstream device was attached during this work,
-      so the threshold/persistence logic is only verified by dry-running
-      the compiled bytecode through the VM against simulated readings, not
-      against a real downstream device
+- [ ] Real-hardware validation against an actual downstream device — on
+      2026-10-05, slot 0 was confirmed loaded and alive on real Teensy 4.1
+      hardware (`GSCRIPTST,0` -> `TRUE,0`), which is further than the
+      dry-run-only verification this item originally described. Still not
+      tested with the script actually enabled and sending to a real
+      downstream device — none was connected during that session — so the
+      threshold/persistence logic itself remains dry-run-verified only, not
+      hardware-verified.

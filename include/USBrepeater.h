@@ -16,10 +16,8 @@
 // SIGNATURE is written into EEPROM so we can detect un-initialised storage.
 // Change this value if you ever change the layout of the Data struct — doing
 // so forces a reset to defaults on the next boot rather than reading garbage.
-// Bumped from 0xAA55A5A7 when ScriptEnabled/ScriptInterval were removed
-// below (superseded by GAACEScript::ScriptRuntime's own Thread::enabled and
-// GTINT/STINT,Script0 — see USBrepeater.cpp Section 6b/8).
-#define SIGNATURE  0xAA55A5A8
+// Bumped from 0xAA55A5A8 when the Ethernet config fields were added below.
+#define SIGNATURE  0xAA55A5A9
 
 // ── Operating modes ───────────────────────────────────────────────────────
 //  Add new modes by appending to this enum (before NUM_MODES) and adding a
@@ -62,6 +60,21 @@ typedef struct
   // ScriptRuntime's own Thread::enabled and interval for slot "Script0"
   // (GTENA/STENA,Script0 and GTINT/STINT,Script0) rather than persisted
   // Data fields — see TODO.md for why that's RAM-only for now.
+
+  // ── Ethernet (single downstream device) ─────────────────────────────────
+  //  See USBrepeater.cpp Section 6c. EthIP/EthSubnet/EthGateway are packed
+  //  IPAddress values (uint32_t), used only when EthDHCP is false. All five
+  //  fields take effect on the next boot (EthernetSetup() in setup()), not
+  //  live — same "change now, SAVE, reboot to apply" convention as the
+  //  Template's STWIADD. EthCtrlPort is a second command-processor stream
+  //  (same commands as SerialUSB1, over TCP); EthDataPort is a second
+  //  passthrough source for RepeaterModeLoop() (see `pcSide`, Section 6).
+  bool          EthDHCP;        // TRUE = DHCP, FALSE = the three static fields below
+  uint32_t      EthIP;          // Static IP (only used when EthDHCP == FALSE)
+  uint32_t      EthSubnet;      // Static subnet mask
+  uint32_t      EthGateway;     // Static gateway
+  int           EthCtrlPort;    // TCP port for the network control port (commandProcessor)
+  int           EthDataPort;    // TCP port for network passthrough
 
   unsigned int  Signature;      // Must equal SIGNATURE for the struct to be considered valid
 } Data;

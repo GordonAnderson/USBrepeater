@@ -34,6 +34,61 @@ They're independent. A PC application that only needs the repeater can use
 (terminal, script, MIPS host) can use `SerialUSB1` to query status or change
 settings without ever touching the data stream.
 
+## Ethernet
+
+[QNEthernet](https://github.com/ssilverman/QNEthernet) drives the Teensy
+4.1's built-in Ethernet MAC/PHY, adding two more ports — this time TCP, not
+USB — that mirror the two USB ones:
+
+| Port | Purpose |
+| --- | --- |
+| `EthCtrlPort` (default 5000) | Control port: every `SerialUSB1` command works verbatim over this TCP connection — same commandProcessor, same ASCII protocol. |
+| `EthDataPort` (default 5001) | Passthrough port: a second source for the repeater byte pump, alongside `Serial`. |
+
+Both are single-session — a new connection takes over from whatever was
+previously connected, same policy every commercial serial-to-Ethernet device
+server uses.
+
+**Passthrough arbitration — "last speaker wins".** `Serial` and the Ethernet
+data client can both drive the downstream device; whichever one most
+recently sent bytes becomes `pcSide` (`src/USBrepeater.cpp`, Section 6), and
+the downstream device's replies are routed back only to it — the same
+pattern `commandProcessor::processStreams()` already uses internally
+(`serial = streams[i];`). This resolves *who gets the reply*; it does not
+prevent both sources writing to the device in the same loop pass if both
+have data available at once — accepted as a known edge case under sustained
+concurrent traffic from both sides, not solved with hard exclusivity. See
+Section 6c's header comment for the full reasoning.
+
+**Baud rate**: `Serial.baud()` auto-follows the PC's chosen baud for the USB
+side; there's no TCP equivalent, so `GBAUD`/`SBAUD` exist for a pure-Ethernet
+client to set it explicitly.
+
+**Configuration**: `?ETHDHCP` (DHCP vs. static), `SETHIP`/`SETHMASK`/`SETHGW`
+(static IP config, dotted-quad), and `?ETHCTRLPORT`/`?ETHDATAPORT` all take
+effect on the **next boot** (`SAVE` first to persist), not live — same
+convention as other reboot-required settings in this codebase. `GETHSTAT`
+always reflects live state (link up/down, DHCP vs. static, current IP,
+whether each TCP port has a connected client) regardless of pending config
+changes.
+
+**Hardware status (verified 2026-10-05)**: tested on real hardware with the
+magjack installed — `GETHSTAT` reported `LINKUP,DHCP,192.168.68.61,FALSE,FALSE`
+after boot, confirming link detection, DHCP, and `Ethernet.begin()` all work
+as implemented, with no crash anywhere in setup() (GAACE_Script's preload and
+EthernetSetup() both survived first contact with real silicon). `GVER`/
+`GLINK`/`GBAUD`/`GSCRIPTST,0` all round-tripped correctly over `SerialUSB1`
+in the same session. **Not yet verified**: a TCP client actually reaching
+`EthCtrlPort`/`EthDataPort` (blocked by the test machine's own LAN routing,
+not a device issue — see TODO.md) and passthrough to a real downstream
+device (none was connected during this test).
+
+**Licensing**: QNEthernet is AGPL-3.0-or-later, unlike `GAACE_Core` (GPLv3)
+or `ArduinoThread` (Public Domain) — AGPL carries network-use
+source-disclosure obligations GPL doesn't. Worth a deliberate decision
+before shipping a product built on this, not just carrying the dependency
+forward by default.
+
 The USB Manufacturer string (`GAA Custom Electronics, LLC`) and Product string
 (`USBrepeater`) are shared by both ports — see
 `board_vendor` / `board_build.usb_product` in `platformio.ini` and
@@ -164,6 +219,14 @@ every registered command and its help string, `HELP,<cmd>` looks up one.
 | `GMODE` | Active mode, index and name |
 | `SMODE,<index>` | Switch active mode (not persisted until `SAVE`) |
 | `GLINK` | Downstream USB device connection state (`TRUE`/`FALSE`) |
+| `GBAUD` / `SBAUD,<baud>` | Baud rate to the downstream device; set explicitly for Ethernet-only use |
+| `GETHDHCP` / `SETHDHCP,TRUE\|FALSE` | DHCP vs. static IP; reboot to apply |
+| `GETHIP` / `SETHIP,<a.b.c.d>` | Static IP address; reboot to apply |
+| `GETHMASK` / `SETHMASK,<a.b.c.d>` | Static subnet mask; reboot to apply |
+| `GETHGW` / `SETHGW,<a.b.c.d>` | Static gateway; reboot to apply |
+| `GETHCTRLPORT` / `SETHCTRLPORT,<port>` | TCP port for the network control port; reboot to apply |
+| `GETHDATAPORT` / `SETHDATAPORT,<port>` | TCP port for network passthrough; reboot to apply |
+| `GETHSTAT` | Live: `link,mode,ip,ctrlConnected,dataConnected` |
 | `GADCEN` / `SADCEN,TRUE\|FALSE` | ADC-update master enable |
 | `GADCPIN` / `SADCPIN,<pin>` | ADC input pin |
 | `GADCINT` / `SADCINT,<mS>` | ADC update interval |
@@ -185,11 +248,19 @@ pio run                # build
 pio run -t upload      # build and flash (upload_protocol = teensy-cli)
 ```
 
-Dependencies (`GAACE_Core`, `ArduinoThread`, `GAACE_Script`) are fetched automatically by
+If `pio run -t upload` can't find the board automatically (times out looking
+for a running app to signal, or reports a write error mid-programming), a
+physical double-tap of the Teensy's reset button to force HalfKay bootloader
+mode before running the command works reliably — this was needed during
+initial hardware bring-up on at least one dev machine/cable combination.
+
+Dependencies (`GAACE_Core`, `ArduinoThread`, `GAACE_Script`, `QNEthernet`) are fetched automatically by
 PlatformIO from their GitHub repos per `platformio.ini`'s `lib_deps` — no
 manual vendoring required.
 
 ## Planned work
 
-See [TODO.md](TODO.md) for design notes and open decisions on Ethernet
-support and multiple downstream devices via a USB hub.
+Single-device Ethernet is implemented (above). See [TODO.md](TODO.md) for
+the remaining open work: real-hardware network validation, and the settled
+design for expanding to multiple downstream devices via a USB hub (which
+also generalizes Ethernet to one TCP port per device).

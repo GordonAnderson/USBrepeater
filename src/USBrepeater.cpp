@@ -81,6 +81,40 @@
 //  https://github.com/GordonAnderson/GAACE_Script.git
 #include <GAACEScriptRuntime.h>
 
+//  QNEthernet — lwIP-based Ethernet for Teensy 4.1's built-in MAC/PHY
+//  (Section 6c). EthernetClient/EthernetServer are Stream/Client subclasses,
+//  same as SerialUSB1, so they plug into cp.registerStream() and
+//  RepeaterModeLoop() with no command-processor changes. Fetched from
+//  https://github.com/ssilverman/QNEthernet.git
+//
+//  LICENSING NOTE: QNEthernet is AGPL-3.0-or-later (GAACE_Core is GPLv3,
+//  ArduinoThread is Public Domain) — AGPL has network-use source-disclosure
+//  obligations GPL doesn't. Worth a deliberate decision before shipping a
+//  product that embeds it, not just carrying it forward by default; see
+//  TODO.md's existing (separate) GAACE_Script license item for the same
+//  category of open question.
+//
+//  SYMBOL COLLISION: QNEthernet.h pulls in raw lwIP C headers (lwip/err.h)
+//  at global scope, which declare their own ERR_TIMEOUT and ERR_ARG — the
+//  same two names GAACE_Core already uses (Errors.h's ErrorCode::ERR_TIMEOUT
+//  enum member, and commandProcessor.h's ERR_ARG #define). Neither library
+//  can be edited to avoid this, so this is the standard preprocessor
+//  workaround for an unavoidable third-party name collision, confined to
+//  this one include:
+//    - ERR_ARG is already a macro (commandProcessor.h, above): undef it so
+//      lwIP's enum sees a plain identifier, then restore the same value
+//      afterward.
+//    - ERR_TIMEOUT is a genuine enum member (Errors.h, above), which #undef
+//      can't touch — alias it to a throwaway name for the duration of this
+//      one include so lwIP's own ERR_TIMEOUT enum member gets renamed to the
+//      alias instead of colliding with GAACE's.
+#undef ERR_ARG
+#define ERR_TIMEOUT QNE_LWIP_ERR_TIMEOUT
+#include <QNEthernet.h>
+#undef ERR_TIMEOUT
+#define ERR_ARG 2   // restore commandProcessor.h's definition
+using namespace qindesign::network;
+
 // =============================================================================
 //  SECTION 2 — GLOBAL STATE
 // =============================================================================
@@ -103,6 +137,13 @@ Data DefaultData =
   "SETVAL",       // AdcCmdName  — placeholder; set to match the downstream command
   1.0f,           // AdcScaleM   — value = counts (identity scale) until calibrated
   0.0f,           // AdcScaleB
+
+  true,           // EthDHCP      — DHCP by default, zero-config on a typical LAN
+  0,              // EthIP        — 0.0.0.0; set explicitly before switching off DHCP
+  0x00FFFFFF,     // EthSubnet    — 255.255.255.0 (packed as IPAddress(255,255,255,0))
+  0,              // EthGateway   — 0.0.0.0; set explicitly before switching off DHCP
+  5000,           // EthCtrlPort  — TCP control port (same commands as SerialUSB1)
+  5001,           // EthDataPort  — TCP passthrough port
 
   SIGNATURE       // Signature — always last
 };
@@ -150,6 +191,11 @@ void HousekeepingUpdate(void)
 // forward declaration is needed.
 Thread ADCThread = Thread();
 
+// EthernetUpdate — periodic Ethernet.loop() pump + connection accept-loop for
+// the control/data TCP servers. Implemented in Section 6c (below), same
+// deferred-definition pattern as ADCUpdate above.
+Thread EthernetThread = Thread();
+
 // =============================================================================
 //  SECTION 4 — MODE DISPATCH TABLE
 // =============================================================================
@@ -185,6 +231,17 @@ static void cmdGetLink(void);
 static void cmdGetAdcInterval(void);
 static void cmdSetAdcInterval(void);
 static void cmdGetAdc(void);
+static void cmdGetBaud(void);
+static void cmdSetBaud(void);
+static void cmdGetEthIp(void);
+static void cmdSetEthIp(void);
+static void cmdGetEthMask(void);
+static void cmdSetEthMask(void);
+static void cmdGetEthGw(void);
+static void cmdSetEthGw(void);
+static void cmdGetEthStat(void);
+
+static int portLimits[] = {1, 65535};  // range check for ?ETHCTRLPORT / ?ETHDATAPORT
 
 Command cmds[] =
 {
@@ -200,6 +257,25 @@ Command cmds[] =
 
   // ── Repeater diagnostics ───────────────────────────────────────────────────
   {"GLINK",    CMDfunction,  0, (void *)cmdGetLink,        NULL, "Downstream USB device connection state"},
+  {"GBAUD",    CMDfunction,  0, (void *)cmdGetBaud,        NULL, "Baud rate used to talk to the downstream device"},
+  {"SBAUD",    CMDfunction,  1, (void *)cmdSetBaud,        NULL, "Set downstream baud rate; needed for Ethernet-only use (no Serial.baud() to follow)"},
+
+  // ── Ethernet (single downstream device; see Section 6c) ────────────────────
+  //  EthCtrlPort mirrors every SerialUSB1 command over TCP. EthDataPort is a
+  //  second passthrough source for RepeaterModeLoop() alongside Serial — see
+  //  `pcSide` in Section 6 for how replies are routed back to whichever one
+  //  spoke most recently. EthDHCP/EthIP/EthMask/EthGw take effect on the next
+  //  boot, not live; GETHSTAT always reflects live state.
+  {"?ETHDHCP",     CMDbool,     -1, (void *)&data.EthDHCP,      NULL, "Use DHCP (TRUE) or static IP (FALSE); reboot to apply"},
+  {"GETHIP",       CMDfunction, -1, (void *)cmdGetEthIp,        NULL, "Static IP address a.b.c.d; reboot to apply"},
+  {"SETHIP",       CMDfunction, -1, (void *)cmdSetEthIp,        NULL, "Set static IP address a.b.c.d; reboot to apply"},
+  {"GETHMASK",     CMDfunction, -1, (void *)cmdGetEthMask,      NULL, "Static subnet mask a.b.c.d; reboot to apply"},
+  {"SETHMASK",     CMDfunction, -1, (void *)cmdSetEthMask,      NULL, "Set static subnet mask a.b.c.d; reboot to apply"},
+  {"GETHGW",       CMDfunction, -1, (void *)cmdGetEthGw,        NULL, "Static gateway a.b.c.d; reboot to apply"},
+  {"SETHGW",       CMDfunction, -1, (void *)cmdSetEthGw,        NULL, "Set static gateway a.b.c.d; reboot to apply"},
+  {"?ETHCTRLPORT", CMDint,      -1, (void *)&data.EthCtrlPort,  portLimits, "TCP port for the network control port; reboot to apply"},
+  {"?ETHDATAPORT", CMDint,      -1, (void *)&data.EthDataPort,  portLimits, "TCP port for network passthrough; reboot to apply"},
+  {"GETHSTAT",     CMDfunction,  0, (void *)cmdGetEthStat,      NULL, "Live status: link,mode,ip,ctrlConnected,dataConnected"},
 
   // ── Periodic ADC -> downstream-device command update ───────────────────────
   //  Runs on ADCThread regardless of the active mode. Each cycle sends
@@ -266,12 +342,137 @@ static void cmdSetMode(void)
 // -----------------------------------------------------------------------------
 // GLINK — TRUE if a downstream USB CDC device is currently enumerated.
 // -----------------------------------------------------------------------------
-extern USBSerial_BigBuffer userial;  // defined in Section 6
+extern USBSerial_BigBuffer userial;    // defined in Section 6
+extern uint32_t            curBaud;    // defined in Section 6
+extern EthernetClient       ethCtrlClient;  // defined in Section 6c
+extern EthernetClient       ethDataClient;  // defined in Section 6c
 
 static void cmdGetLink(void)
 {
   cp.sendACK(false);
   cp.println((bool)userial);
+}
+
+// -----------------------------------------------------------------------------
+// GBAUD / SBAUD,<baud> — get/set the baud rate used to talk to the downstream
+// device. Serial.baud() auto-follows the PC's chosen baud when Serial drives
+// the link (see RepeaterModeLoop(), Section 6); that signal doesn't exist
+// over Ethernet, so a network-only client needs this to configure it.
+// -----------------------------------------------------------------------------
+static void cmdGetBaud(void)
+{
+  if (!cp.checkExpectedArgs(0)) return;
+  cp.sendACK(false);
+  cp.println(curBaud);
+}
+
+static void cmdSetBaud(void)
+{
+  if (!cp.checkExpectedArgs(1)) return;
+
+  uint32_t b;
+  if (!cp.getValue(&b, 300, 2000000))   // sane serial baud range
+  {
+    cp.sendNAK(ERR_BADARG);
+    return;
+  }
+
+  curBaud = b;
+  if ((bool)userial) userial.begin(curBaud);
+  cp.sendACK();
+}
+
+// -----------------------------------------------------------------------------
+// GETHIP/SETHIP, GETHMASK/SETHMASK, GETHGW/SETHGW — dotted-quad get/set for
+// the static-IP config fields. Function pairs rather than a bidirectional
+// CMDstr/CMDint field because there's no built-in CmdType that formats or
+// parses a.b.c.d. Changes take effect on the next boot (EthernetSetup(),
+// Section 6c/8), not live.
+// -----------------------------------------------------------------------------
+static void printIpAddr(IPAddress ip)
+{
+  cp.print((int)ip[0]); cp.print(".");
+  cp.print((int)ip[1]); cp.print(".");
+  cp.print((int)ip[2]); cp.print(".");
+  cp.print((int)ip[3]);
+}
+
+static bool parseIpArg(uint32_t *out)
+{
+  char *tok;
+  if (!cp.getValue(&tok)) return false;
+
+  int a, b, c, d;
+  bool ok = (sscanf(tok, "%d.%d.%d.%d", &a, &b, &c, &d) == 4) &&
+            a >= 0 && a <= 255 && b >= 0 && b <= 255 &&
+            c >= 0 && c <= 255 && d >= 0 && d <= 255;
+  cp.ca->free(tok);
+  if (!ok) return false;
+
+  *out = (uint32_t)IPAddress(a, b, c, d);
+  return true;
+}
+
+static void cmdGetEthIp(void)
+{
+  if (!cp.checkExpectedArgs(0)) return;
+  cp.sendACK(false);
+  printIpAddr(IPAddress(data.EthIP));
+  cp.print();
+}
+
+static void cmdSetEthIp(void)
+{
+  if (!cp.checkExpectedArgs(1)) return;
+  if (!parseIpArg(&data.EthIP)) { cp.sendNAK(ERR_BADARG); return; }
+  cp.sendACK();
+}
+
+static void cmdGetEthMask(void)
+{
+  if (!cp.checkExpectedArgs(0)) return;
+  cp.sendACK(false);
+  printIpAddr(IPAddress(data.EthSubnet));
+  cp.print();
+}
+
+static void cmdSetEthMask(void)
+{
+  if (!cp.checkExpectedArgs(1)) return;
+  if (!parseIpArg(&data.EthSubnet)) { cp.sendNAK(ERR_BADARG); return; }
+  cp.sendACK();
+}
+
+static void cmdGetEthGw(void)
+{
+  if (!cp.checkExpectedArgs(0)) return;
+  cp.sendACK(false);
+  printIpAddr(IPAddress(data.EthGateway));
+  cp.print();
+}
+
+static void cmdSetEthGw(void)
+{
+  if (!cp.checkExpectedArgs(1)) return;
+  if (!parseIpArg(&data.EthGateway)) { cp.sendNAK(ERR_BADARG); return; }
+  cp.sendACK();
+}
+
+// -----------------------------------------------------------------------------
+// GETHSTAT — live network status: link,mode,ip,ctrlConnected,dataConnected.
+// Always reflects current runtime state (unlike the config getters above,
+// which read back the stored, possibly-not-yet-applied, EthIP/EthMask/EthGw).
+// -----------------------------------------------------------------------------
+static void cmdGetEthStat(void)
+{
+  if (!cp.checkExpectedArgs(0)) return;
+
+  cp.sendACK(false);
+  cp.print(Ethernet.linkState() ? "LINKUP" : "LINKDOWN"); cp.print(",");
+  cp.print(data.EthDHCP ? "DHCP" : "STATIC");             cp.print(",");
+  printIpAddr(Ethernet.localIP());                        cp.print(",");
+  cp.print((bool)ethCtrlClient && ethCtrlClient.connected()); cp.print(",");
+  cp.println((bool)ethDataClient && ethDataClient.connected());
 }
 
 // -----------------------------------------------------------------------------
@@ -360,12 +561,13 @@ static void cmdGetAdc(void)
 // =============================================================================
 //
 //  PC <-> Teensy device port (micro-USB, SerialUSB1 shares the connector) <->
-//  Teensy host port (5-pin header) <-> downstream VCP device.
+//  Teensy host port (5-pin header) <-> downstream VCP device. As of Section
+//  6c, a connected Ethernet client on EthDataPort is a second possible "PC"
+//  for this same link — see `pcSide` below.
 //
-//  Unchanged from the original implementation, just relocated behind the mode
-//  dispatch table. Runs unthrottled from loop() — do not add commandProcessor
-//  traffic or other blocking work to this path; it must stay fast enough to
-//  keep up with the downstream device's baud rate.
+//  Runs unthrottled from loop() — do not add commandProcessor traffic or
+//  other blocking work to this path; it must stay fast enough to keep up
+//  with the downstream device's baud rate.
 
 USBHost             myusb;
 USBHub              hub1(myusb);
@@ -374,6 +576,17 @@ USBSerial_BigBuffer userial(myusb);   // handles FS (64 B) and HS (512 B) CDC de
 uint32_t curBaud      = 115200;
 bool     wasConnected = false;
 uint8_t  repeaterBuf[512];
+
+// Whichever source (Serial, or the Ethernet data client — Section 6c) most
+// recently sent bytes to the device. Downstream device -> PC bytes are
+// written only here: "last speaker wins", the same pattern
+// commandProcessor::processStreams() already uses
+// (`serial = streams[i]; // route replies back to the stream that sent the command`).
+// This settles *who gets the reply*; it does not stop two sources from
+// writing to `userial` in the same loop pass if both have data available at
+// once — see Section 6c for why that's accepted as a known edge case rather
+// than solved with hard exclusivity.
+Stream *pcSide = &Serial;
 
 // State shared with ADCUpdate() (Section 6a) so an injected command doesn't
 // collide with in-flight PC<->device traffic. See Section 6a for the full
@@ -416,16 +629,33 @@ void RepeaterModeLoop(void)
 
   if (!connected) return;
 
-  // PC -> device
+  // PC -> device. Both Serial and a connected Ethernet data client can drive
+  // the link; whichever one actually sends bytes this pass becomes pcSide,
+  // so the reply below goes back to whoever just spoke. If both have data in
+  // the same pass, both still get forwarded here (in this order) and can
+  // interleave on the wire to the downstream device — see Section 6c.
   int n = Serial.available();
   if (n > 0)
   {
     n = Serial.readBytes((char *)repeaterBuf, min(n, (int)sizeof(repeaterBuf)));
     userial.write(repeaterBuf, n);
     lastPcToDeviceMs = millis();   // tells ADCUpdate() the link was just busy
+    pcSide = &Serial;
   }
 
-  // Device -> PC
+  if (ethDataClient && ethDataClient.connected())
+  {
+    int n2 = ethDataClient.available();
+    if (n2 > 0)
+    {
+      n2 = ethDataClient.read(repeaterBuf, min(n2, (int)sizeof(repeaterBuf)));
+      userial.write(repeaterBuf, n2);
+      lastPcToDeviceMs = millis();
+      pcSide = &ethDataClient;
+    }
+  }
+
+  // Device -> PC — written only to pcSide, not broadcast to both.
   n = userial.available();
   if (n > 0)
   {
@@ -433,7 +663,7 @@ void RepeaterModeLoop(void)
     // Discard bytes that are (most likely) the downstream device's reply to
     // an ADCUpdate()-injected command instead of forwarding them to the PC —
     // see Section 6a. Outside that short window, behavior is unchanged.
-    if (millis() >= adcSwallowUntilMs) Serial.write(repeaterBuf, n);
+    if (millis() >= adcSwallowUntilMs) pcSide->write(repeaterBuf, n);
   }
 }
 
@@ -555,6 +785,86 @@ static int32_t sys_scale_send(int32_t *args, uint8_t argc)
 }
 
 // =============================================================================
+//  SECTION 6c — ETHERNET (single downstream device)
+// =============================================================================
+//
+//  Two independent TCP servers, both single-session ("latest connection
+//  wins" — same policy every commercial serial-to-Ethernet device server
+//  uses, because two live sessions driving the same downstream link would
+//  corrupt each other's traffic regardless of arbitration):
+//
+//    ethCtrlServer / ethCtrlClient — mirrors SerialUSB1: registered with
+//      cp.registerStream() once in EthernetSetup(), so every command
+//      (GVER, GMODE, SADCxxx, ...) works verbatim over this TCP port with no
+//      command-processor changes.
+//
+//    ethDataServer / ethDataClient — a second passthrough source for
+//      RepeaterModeLoop() (Section 6), alongside Serial. See `pcSide` there
+//      for how replies are routed back to whichever source spoke most
+//      recently.
+//
+//  Both client globals are reused across reconnects (`ethXClient = newClient`
+//  inside EthernetUpdate() below) rather than replaced, because
+//  cp.registerStream() has no matching "unregister"/"replace" call — it
+//  records a Stream* once, so that address must stay the same object for the
+//  life of the program. QNEthernet's EthernetClient supports this: it's a
+//  copyable handle around a connection, and calling available()/connected()
+//  on one that was never connected (or has since disconnected) safely
+//  returns 0/false rather than crashing or blocking.
+//
+//  KNOWN LIMITATION (carried over from design discussion, not solved here):
+//  pcSide (Section 6) resolves who gets a reply, not simultaneous writes. If
+//  Serial and ethDataClient both have bytes available in the same
+//  RepeaterModeLoop() pass, both still get forwarded to userial that pass
+//  and can interleave on the wire. This only bites under sustained
+//  concurrent traffic from both sides at once, not "one connected while the
+//  other is idle" — accepted as a known edge case, same as the equivalent
+//  ADC-injection guards are heuristics rather than a real bus-arbitration
+//  protocol.
+//
+//  BAUD RATE: Serial.baud() (Section 6) only exists for a USB CDC host; a
+//  pure-Ethernet client has no equivalent way to signal a baud rate, so
+//  GBAUD/SBAUD (Section 5) exist for that case — set it once after boot if
+//  you're not also using the USB side.
+
+EthernetServer ethCtrlServer;   // port bound in EthernetSetup() from data.EthCtrlPort
+EthernetServer ethDataServer;   // port bound in EthernetSetup() from data.EthDataPort
+EthernetClient ethCtrlClient;
+EthernetClient ethDataClient;
+
+static void EthernetSetup(void)
+{
+  if (data.EthDHCP)
+  {
+    Ethernet.begin();   // DHCP; uses the Teensy's system MAC automatically
+  }
+  else
+  {
+    Ethernet.begin(IPAddress(data.EthIP), IPAddress(data.EthSubnet), IPAddress(data.EthGateway));
+  }
+
+  ethCtrlServer.begin(data.EthCtrlPort);
+  ethDataServer.begin(data.EthDataPort);
+
+  // Registered once; see the comment above for why the same object is
+  // reused across reconnects instead of re-registering a new one.
+  cp.registerStream(&ethCtrlClient);
+}
+
+static void EthernetUpdate(void)
+{
+  Ethernet.loop();   // "call often" per QNEthernet's docs — DHCP renewal etc.
+
+  // accept() is non-blocking: it returns an unconnected client immediately
+  // if nobody is trying to connect right now.
+  EthernetClient nc = ethCtrlServer.accept();
+  if (nc) { if (ethCtrlClient) ethCtrlClient.stop(); ethCtrlClient = nc; }
+
+  EthernetClient nd = ethDataServer.accept();
+  if (nd) { if (ethDataClient) ethDataClient.stop(); ethDataClient = nd; }
+}
+
+// =============================================================================
 //  SECTION 7 — SETTINGS PERSISTENCE (EEPROM)
 // =============================================================================
 
@@ -633,6 +943,16 @@ void setup()
   ADCThread.onRun(ADCUpdate);
   ADCThread.setInterval(data.AdcInterval);
   control.add(&ADCThread);
+
+  // ── 5a. Ethernet (Section 6c) ───────────────────────────────────────────────
+  //  Bring up the network and the two TCP servers, then poll for new
+  //  connections / pump lwIP on its own thread. Independent of the active
+  //  mode, same as ADCThread — keeps working during REPEATER mode.
+  EthernetSetup();
+  EthernetThread.setName("Ethernet");
+  EthernetThread.onRun(EthernetUpdate);
+  EthernetThread.setInterval(20);   // ms; keeps Ethernet.loop() ticking promptly
+  control.add(&EthernetThread);
 
   // Preload the ADC demo (Section 6b) into slot 0, the same way a project
   // preloads any default script: fill code[]/codeLen, vmInit(), loaded=true.
