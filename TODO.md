@@ -57,7 +57,236 @@ Nothing left unverified from the original single-device design discussion.
 Remaining open work in this file is specifically the multi-device
 generalization (per-device ring buffers, `SDEV`, one TCP port per device).
 
+## Hardware-verified development plan (2026-10-27) — USBrepeater Hub Carrier
+
+Real hardware is designed, boards are on order. This section reviews the
+actual schematic (`/Users/gordonanderson/GAACE_Local/Products/USBrepeater/KiCad/USBrepeater`,
+exported and verified pin-by-pin via `kicad-cli sch export netlist`, not just
+read visually), `UsbHubBoot.h`/`.cpp` (the hub boot helper, lives alongside
+the schematic, not yet in this firmware repo), and
+`USBrepeater_Hub_KiCad_Design_Guide_4.docx` (the design narrative) — and
+replaces the speculative parts of "Settled design" below with what's
+actually built. The multi-device *topology* decisions in that section
+(per-device ring buffers, `SDEV`, one TCP port per device) still stand; this
+section is the hardware ground truth they need to build against.
+
+### Correction: the design guide's V1/V2 hub-strapping scheme is superseded
+
+The docx (dated 2026-09-27) describes a two-variant plan: V1 = pure resistor
+straps with the Teensy physically disconnected from the hub's SDA/SCL pins,
+V2 = add population options later for real SMBus control. **The schematic
+that was actually built does neither.** Verified via the exported netlist:
+the Teensy drives all four hub strap pins directly as GPIO, every time, on
+every board — there is no resistor-strap-only variant and no DNP population
+option scheme in the real design:
+
+| Teensy pin | Net (verified) | Hub pin (U6) |
+| --- | --- | --- |
+| 18 | `U4-18_A4_SDA` | 22 — SDA/SMBDATA/NON_REM1 |
+| 19 | `U4-19_A5_SCL` | 24 — SCL/SMBCLK/CFG_SEL0 |
+| 34 | `U4-34_RX8` | 25 — HS_IND/CFG_SEL1 |
+| 35 | `U4-35_TX8` | 28 — SUSP_IND/LOCAL_PWR/NON_REM0 |
+| 36 | via R12 (100k) | 26 — RESET_N (C8 0.1µF to GND at the node) |
+| 32 | via R7 (4.7k) | 27 — VBUS_DET (R8 100k pull-down at the node) |
+
+This is exactly what `UsbHubBoot.h`'s header comment and `UsbHubBoot.cpp`'s
+`run()`/`attach()`/`detach()` implement — drive the straps while holding
+reset, release reset, hold the strap levels past the hold time, then
+tri-state the strap pins (which become the hub's `HS_IND`/`SUSP_IND` status
+outputs on pins 34/35, and real SDA/SCL on 18/19 if a future build ever
+wants actual SMBus). Treat `UsbHubBoot.h`/`.cpp` and the netlist as the
+source of truth over the docx for anything hub-strapping-related.
+
+**Standing constraint, not just a one-time setup step**: pins 18/19 and
+34/35 are permanently committed to the hub interface on this board. Current
+firmware uses neither (`Wire`/`Serial8` are never initialized anywhere in
+`src/USBrepeater.cpp`), so there's no conflict today — but any future
+feature must not claim `Wire` (default pins 18/19) or `Serial8` (pins
+34/35). `UsbHubBoot.h`'s comment ("do not enable Serial8 or Wire before
+run() returns") understates this: it's not just before `run()` returns,
+it's never, for the life of this firmware, unless a real SMBus hub-control
+feature is deliberately added later using those same pins for their real
+function.
+
+**Also confirmed not wired on the real board** (present in the docx's
+§5.8 pin table, absent from the netlist — `unconnected-(U4-...)` entries
+for every one of these): the Board-ID strap (pins 28/29) and all four
+per-port `FLG` over-current flags (pins 37–40). Two consequences for
+firmware: there's no way to detect hardware revision at boot (don't build
+a feature assuming one exists), and over-current protection is fully
+autonomous at the hub+switch level — firmware has no visibility into a
+per-port fault, only `GLINK`-style "is something enumerated" after the
+fact.
+
+### Phase 0 — Hub bring-up (do this first; blocks everything else)
+
+**Done (2026-10-27), compile-verified only — no hub board to test against
+yet.**
+
+- [x] Copied `UsbHubBoot.h`/`UsbHubBoot.cpp` verbatim from
+      `/Users/gordonanderson/GAACE_Local/Products/USBrepeater/` into
+      `include/`/`src/` of this repo.
+- [x] Wired the exact sequence from `UsbHubBoot_example.ino` into
+      `RepeaterModeSetup()` (`src/USBrepeater.cpp`, Section 6):
+      `UsbHubBoot::run();` **before** `myusb.begin()`,
+      `UsbHubBoot::attach();` **after**.
+- [x] Confirmed no other use of pins 18/19/32/34/35/36 anywhere in
+      firmware (`Wire`/`Serial8` are never initialized) — no conflict today.
+- [x] Builds clean, no new warnings.
+- [ ] `UsbHubBoot::Options.nonRem` is left at its default (`0`, all 4 ports
+      removable/hot-pluggable) — not overridden, since that seems correct
+      for 4 USB-A connectors meant for pluggable downstream devices. Still
+      needs confirming against actual intent, not just left unchallenged.
+- [ ] **Not yet tested on real hardware** — no hub board here yet. First
+      real test is Phase 1 below, once boards arrive.
+
+### Phase 1 — Validate the hub itself before going to 4 devices
+
+Bring-up order from the docx's own §9 is worth following literally: with
+hub bring-up (Phase 0) done, plug in **one** downstream device to any one
+of the 4 ports and run **today's existing single-`userial` firmware**
+unchanged. This isolates "does the hub attach and pass traffic at all"
+from "does 4-device multiplexing work" — don't debug both at once.
+
+- [ ] Pass criterion: `GLINK` reports `TRUE`, and `GVER` through the
+      repeater passthrough reaches the downstream device and gets a reply —
+      literally the same test already done end-to-end on 2026-10-06, just
+      with the hub now in the path instead of a direct connection.
+
+### Phase 2 — Multi-device support (4× `USBSerial_BigBuffer`)
+
+**Implemented (2026-10-27), compile-verified only — no 4-device hardware to
+test against yet.** `src/USBrepeater.cpp` Section 6 now has `userial1..4`,
+one `DevPort` (ring buffer + connection state) per port, and `SDEV`/`GDEV`
+(active device) plus `SADCDEV`/`GADCDEV` (independent `ADCThread`/script
+target) commands. `GDEVSTAT` reports `dev,connected,bytesWaiting,
+bytesDropped` per port.
+
+**The device-identification question is resolved — by decision, not by
+testing.** The `hub_port`-is-protected problem below turned out not to
+matter: it's explicitly **the host's job**, not firmware's, to map port
+number to device identity/function. The host switches `SDEV` through 1-4
+and asks each one `GNAME`/`GVER` itself over the ordinary passthrough path,
+building its own table. Firmware never tries to identify what's plugged
+in — no injected identify-query, no caching, no parsing. This is simpler
+than anything on the table before and sidesteps the `hub_port` limitation
+entirely. (Original finding, kept for context: `Device_t` has a `hub_port`
+field but it's `protected`, not reachable through `USBSerial_BigBuffer`;
+the only identification it exposes publicly is `idVendor()`/`idProduct()`/
+`manufacturer()`/`product()`/`serialNumber()` — moot now, but would matter
+again if firmware-side identification is ever revisited.)
+
+**Ring buffer / overflow design (decided):**
+- Every port captures incoming bytes continuously into its own ring buffer
+  (`DEVPORT_RINGBUF_SIZE`, `#define`, currently 2048 bytes — tunable),
+  regardless of whether it's selected. Only the selected port's buffer gets
+  flushed to the upstream, every tick — which naturally delivers backlog
+  the moment `SDEV` switches to a port, with no special "flush on switch"
+  code needed.
+- Overflow policy: **drop incoming bytes once full**, preserving the order
+  of what's already queued (rejected the drop-oldest/overwrite
+  alternative — explicitly "this is bad no matter what," so correctness
+  under pressure (preserve order) was prioritized over always having the
+  freshest sample). `GDEVSTAT`'s `bytesDropped` is a monotonic since-boot
+  counter, never auto-cleared (including on flush/select), so the loss is
+  never silently hidden.
+- The injection swallow-window (ADC/script replies that must never reach
+  the host) happens at buffer-*push* time now, not flush time — a byte
+  arriving during a port's swallow window is discarded before it can enter
+  that port's ring buffer at all, so it can never leak out later even if
+  that port becomes selected afterward.
+
+- [ ] **Not yet tested on real hardware** — no 4-port hub/4 downstream
+      devices here yet. First real test, once hardware arrives: the docx's
+      own bring-up pass criterion is a good target — all four enumerate
+      after power-up and after hot-plugging each individually, `GDEVSTAT`
+      shows sane `bytesWaiting`/`bytesDropped` for a port left unselected
+      while its device talks, and `ADCThread` keeps running throughout.
+- [ ] `SDEV`'s reply-delivery-on-switch behavior (the core of the "nothing
+      is lost" design) only really proves itself with a device that
+      actually sends meaningful unsolicited chatter while not selected —
+      worth a deliberate test for this specifically, not just "does it
+      enumerate."
+
+### Phase 3 — Analog input (AIN, SMA) hardware alignment
+
+**Already done**, confirmed in `src/USBrepeater.cpp` (commit `8bc42ec`):
+12-bit resolution, 32× hardware averaging, 16× software averaging,
+one shared `readAdcCounts()` read path — exactly what the design guide's
+§5.6.2 recommends. No firmware change needed for this part.
+
+**Still needed**:
+- [ ] On-hardware calibration once boards arrive: apply known voltages at
+      the AIN SMA and fit `SADCM`/`SADCB` from the real board, per the
+      docx's bring-up plan. Starting points (12-bit-adjusted from the
+      docx's §5.6/§5.6.2 transfer functions — confirm against the actual
+      populated range before trusting them):
+      - ±10 V range: `SADCM,0.005348` `SADCB,-10.96`
+      - 0–10 V range: `SADCM,0.002705` `SADCB,-0.496`
+- [ ] **REF channel (A1/pin 15) ratiometric correction — not implemented
+      at all yet.** The board has a 2.5 V precision reference
+      (`ISL21070CIH325Z`, confirmed on A1 via the netlist) specifically so
+      firmware can cancel gain drift from the Teensy's 3.3 V rail (which is
+      both the ADC reference and the AIN summing network's offset
+      reference). Per the docx's §5.6.1 formula:
+      `value_corrected = (REF_cal / REF_now) × (AdcScaleM × AIN_counts + AdcScaleB)`.
+      Concrete firmware work: add a `RefCal` field to `Data` (`Signature`
+      bump), read A1 through the same averaged-read path as AIN, and a way
+      to capture `REF_cal` at calibration time (e.g. a `CALREF` command
+      that reads the current A1 average into `data.RefCal`, then `SAVE`).
+      Until this exists, the channel is wired but unused — the board works
+      exactly as it does today without it.
+- [ ] `AinRange` (±10 V vs. 0–10 V) is a **population option, not a
+      firmware feature** — confirmed by the docx itself ("gain, offset and
+      sign are all absorbed by `AdcScaleM`/`AdcScaleB`, so no firmware
+      change is needed"). Just make sure the calibration constants above
+      match whichever range was actually populated on the boards that were
+      ordered.
+
+### Phase 4 — Digital I/O (DIO, SMA) — new feature, nothing exists yet
+
+Confirmed via the netlist: logical pin 2 → `74AHCT1G125` tri-state driver
+(`DIO_OUT`), pin 3 → that driver's `OE_N` (`DIO_OE_N`, pulled up on-board —
+defaults to input/disabled at power-up, before firmware ever runs), pin 4 →
+`74LVC1G17` Schmitt input (`DIO_IN`). Matches the docx's §5.8 proposal
+exactly for this one connector (unlike the hub-strap and Board-ID pins,
+which didn't make it into the real board as proposed).
+
+- [ ] New `Data` fields: at minimum a persisted `DioOutputEnabled`
+      (`Signature` bump).
+- [ ] New commands, roughly per the docx's own suggestion: `?DIODIR`
+      (`TRUE`=output enabled, drives `OE_N` low; `FALSE`=input/high-Z,
+      the safe default) and `?DOUT` (drives `DIO_OUT` when direction is
+      output) as bidirectional `CMDbool`s; `GDIN` (reads `DIO_IN`,
+      meaningful in both directions — with output enabled it reads back
+      the actual line level, so firmware can detect a shorted or contended
+      output).
+- [ ] Boot safety: set `DIO_OE_N` `OUTPUT`/`HIGH` (disabled) *before*
+      touching `DIO_OUT` at all, so the driver can never glitch into an
+      unintended output state during `setup()`.
+- [ ] Not needed for V1: pin 2 is PWM-capable and pin 4 is
+      interrupt/capture-capable specifically so a later feature (pulse
+      output, edge-triggered ADC sampling — the docx explicitly raises "DIO
+      edge triggers an ADC sample/send" as a future idea) doesn't need a
+      board respin. Keep the V1 command handlers simple (static levels
+      only); don't build the PWM/capture path now.
+
+### Phase 5 — Documentation follow-up
+
+- [ ] `USBrepeater_Hub_KiCad_Design_Guide_4.docx` should get a revision (or
+      at least an errata note) reflecting the hub-strapping correction
+      above, so nobody builds a future SMBus/Board-ID feature against the
+      stale V1/V2 plan without checking the real schematic first. Low
+      urgency — this TODO.md section is the correction of record in the
+      meantime.
+
 ## Settled design: 4 downstream devices via hub + Ethernet
+
+**Real hardware now exists for this** — see "Hardware-verified development
+plan" above for the actual schematic facts (hub strapping, AIN/REF/DIO
+connectors, what's and isn't wired to the Teensy) and the phased work order.
+This section is the topology/architecture design; that one is the hardware
+ground truth it needs to build against.
 
 **Goal**: support 4 downstream USB devices connected through a hub on the
 Teensy's host port, reachable from the PC over both USB and Ethernet, with

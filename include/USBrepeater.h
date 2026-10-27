@@ -16,8 +16,15 @@
 // SIGNATURE is written into EEPROM so we can detect un-initialised storage.
 // Change this value if you ever change the layout of the Data struct — doing
 // so forces a reset to defaults on the next boot rather than reading garbage.
-// Bumped from 0xAA55A5A8 when the Ethernet config fields were added below.
-#define SIGNATURE  0xAA55A5A9
+// Bumped from 0xAA55A5A9 when ActiveDevice/AdcTargetDevice were added below
+// for the 4-downstream-port USBrepeater Hub Carrier board.
+#define SIGNATURE  0xAA55A5AA
+
+// Number of downstream USB ports on the Hub Carrier board (one USB2514B
+// 4-port hub). ActiveDevice/AdcTargetDevice below are 1-based indices into
+// this range. See src/USBrepeater.cpp Section 6 for the per-port state this
+// drives (userial1..userial4, one ring buffer each).
+#define DEVPORT_COUNT 4
 
 // ── Operating modes ───────────────────────────────────────────────────────
 //  Add new modes by appending to this enum (before NUM_MODES) and adding a
@@ -41,6 +48,17 @@ typedef struct
   char          Name[20];       // Human-readable board name, settable via SNAME
   int8_t        Rev;            // Firmware/hardware revision number
   uint8_t       Mode;           // Active SystemMode, persisted across reboots
+
+  // ── Downstream device selection (Hub Carrier board, 4 ports) ─────────────
+  //  See USBrepeater.cpp Section 6. ActiveDevice is which downstream port the
+  //  single switchable upstream data path (Serial + EthDataPort) is bridged
+  //  to, settable via SDEV,<n>. AdcTargetDevice is which port ADCThread/the
+  //  GAACE_Script demo sends to — independent of ActiveDevice on purpose:
+  //  switching which device the host is interactively looking at must not
+  //  interrupt a background ADC feed to a different one. Both are 1-based,
+  //  range [1, DEVPORT_COUNT].
+  uint8_t       ActiveDevice;
+  uint8_t       AdcTargetDevice;
 
   // ── Periodic ADC -> downstream-device command update ────────────────────
   //  Runs on its own thread (see ADCThread in USBrepeater.cpp), independent

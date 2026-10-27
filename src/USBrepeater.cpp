@@ -18,6 +18,21 @@
 //                  ?NAME, GMODE/SMODE, SAVE/RESTORE, thread introspection, ...)
 //                  lives here so it never collides with repeater traffic.
 //
+//  DOWNSTREAM PORTS  (USBrepeater Hub Carrier board — USB2514B 4-port hub)
+//  -------------------------------------------------------------------------
+//  4 downstream USB-A ports, all connected/auto-reconnecting continuously
+//  and each capturing incoming bytes into its own ring buffer regardless of
+//  selection (see Section 6). Only one is bridged to the upstream data path
+//  (Serial + EthDataPort) at a time — data.ActiveDevice, set via SDEV/GDEV —
+//  because the hardware doesn't have upstream USB endpoints to spare for
+//  more. The host is responsible for mapping port number to device identity:
+//  it switches SDEV through 1-4 and asks each one GNAME/GVER itself over the
+//  ordinary passthrough path; firmware never tries to identify what's
+//  plugged in. ADCThread/the script demo (below) target a second,
+//  independent selection (data.AdcTargetDevice, SADCDEV/GADCDEV) so
+//  background monitoring of one device isn't disrupted by the host switching
+//  interactive focus to another.
+//
 //  MODES
 //  -----
 //  The system runs one active SystemMode at a time (see USBrepeater.h). Mode 0
@@ -56,6 +71,14 @@
 #include <stdio.h>   // snprintf() — used by ADCUpdate() (Section 6a)
 #include <string.h>  // memcpy() — used by setup() to preload a default script
 #include <math.h>    // lroundf() — used by sys_read_adc() (Section 6b)
+
+//  UsbHubBoot — USB2514B strap/reset sequencing for the USBrepeater Hub
+//  Carrier board (Section 6). Required any time this firmware runs on that
+//  board: without it the hub comes up in an unknown strap configuration.
+//  See TODO.md's "Hardware-verified development plan" for the pin mapping
+//  this was verified against (kicad-cli-exported netlist, not just the
+//  design guide, which is stale on this specific point).
+#include "UsbHubBoot.h"
 
 //  GAACE_Core — command processor, ring buffer, arena allocator, error codes.
 //  Fetched by PlatformIO from https://github.com/GordonAnderson/GAACE_Core.git
@@ -119,6 +142,11 @@ using namespace qindesign::network;
 //  SECTION 2 — GLOBAL STATE
 // =============================================================================
 
+// Per-downstream-port capture ring buffer size (Section 6). Tunable: start
+// small (2-4 KB; RAM isn't the constraint here, reasonable backlog is), bump
+// up if a real device's unsolicited chatter between host visits needs more.
+#define DEVPORT_RINGBUF_SIZE 2048
+
 // Active runtime data. Loaded from EEPROM on boot; written back by SAVE.
 Data data;
 
@@ -130,6 +158,9 @@ Data DefaultData =
   "USBrepeater",  // Name
   1,              // Rev  — increment when hardware changes
   MODE_REPEATER,  // Mode — boot into repeater mode by default
+
+  1,              // ActiveDevice    — downstream port 1, boots selected by default
+  1,              // AdcTargetDevice — same, independent selection
 
   false,          // AdcEnabled  — off until a pin/command/scale is configured
   A0,             // AdcPin
@@ -185,10 +216,10 @@ void HousekeepingUpdate(void)
 }
 
 // ADCUpdate — periodic ADC-driven downstream command injector. Implemented in
-// Section 6a (below), alongside the repeater state it shares (userial, and
-// the guard/swallow timestamps). ADCThread.onRun(ADCUpdate) is wired up in
-// setup() (Section 8), which comes after Section 6a in this file, so no
-// forward declaration is needed.
+// Section 6a (below), alongside the per-port state it shares with
+// RepeaterModeLoop() (userialPtr[]/devPort[], Section 6). ADCThread.onRun(
+// ADCUpdate) is wired up in setup() (Section 8), which comes after Section 6a
+// in this file, so no forward declaration is needed.
 Thread ADCThread = Thread();
 
 // EthernetUpdate — periodic Ethernet.loop() pump + connection accept-loop for
@@ -240,8 +271,23 @@ static void cmdSetEthMask(void);
 static void cmdGetEthGw(void);
 static void cmdSetEthGw(void);
 static void cmdGetEthStat(void);
+static void cmdGetDev(void);
+static void cmdSetDev(void);
+static void cmdGetAdcDev(void);
+static void cmdSetAdcDev(void);
+static void cmdGetDevStat(void);
 
 static int portLimits[] = {1, 65535};  // range check for ?ETHCTRLPORT / ?ETHDATAPORT
+
+// Per-port accessors — implemented in Section 6, where userial1..userial4
+// and their ring buffers actually live. Keeps these command handlers (and
+// GLINK/SBAUD above) from needing extern access to the raw per-port arrays.
+// dev1based is in [1, DEVPORT_COUNT]; callers here always pass a value
+// already range-checked by cp.getValue() or a persisted Data field.
+bool     isDeviceConnected(uint8_t dev1based);
+uint16_t deviceBytesWaiting(uint8_t dev1based);
+uint32_t deviceBytesDropped(uint8_t dev1based);
+void     reinitDeviceBaud(uint8_t dev1based, uint32_t baud);
 
 Command cmds[] =
 {
@@ -256,9 +302,22 @@ Command cmds[] =
   {"SMODE",    CMDfunction, -1, (void *)cmdSetMode,        NULL, "Set active mode by index"},
 
   // ── Repeater diagnostics ───────────────────────────────────────────────────
-  {"GLINK",    CMDfunction,  0, (void *)cmdGetLink,        NULL, "Downstream USB device connection state"},
+  {"GLINK",    CMDfunction,  0, (void *)cmdGetLink,        NULL, "ActiveDevice's USB connection state"},
   {"GBAUD",    CMDfunction,  0, (void *)cmdGetBaud,        NULL, "Baud rate used to talk to the downstream device"},
   {"SBAUD",    CMDfunction,  1, (void *)cmdSetBaud,        NULL, "Set downstream baud rate; needed for Ethernet-only use (no Serial.baud() to follow)"},
+
+  // ── Downstream device selection (Hub Carrier board, 4 ports) ────────────────
+  //  SDEV switches which port the upstream data path (Serial + EthDataPort)
+  //  bridges to; each port keeps capturing into its own ring buffer whether
+  //  selected or not, so switching never loses what a non-selected device
+  //  said — see Section 6. SADCDEV is a completely independent selection for
+  //  ADCThread/the script demo, so background monitoring of one device isn't
+  //  interrupted by switching interactive focus to another.
+  {"GDEV",     CMDfunction, -1, (void *)cmdGetDev,         NULL, "Get the active downstream device, 1-4"},
+  {"SDEV",     CMDfunction, -1, (void *)cmdSetDev,         NULL, "Set the active downstream device, 1-4"},
+  {"GADCDEV",  CMDfunction, -1, (void *)cmdGetAdcDev,      NULL, "Get ADCThread/script target device, 1-4"},
+  {"SADCDEV",  CMDfunction, -1, (void *)cmdSetAdcDev,      NULL, "Set ADCThread/script target device, 1-4"},
+  {"GDEVSTAT", CMDfunction,  0, (void *)cmdGetDevStat,     NULL, "Per-port status: dev,connected,bytesWaiting,bytesDropped"},
 
   // ── Ethernet (single downstream device; see Section 6c) ────────────────────
   //  EthCtrlPort mirrors every SerialUSB1 command over TCP. EthDataPort is a
@@ -340,17 +399,95 @@ static void cmdSetMode(void)
 }
 
 // -----------------------------------------------------------------------------
-// GLINK — TRUE if a downstream USB CDC device is currently enumerated.
+// GLINK — TRUE if the active downstream device (data.ActiveDevice) is
+// currently enumerated. isDeviceConnected() etc. are declared earlier in this
+// section (forward declarations, implemented in Section 6).
 // -----------------------------------------------------------------------------
-extern USBSerial_BigBuffer userial;    // defined in Section 6
-extern uint32_t            curBaud;    // defined in Section 6
-extern EthernetClient       ethCtrlClient;  // defined in Section 6c
-extern EthernetClient       ethDataClient;  // defined in Section 6c
+extern uint32_t       curBaud;         // defined in Section 6
+extern EthernetClient ethCtrlClient;    // defined in Section 6c
+extern EthernetClient ethDataClient;    // defined in Section 6c
 
 static void cmdGetLink(void)
 {
   cp.sendACK(false);
-  cp.println((bool)userial);
+  cp.println(isDeviceConnected(data.ActiveDevice));
+}
+
+// -----------------------------------------------------------------------------
+// GDEV / SDEV,<n> — get/set which downstream port (1-4) the upstream data
+// path (Serial + EthDataPort) is bridged to. The newly-selected port's ring
+// buffer (Section 6) starts flushing to the upstream on the very next
+// RepeaterModeLoop() pass — no separate "flush on switch" step is needed,
+// since the loop always flushes whichever port is currently selected.
+// -----------------------------------------------------------------------------
+static void cmdGetDev(void)
+{
+  if (!cp.checkExpectedArgs(0)) return;
+  cp.sendACK(false);
+  cp.println((int)data.ActiveDevice);
+}
+
+static void cmdSetDev(void)
+{
+  if (!cp.checkExpectedArgs(1)) return;
+
+  int n;
+  if (!cp.getValue(&n, 1, DEVPORT_COUNT))
+  {
+    cp.sendNAK(ERR_BADARG);
+    return;
+  }
+
+  data.ActiveDevice = (uint8_t)n;
+  cp.sendACK();
+}
+
+// -----------------------------------------------------------------------------
+// GADCDEV / SADCDEV,<n> — get/set which downstream port (1-4) ADCThread and
+// the GAACE_Script demo send to. Deliberately independent of GDEV/SDEV: see
+// the command table comment above.
+// -----------------------------------------------------------------------------
+static void cmdGetAdcDev(void)
+{
+  if (!cp.checkExpectedArgs(0)) return;
+  cp.sendACK(false);
+  cp.println((int)data.AdcTargetDevice);
+}
+
+static void cmdSetAdcDev(void)
+{
+  if (!cp.checkExpectedArgs(1)) return;
+
+  int n;
+  if (!cp.getValue(&n, 1, DEVPORT_COUNT))
+  {
+    cp.sendNAK(ERR_BADARG);
+    return;
+  }
+
+  data.AdcTargetDevice = (uint8_t)n;
+  cp.sendACK();
+}
+
+// -----------------------------------------------------------------------------
+// GDEVSTAT — one row per downstream port: dev, connected, bytesWaiting,
+// bytesDropped. bytesDropped is a monotonic since-boot counter (Section 6
+// never auto-clears it, including on flush) so a host that wasn't watching
+// can still tell whether a port's "nothing is lost" promise actually held.
+// -----------------------------------------------------------------------------
+static void cmdGetDevStat(void)
+{
+  if (!cp.checkExpectedArgs(0)) return;
+
+  cp.sendACK(false);
+  cp.println("#dev,connected,bytesWaiting,bytesDropped");
+  for (uint8_t i = 1; i <= DEVPORT_COUNT; i++)
+  {
+    cp.print((int)i);                            cp.print(",");
+    cp.print(isDeviceConnected(i));               cp.print(",");
+    cp.print((int)deviceBytesWaiting(i));         cp.print(",");
+    cp.println(deviceBytesDropped(i));
+  }
 }
 
 // -----------------------------------------------------------------------------
@@ -378,7 +515,7 @@ static void cmdSetBaud(void)
   }
 
   curBaud = b;
-  if ((bool)userial) userial.begin(curBaud);
+  reinitDeviceBaud(data.ActiveDevice, curBaud);
   cp.sendACK();
 }
 
@@ -557,114 +694,265 @@ static void cmdGetAdc(void)
 }
 
 // =============================================================================
-//  SECTION 6 — REPEATER MODE
+//  SECTION 6 — REPEATER MODE (4 downstream ports, Hub Carrier board)
 // =============================================================================
 //
 //  PC <-> Teensy device port (micro-USB, SerialUSB1 shares the connector) <->
-//  Teensy host port (5-pin header) <-> downstream VCP device. As of Section
-//  6c, a connected Ethernet client on EthDataPort is a second possible "PC"
-//  for this same link — see `pcSide` below.
+//  Teensy host port (5-pin header) <-> USB2514B hub <-> one of 4 downstream
+//  USB-A ports. As of Section 6c, a connected Ethernet client on EthDataPort
+//  is a second possible "PC" for this same link — see `pcSide` below.
+//
+//  TOPOLOGY
+//  --------
+//  All 4 downstream ports stay connected/auto-reconnecting continuously,
+//  independent of which one the host is looking at (devPortUpdateConnection()
+//  below runs on all 4 every tick). Each port has its own ring buffer
+//  (devPort[i].rxbuf) that captures incoming bytes continuously too — so a
+//  device that chatters unsolicited while not selected is never silently
+//  lost. Only ONE port at a time can be bridged to the upstream data path
+//  (Serial + EthDataPort): the hardware doesn't have more upstream USB
+//  endpoints to spare (see TODO.md), and giving every port its own Ethernet
+//  port is still future work. data.ActiveDevice (1-4, SDEV/GDEV) selects it.
+//
+//  The host is responsible for mapping port number to device identity/
+//  function — it does this itself, by switching SDEV through 1-4 and asking
+//  each one GNAME/GVER over the ordinary passthrough path. Firmware doesn't
+//  try to identify what's plugged into a port; that would require injecting
+//  and parsing a command on every connect, which is real complexity this
+//  design deliberately avoids by pushing the decision to the host instead.
+//
+//  RING BUFFER / FLUSH MODEL
+//  -------------------------
+//  Every tick: drain available bytes from ALL 4 ports into their own ring
+//  buffers (devPortDrainIncoming()), unconditionally. Then flush ONLY the
+//  currently-selected port's buffer out to the upstream (devPortFlush()).
+//  This one mechanism covers both live forwarding (the selected port's
+//  buffer drains about as fast as it fills, so latency in steady state is
+//  the same as direct passthrough) and "deliver the backlog" when SDEV
+//  switches to a port that's been accumulating in the background — nothing
+//  special has to happen at the moment of switching, because the flush step
+//  doesn't care whether the backlog built up over one tick or a thousand.
+//
+//  Overflow policy (decided): drop incoming bytes once a port's buffer is
+//  full, preserving the order of what's already queued, rather than
+//  overwriting old data with new. Either way data gets lost once genuinely
+//  full — devPort[i].rxDropped is a monotonic since-boot counter (GDEVSTAT)
+//  so that loss is at least visible, never silent.
 //
 //  Runs unthrottled from loop() — do not add commandProcessor traffic or
 //  other blocking work to this path; it must stay fast enough to keep up
-//  with the downstream device's baud rate.
+//  with the downstream devices' baud rate.
 
 USBHost             myusb;
 USBHub              hub1(myusb);
-USBSerial_BigBuffer userial(myusb);   // handles FS (64 B) and HS (512 B) CDC devices
+USBSerial_BigBuffer userial1(myusb);
+USBSerial_BigBuffer userial2(myusb);
+USBSerial_BigBuffer userial3(myusb);
+USBSerial_BigBuffer userial4(myusb);
 
-uint32_t curBaud      = 115200;
-bool     wasConnected = false;
-uint8_t  repeaterBuf[512];
+// Indexed 0..DEVPORT_COUNT-1; devPort[]/the command handlers above use
+// 1-based device numbers throughout (dev1based - 1 to index in here).
+USBSerial_BigBuffer *userialPtr[DEVPORT_COUNT] = { &userial1, &userial2, &userial3, &userial4 };
+
+uint32_t curBaud = 115200;   // shared across all 4 ports; set via SBAUD or Serial.baud() auto-follow
+uint8_t  repeaterBuf[512];   // shared scratch buffer for all per-port USB reads
+
+struct DevPort
+{
+  bool     wasConnected       = false;
+  uint16_t rxHead             = 0;  // ring buffer write index
+  uint16_t rxTail             = 0;  // ring buffer read index
+  uint16_t rxCount            = 0;  // bytes currently buffered
+  uint32_t rxDropped          = 0;  // bytes dropped because the buffer was full, since boot
+  uint32_t swallowUntilMs     = 0;  // while millis() < this, incoming bytes are discarded (ADC/script injection reply — Section 6a/6b)
+  uint32_t lastHostToDeviceMs = 0;  // last time host traffic was forwarded TO this port (ADC/script quiet guard)
+  uint8_t  rxbuf[DEVPORT_RINGBUF_SIZE];
+};
+
+DevPort devPort[DEVPORT_COUNT];
 
 // Whichever source (Serial, or the Ethernet data client — Section 6c) most
-// recently sent bytes to the device. Downstream device -> PC bytes are
-// written only here: "last speaker wins", the same pattern
-// commandProcessor::processStreams() already uses
+// recently sent bytes to whichever device is currently selected. Downstream
+// device -> PC bytes are written only here: "last speaker wins", the same
+// pattern commandProcessor::processStreams() already uses
 // (`serial = streams[i]; // route replies back to the stream that sent the command`).
 // This settles *who gets the reply*; it does not stop two sources from
-// writing to `userial` in the same loop pass if both have data available at
-// once — see Section 6c for why that's accepted as a known edge case rather
-// than solved with hard exclusivity.
+// writing to the same device in the same loop pass if both have data
+// available at once — see Section 6c for why that's accepted as a known
+// edge case rather than solved with hard exclusivity. Not per-port: it's
+// about which upstream *channel* the host is using, independent of which
+// device SDEV currently points at (switching devices over the control port
+// doesn't change which passthrough channel the host is using for data).
 Stream *pcSide = &Serial;
 
-// State shared with ADCUpdate() (Section 6a) so an injected command doesn't
-// collide with in-flight PC<->device traffic. See Section 6a for the full
-// explanation of both guards.
-uint32_t lastPcToDeviceMs = 0;   // updated whenever PC bytes are forwarded to the device
-uint32_t adcSwallowUntilMs = 0;  // while millis() < this, discard device->PC bytes
+// -----------------------------------------------------------------------------
+// Per-port accessors — forward-declared in Section 5 for the command
+// handlers there (GLINK, GDEVSTAT, SBAUD, ...).
+// -----------------------------------------------------------------------------
+bool isDeviceConnected(uint8_t dev1based)
+{
+  if (dev1based < 1 || dev1based > DEVPORT_COUNT) return false;
+  return (bool)(*userialPtr[dev1based - 1]);
+}
+
+uint16_t deviceBytesWaiting(uint8_t dev1based)
+{
+  if (dev1based < 1 || dev1based > DEVPORT_COUNT) return 0;
+  return devPort[dev1based - 1].rxCount;
+}
+
+uint32_t deviceBytesDropped(uint8_t dev1based)
+{
+  if (dev1based < 1 || dev1based > DEVPORT_COUNT) return 0;
+  return devPort[dev1based - 1].rxDropped;
+}
+
+void reinitDeviceBaud(uint8_t dev1based, uint32_t baud)
+{
+  if (dev1based < 1 || dev1based > DEVPORT_COUNT) return;
+  if (isDeviceConnected(dev1based)) userialPtr[dev1based - 1]->begin(baud);
+}
+
+// -----------------------------------------------------------------------------
+// devPortPush — accept one incoming byte into port idx's ring buffer.
+// Swallow check happens here (not at flush time): a byte arriving during
+// idx's swallow window is the reply to an ADCUpdate()/script-injected
+// command and is never meant for the host, on this port or any other, so it
+// must never enter the buffer at all — not dropped-and-counted (that's for
+// genuine overflow only), just discarded.
+// -----------------------------------------------------------------------------
+static void devPortPush(uint8_t idx, uint8_t b)
+{
+  DevPort &p = devPort[idx];
+  if (millis() < p.swallowUntilMs) return;
+
+  if (p.rxCount >= DEVPORT_RINGBUF_SIZE)
+  {
+    p.rxDropped++;   // overflow: drop incoming, keep what's already queued
+    return;
+  }
+
+  p.rxbuf[p.rxHead] = b;
+  p.rxHead = (uint16_t)((p.rxHead + 1) % DEVPORT_RINGBUF_SIZE);
+  p.rxCount++;
+}
+
+// Drain whatever's available from userialPtr[idx] into devPort[idx]'s ring
+// buffer. Runs for all 4 ports every tick, regardless of selection.
+static void devPortDrainIncoming(uint8_t idx)
+{
+  int n = userialPtr[idx]->available();
+  if (n <= 0) return;
+
+  n = userialPtr[idx]->readBytes((char *)repeaterBuf, min(n, (int)sizeof(repeaterBuf)));
+  for (int i = 0; i < n; i++) devPortPush(idx, repeaterBuf[i]);
+}
+
+// Write out everything currently buffered for port idx, in order, to `out`.
+// At most two write() calls (handles the ring's wraparound in two
+// contiguous runs) rather than one per byte.
+static void devPortFlush(uint8_t idx, Stream *out)
+{
+  DevPort &p = devPort[idx];
+  while (p.rxCount > 0)
+  {
+    uint16_t contiguous = (uint16_t)min((int)p.rxCount, (int)(DEVPORT_RINGBUF_SIZE - p.rxTail));
+    out->write(&p.rxbuf[p.rxTail], contiguous);
+    p.rxTail   = (uint16_t)((p.rxTail + contiguous) % DEVPORT_RINGBUF_SIZE);
+    p.rxCount -= contiguous;
+  }
+}
+
+// Attach/detach + auto-reconnect for one port. Runs on all 4 every tick,
+// independent of selection — a port reconnecting must not depend on whether
+// it's the one currently bridged to the upstream.
+static void devPortUpdateConnection(uint8_t idx)
+{
+  DevPort &p = devPort[idx];
+  bool connected = (bool)(*userialPtr[idx]);
+
+  if (connected && !p.wasConnected) userialPtr[idx]->begin(curBaud);
+  p.wasConnected = connected;
+}
 
 void RepeaterModeSetup(void)
 {
-  pinMode(LED_BUILTIN, OUTPUT);       // LED = downstream device connected
+  pinMode(LED_BUILTIN, OUTPUT);       // LED = ActiveDevice connected
   Serial.begin(115200);               // native USB, baud value ignored
+
+  // Strap + reset the USB2514B hub (no hardware straps on this board — see
+  // UsbHubBoot.h). Must happen before myusb.begin(): run() leaves the hub
+  // deliberately detached (VBUS_DET low) so it never attaches mid-strap;
+  // attach() is what lets the now-running host stack actually see it.
+  UsbHubBoot::run();
   myusb.begin();                      // enables host port VBUS
+  UsbHubBoot::attach();
 }
 
 void RepeaterModeLoop(void)
 {
   myusb.Task();
 
-  bool connected = userial;
-
-  // Downstream device attach / detach
-  if (connected && !wasConnected)
+  // Connection management + incoming capture: all 4 ports, every tick,
+  // unconditionally. This is what makes "nothing is lost" true regardless
+  // of what's selected.
+  for (uint8_t i = 0; i < DEVPORT_COUNT; i++)
   {
-    userial.begin(curBaud);
-    digitalWriteFast(LED_BUILTIN, HIGH);
+    devPortUpdateConnection(i);
+    devPortDrainIncoming(i);
   }
-  else if (!connected && wasConnected)
-  {
-    digitalWriteFast(LED_BUILTIN, LOW);
-  }
-  wasConnected = connected;
 
-  // Follow the baud rate the PC application sets (matters for FTDI/CP210x/CH340 bridges)
+  uint8_t selIdx = (uint8_t)(data.ActiveDevice - 1);
+  if (selIdx >= DEVPORT_COUNT) selIdx = 0;   // defensive; ActiveDevice is range-checked at SDEV time
+  USBSerial_BigBuffer *sel = userialPtr[selIdx];
+  bool connected = (bool)(*sel);
+
+  digitalWriteFast(LED_BUILTIN, connected ? HIGH : LOW);
+
+  // Follow the baud rate the PC application sets (matters for FTDI/CP210x/CH340 bridges).
+  // Applies only to the selected device — the one actually receiving PC traffic right now.
   uint32_t b = Serial.baud();
   if (b != 0 && b != curBaud)
   {
     curBaud = b;
-    if (connected) userial.begin(curBaud);
+    if (connected) sel->begin(curBaud);
   }
 
-  if (!connected) return;
-
-  // PC -> device. Both Serial and a connected Ethernet data client can drive
-  // the link; whichever one actually sends bytes this pass becomes pcSide,
-  // so the reply below goes back to whoever just spoke. If both have data in
-  // the same pass, both still get forwarded here (in this order) and can
-  // interleave on the wire to the downstream device — see Section 6c.
-  int n = Serial.available();
-  if (n > 0)
+  // PC -> device: only meaningful if the selected device is actually
+  // connected. Both Serial and a connected Ethernet data client can drive
+  // it; whichever one actually sends bytes this pass becomes pcSide, and
+  // also marks this port as "just heard from the host" for ADCUpdate()'s
+  // quiet guard (Section 6a). If both have data in the same pass, both
+  // still get forwarded here (in this order) and can interleave on the
+  // wire — see Section 6c.
+  if (connected)
   {
-    n = Serial.readBytes((char *)repeaterBuf, min(n, (int)sizeof(repeaterBuf)));
-    userial.write(repeaterBuf, n);
-    lastPcToDeviceMs = millis();   // tells ADCUpdate() the link was just busy
-    pcSide = &Serial;
-  }
-
-  if (ethDataClient && ethDataClient.connected())
-  {
-    int n2 = ethDataClient.available();
-    if (n2 > 0)
+    int n = Serial.available();
+    if (n > 0)
     {
-      n2 = ethDataClient.read(repeaterBuf, min(n2, (int)sizeof(repeaterBuf)));
-      userial.write(repeaterBuf, n2);
-      lastPcToDeviceMs = millis();
-      pcSide = &ethDataClient;
+      n = Serial.readBytes((char *)repeaterBuf, min(n, (int)sizeof(repeaterBuf)));
+      sel->write(repeaterBuf, n);
+      devPort[selIdx].lastHostToDeviceMs = millis();
+      pcSide = &Serial;
+    }
+
+    if (ethDataClient && ethDataClient.connected())
+    {
+      int n2 = ethDataClient.available();
+      if (n2 > 0)
+      {
+        n2 = ethDataClient.read(repeaterBuf, min(n2, (int)sizeof(repeaterBuf)));
+        sel->write(repeaterBuf, n2);
+        devPort[selIdx].lastHostToDeviceMs = millis();
+        pcSide = &ethDataClient;
+      }
     }
   }
 
-  // Device -> PC — written only to pcSide, not broadcast to both.
-  n = userial.available();
-  if (n > 0)
-  {
-    n = userial.readBytes((char *)repeaterBuf, min(n, (int)sizeof(repeaterBuf)));
-    // Discard bytes that are (most likely) the downstream device's reply to
-    // an ADCUpdate()-injected command instead of forwarding them to the PC —
-    // see Section 6a. Outside that short window, behavior is unchanged.
-    if (millis() >= adcSwallowUntilMs) pcSide->write(repeaterBuf, n);
-  }
+  // Device -> PC: flush whatever's buffered for the selected port, to
+  // whoever last spoke. Flushed even if the device isn't connected right
+  // now — a backlog captured before a disconnect is still worth delivering.
+  devPortFlush(selIdx, pcSide);
 }
 
 // =============================================================================
@@ -673,24 +961,30 @@ void RepeaterModeLoop(void)
 //
 //  ADCUpdate() runs on ADCThread (registered in setup()), independent of the
 //  active mode, so it keeps working while REPEATER mode is active. It writes
-//  directly to `userial` — the same link RepeaterModeLoop() pumps PC<->device
-//  traffic over — because that IS the connection to the device being
-//  controlled. There is no framing on that raw byte stream, so two guards
-//  keep injected commands from colliding with ordinary repeater traffic:
+//  directly to data.AdcTargetDevice's userial — a specific downstream port,
+//  independent of whatever data.ActiveDevice (SDEV) the host currently has
+//  selected — because that IS the connection to the device being
+//  controlled. There is no framing on that raw byte stream, so two guards,
+//  now tracked per-port (DevPort::lastHostToDeviceMs/swallowUntilMs, Section
+//  6), keep injected commands from colliding with ordinary repeater traffic:
 //
-//   1. QUIET GUARD (before sending): skip this cycle if the PC forwarded
-//      bytes to the device within the last ADC_QUIET_GUARD_MS. Reduces the
-//      chance of splicing our own bytes into the middle of a PC-initiated
-//      command that's still arriving.
+//   1. QUIET GUARD (before sending): skip this cycle if the host forwarded
+//      bytes to THIS port within the last ADC_QUIET_GUARD_MS. Only actually
+//      possible if the ADC target happens to also be the selected device —
+//      a non-selected port's timestamp just sits stale, which correctly
+//      never blocks an injection. Reduces the chance of splicing our own
+//      bytes into the middle of a host-initiated command that's still
+//      arriving.
 //
 //   2. SWALLOW WINDOW (after sending): for ADC_SWALLOW_WINDOW_MS after
-//      injecting, RepeaterModeLoop() discards device->PC bytes instead of
-//      forwarding them, so the downstream device's reply to our command
-//      doesn't show up as unsolicited bytes in the PC application's stream.
+//      injecting, devPortPush() (Section 6) discards this port's incoming
+//      bytes instead of buffering them, so the downstream device's reply to
+//      our command can never reach the host — on this port or any other —
+//      whether or not it happens to be selected right now.
 //
 //  Neither guard is a hard guarantee — a downstream device that replies
 //  unusually slowly could see its reply forwarded anyway (swallow window
-//  expired), and a PC command that happens to start in the few mS after an
+//  expired), and a host command that happens to start in the few mS after an
 //  injection could still overlap it. They are heuristics sized for typical
 //  short ASCII command/reply traffic, not a real bus arbitration protocol.
 //  Widen the windows here if your downstream device is slower to reply.
@@ -701,9 +995,12 @@ void RepeaterModeLoop(void)
 void ADCUpdate(void)
 {
   if (!data.AdcEnabled) return;
-  if (!(bool)userial)   return;   // nothing connected to control
 
-  if ((millis() - lastPcToDeviceMs) < ADC_QUIET_GUARD_MS) return;  // link busy, try next cycle
+  uint8_t idx = (uint8_t)(data.AdcTargetDevice - 1);
+  if (idx >= DEVPORT_COUNT) return;   // defensive; AdcTargetDevice is range-checked at SADCDEV time
+  if (!(bool)(*userialPtr[idx])) return;   // nothing connected to control
+
+  if ((millis() - devPort[idx].lastHostToDeviceMs) < ADC_QUIET_GUARD_MS) return;  // link busy, try next cycle
 
   float counts = readAdcCounts();
   float value  = data.AdcScaleM * counts + data.AdcScaleB;
@@ -713,8 +1010,8 @@ void ADCUpdate(void)
   if (len <= 0) return;
   if (len >= (int)sizeof(cmdLine)) len = sizeof(cmdLine) - 1;  // truncated; still send what fits
 
-  userial.write((uint8_t *)cmdLine, len);
-  adcSwallowUntilMs = millis() + ADC_SWALLOW_WINDOW_MS;
+  userialPtr[idx]->write((uint8_t *)cmdLine, len);
+  devPort[idx].swallowUntilMs = millis() + ADC_SWALLOW_WINDOW_MS;
 }
 
 // =============================================================================
@@ -725,9 +1022,10 @@ void ADCUpdate(void)
 //  that file's header for the regeneration command) in slot 0 of `scripts`
 //  (the GAACEScript::ScriptRuntime declared in Section 3), alongside
 //  ADCThread. This is a real integration, not a standalone toy: the syscalls
-//  below drive the actual downstream link (userial), the actual calibration
-//  fields (AdcPin/AdcScaleM/AdcScaleB/AdcCmdName), and the same guard/swallow
-//  state (lastPcToDeviceMs/adcSwallowUntilMs) ADCUpdate() uses, so the two
+//  below drive the actual downstream link for data.AdcTargetDevice (the same
+//  target ADCThread uses), the actual calibration fields (AdcPin/AdcScaleM/
+//  AdcScaleB/AdcCmdName), and that port's own guard/swallow state
+//  (DevPort::lastHostToDeviceMs/swallowUntilMs, Section 6) — so the two
 //  features can't collide with ordinary repeater traffic any differently
 //  than ADCUpdate() already doesn't.
 //
@@ -745,7 +1043,7 @@ void ADCUpdate(void)
 //
 //  Syscall ids (must match scripts.registerSyscall() call order in setup(),
 //  and the `syscall NAME(...) = ID;` declarations in gaace_scripts/adc_demo.gs):
-//    0 = link_ready()      — userial connected AND quiet-guard elapsed
+//    0 = link_ready()      — data.AdcTargetDevice connected AND quiet-guard elapsed
 //    1 = read_adc()         — readAdcCounts() rounded to int32 via lroundf()
 //                             (the VM is int32-only; see readAdcCounts()'s
 //                             own comment in Section 5 for the averaging)
@@ -758,8 +1056,11 @@ using namespace GAACEScript;
 static int32_t sys_link_ready(int32_t *args, uint8_t argc)
 {
   (void)args; (void)argc;
-  if (!(bool)userial) return 0;                                    // nothing connected
-  if ((millis() - lastPcToDeviceMs) < ADC_QUIET_GUARD_MS) return 0; // link busy
+
+  uint8_t idx = (uint8_t)(data.AdcTargetDevice - 1);
+  if (idx >= DEVPORT_COUNT) return 0;
+  if (!(bool)(*userialPtr[idx])) return 0;                                      // nothing connected
+  if ((millis() - devPort[idx].lastHostToDeviceMs) < ADC_QUIET_GUARD_MS) return 0; // link busy
   return 1;
 }
 
@@ -772,6 +1073,10 @@ static int32_t sys_read_adc(int32_t *args, uint8_t argc)
 static int32_t sys_scale_send(int32_t *args, uint8_t argc)
 {
   (void)argc;
+
+  uint8_t idx = (uint8_t)(data.AdcTargetDevice - 1);
+  if (idx >= DEVPORT_COUNT) return 0;
+
   float value = data.AdcScaleM * (float)args[0] + data.AdcScaleB;
 
   char cmdLine[48];
@@ -779,13 +1084,13 @@ static int32_t sys_scale_send(int32_t *args, uint8_t argc)
   if (len <= 0) return 0;
   if (len >= (int)sizeof(cmdLine)) len = sizeof(cmdLine) - 1;  // truncated; still send what fits
 
-  userial.write((uint8_t *)cmdLine, len);
-  adcSwallowUntilMs = millis() + ADC_SWALLOW_WINDOW_MS;
+  userialPtr[idx]->write((uint8_t *)cmdLine, len);
+  devPort[idx].swallowUntilMs = millis() + ADC_SWALLOW_WINDOW_MS;
   return 1;
 }
 
 // =============================================================================
-//  SECTION 6c — ETHERNET (single downstream device)
+//  SECTION 6c — ETHERNET
 // =============================================================================
 //
 //  Two independent TCP servers, both single-session ("latest connection
@@ -795,13 +1100,16 @@ static int32_t sys_scale_send(int32_t *args, uint8_t argc)
 //
 //    ethCtrlServer / ethCtrlClient — mirrors SerialUSB1: registered with
 //      cp.registerStream() once in EthernetSetup(), so every command
-//      (GVER, GMODE, SADCxxx, ...) works verbatim over this TCP port with no
-//      command-processor changes.
+//      (GVER, GMODE, SDEV, SADCxxx, ...) works verbatim over this TCP port
+//      with no command-processor changes.
 //
 //    ethDataServer / ethDataClient — a second passthrough source for
-//      RepeaterModeLoop() (Section 6), alongside Serial. See `pcSide` there
-//      for how replies are routed back to whichever source spoke most
-//      recently.
+//      RepeaterModeLoop() (Section 6), alongside Serial, bridged to
+//      whichever port data.ActiveDevice currently selects. See `pcSide`
+//      there for how replies are routed back to whichever source spoke most
+//      recently. One data port shared across all 4 downstream devices for
+//      now (matching Serial's single switchable upstream path) — a
+//      dedicated TCP port per device is still future work (see TODO.md).
 //
 //  Both client globals are reused across reconnects (`ethXClient = newClient`
 //  inside EthernetUpdate() below) rather than replaced, because
@@ -815,8 +1123,9 @@ static int32_t sys_scale_send(int32_t *args, uint8_t argc)
 //  KNOWN LIMITATION (carried over from design discussion, not solved here):
 //  pcSide (Section 6) resolves who gets a reply, not simultaneous writes. If
 //  Serial and ethDataClient both have bytes available in the same
-//  RepeaterModeLoop() pass, both still get forwarded to userial that pass
-//  and can interleave on the wire. This only bites under sustained
+//  RepeaterModeLoop() pass, both still get forwarded to the selected
+//  device's userial that pass and can interleave on the wire. This only bites
+//  under sustained
 //  concurrent traffic from both sides at once, not "one connected while the
 //  other is idle" — accepted as a known edge case, same as the equivalent
 //  ADC-injection guards are heuristics rather than a real bus-arbitration
@@ -977,11 +1286,11 @@ void setup()
 // =============================================================================
 //
 //  processStreams()/processCommands() service SerialUSB1 only, so they never
-//  compete with the repeater's Serial <-> userial byte pump. control.run()
-//  drives the thread pool, including ADCThread — which runs regardless of the
-//  active mode, so it keeps working during REPEATER mode. The active mode's
-//  loop() runs
-//  last and unconditionally, at full speed, every iteration.
+//  compete with the repeater's Serial <-> downstream-device byte pump.
+//  control.run() drives the thread pool, including ADCThread — which runs
+//  regardless of the active mode, so it keeps working during REPEATER mode.
+//  The active mode's loop() runs last and unconditionally, at full speed,
+//  every iteration.
 
 void loop()
 {

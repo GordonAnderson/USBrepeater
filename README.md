@@ -7,16 +7,22 @@ and [ArduinoThread](https://github.com/GordonAnderson/ArduinoThread), following
 the same layout as [GordonAnderson/Template](https://github.com/GordonAnderson/Template).
 
 At its core it transparently relays a USB CDC connection from a PC through the
-Teensy's USB host port to a downstream USB CDC device, exactly like a plain
-USB-to-USB serial repeater. On top of that it adds a GAACE command processor,
-a mode framework, a cooperative thread scheduler, persistent settings, and a
-periodic ADC-driven control feature — all running alongside the passthrough
-without disturbing it.
+Teensy's USB host port to one of up to 4 downstream USB CDC devices, exactly
+like a plain USB-to-USB serial repeater with a switch on the downstream side.
+On top of that it adds a GAACE command processor, a mode framework, a
+cooperative thread scheduler, persistent settings, Ethernet, and a periodic
+ADC-driven control feature — all running alongside the passthrough without
+disturbing it.
 
 ## Hardware
 
 - Teensy 4.1
-- Downstream USB CDC device connected to the Teensy's host port (5-pin header)
+- Either a single downstream USB CDC device wired directly to the Teensy's
+  host port (5-pin header), or the **USBrepeater Hub Carrier** board — a
+  Microchip USB2514B 4-port hub on that same host port, driving 4 downstream
+  USB-A ports plus an analog input and digital I/O (see
+  [TODO.md](TODO.md)'s "Hardware-verified development plan" for the full
+  schematic review)
 - PC connected to the Teensy's micro-USB (device) port
 
 ## USB port layout
@@ -123,6 +129,36 @@ one mode:
 Adding a mode: append to the `SystemMode` enum, write a
 `<Mode>Setup()`/`<Mode>Loop()` pair, add a row to `modeTable[]`. See
 [TODO.md](TODO.md) for planned additions.
+
+### Downstream ports
+
+4 downstream USB-A ports (via the Hub Carrier's USB2514B), each with its own
+`USBSerial_BigBuffer` and ring buffer. All 4 stay connected and
+auto-reconnecting continuously, and each one **keeps capturing incoming
+bytes into its own buffer regardless of whether it's currently
+selected** — so a device that sends unsolicited chatter while not in focus
+is never silently lost. Only one port at a time is bridged to the upstream
+data path (`Serial` + the Ethernet data port): `SDEV,<n>` / `GDEV` selects
+it. Switching delivers that port's buffered backlog on the very next tick,
+with no separate "flush" step — the firmware always flushes whichever port
+is currently selected, so the backlog built up while it wasn't just goes out
+immediately once it is.
+
+Identifying what's plugged into which port is **the host's job, not
+firmware's**: switch `SDEV` through 1–4 and ask each one `GNAME`/`GVER`
+yourself over the ordinary passthrough path to build your own port-to-device
+table. Firmware never tries to identify a device itself.
+
+`ADCThread` and the script demo (below) target a separate, independent
+selection — `SADCDEV,<n>` / `GADCDEV` — so switching which device the host
+is interactively looking at never interrupts background monitoring of a
+different one.
+
+`GDEVSTAT` reports one line per port: `dev,connected,bytesWaiting,
+bytesDropped`. `bytesDropped` is a monotonic since-boot counter — if a
+port's buffer genuinely fills (new bytes are dropped, not oldest-overwritten,
+so order is preserved for whatever's already queued), this is how you'd
+know, even if nobody was watching at the time.
 
 ### Threading
 
@@ -232,8 +268,11 @@ every registered command and its help string, `HELP,<cmd>` looks up one.
 | `RESTORE` | Restore settings from EEPROM |
 | `GMODE` | Active mode, index and name |
 | `SMODE,<index>` | Switch active mode (not persisted until `SAVE`) |
-| `GLINK` | Downstream USB device connection state (`TRUE`/`FALSE`) |
+| `GLINK` | Active device's USB connection state (`TRUE`/`FALSE`) |
 | `GBAUD` / `SBAUD,<baud>` | Baud rate to the downstream device; set explicitly for Ethernet-only use |
+| `GDEV` / `SDEV,<n>` | Get/set which downstream port (1-4) the upstream data path is bridged to |
+| `GADCDEV` / `SADCDEV,<n>` | Get/set which downstream port (1-4) `ADCThread`/the script demo targets |
+| `GDEVSTAT` | Per-port: `dev,connected,bytesWaiting,bytesDropped` |
 | `GETHDHCP` / `SETHDHCP,TRUE\|FALSE` | DHCP vs. static IP; reboot to apply |
 | `GETHIP` / `SETHIP,<a.b.c.d>` | Static IP address; reboot to apply |
 | `GETHMASK` / `SETHMASK,<a.b.c.d>` | Static subnet mask; reboot to apply |
@@ -274,7 +313,10 @@ manual vendoring required.
 
 ## Planned work
 
-Single-device Ethernet is implemented (above). See [TODO.md](TODO.md) for
-the remaining open work: real-hardware network validation, and the settled
-design for expanding to multiple downstream devices via a USB hub (which
-also generalizes Ethernet to one TCP port per device).
+Single-device Ethernet, hub bring-up, and 4-device downstream support are
+all implemented (above) — see [TODO.md](TODO.md) for exactly what's
+real-hardware-verified versus compile-verified-only so far. Remaining open
+work there: real-hardware validation of the 4-port hub and the downstream
+ring buffers, the REF-channel ADC calibration correction, digital I/O
+command support, and giving each downstream device its own Ethernet TCP
+port instead of sharing the one switchable data port.
