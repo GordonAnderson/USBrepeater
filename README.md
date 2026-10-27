@@ -246,6 +246,21 @@ the exact command) and committing the regenerated
 [include/ScriptBytecode.h](include/ScriptBytecode.h) — there's no build-time
 codegen step yet.
 
+### Loading scripts at runtime (no reflash)
+
+`SCRIPTLOAD,<slot>,<hex>` sends a compiled script over the control port
+without touching firmware — but it's decoded through `commandProcessor`'s
+shared 512-byte scratch arena, so one call can only ever deliver roughly
+250 decoded bytes, independent of `GAACE_SCRIPT_MAX_CODE_LEN` (bumped to
+2048 here to give scripts real room to grow). Anything larger goes through
+`SCRIPTAPPEND,<slot>,<offset>,<hexchunk>` (one or more calls, each well
+under the arena's ceiling) followed by `SCRIPTCOMMIT,<slot>,<totalLen>` to
+finalize it — `tools/gsc.py --upload` in
+[GAACE_Script](https://github.com/GordonAnderson/GAACE_Script) picks
+single-`SCRIPTLOAD` vs. chunked automatically based on size, so this is
+usually invisible day to day. See that repo's `WORKFLOW.md` for the full
+walkthrough.
+
 ### Persistence
 
 Settings live in the `Data` struct (`include/USBrepeater.h`), saved to and
@@ -287,7 +302,9 @@ every registered command and its help string, `HELP,<cmd>` looks up one.
 | `GADCM` / `SADCM,<m>` | ADC scale slope |
 | `GADCB` / `SADCB,<b>` | ADC scale offset |
 | `GADC` | Read ADC now: averaged counts (2 decimals) + scaled value (4 decimals), no send |
-| `SCRIPTLOAD,<slot>,<hex>` | Load a compiled script (`gsc.py --format hex`) into a `GAACE_Script` slot |
+| `SCRIPTLOAD,<slot>,<hex>` | Load a compiled script (`gsc.py --format hex`) into a `GAACE_Script` slot in one call — capped at roughly 250 decoded bytes by `commandProcessor`'s shared 512-byte scratch arena, regardless of `GAACE_SCRIPT_MAX_CODE_LEN` |
+| `SCRIPTAPPEND,<slot>,<offset>,<hexchunk>` | Write one chunk of a larger script into a slot's buffer at `offset`; marks the slot not-loaded until `SCRIPTCOMMIT` finalizes it |
+| `SCRIPTCOMMIT,<slot>,<totalLen>` | Finalize a buffer assembled via `SCRIPTAPPEND` calls and make the slot runnable |
 | `GSCRIPTLIMITS` | `slots,maxCodeLen,stackSize,varSlots,maxSyscalls` for the script runtime |
 | `GSCRIPTST,<slot>` | `loaded(0\|1),lastStatus` for one script slot |
 | `GCMDS` | List all commands and help strings |

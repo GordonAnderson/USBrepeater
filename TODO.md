@@ -606,6 +606,30 @@ a new constraint.
       rather than exercising `SCRIPTLOAD` live, but the capability itself —
       the original "download without reflashing" motivation — is real now,
       not just proposed
+- [x] **Resolved (2026-10-27): `SCRIPTLOAD`'s single-call size ceiling.**
+      `SCRIPTLOAD`'s hex argument is decoded through `commandProcessor`'s
+      shared 512-byte `charAllocate` scratch arena, so one call can only
+      ever deliver roughly 250 decoded bytes — raising
+      `GAACE_SCRIPT_MAX_CODE_LEN` alone doesn't help, since the payload
+      can't arrive in one piece regardless of the destination buffer size.
+      `GAACE_Script` gained `SCRIPTAPPEND,<slot>,<offset>,<hexchunk>` +
+      `SCRIPTCOMMIT,<slot>,<totalLen>` to assemble a slot's buffer across
+      many small calls instead, each individually under the arena's
+      ceiling regardless of total script size; a partially-written buffer
+      is marked not-loaded until `SCRIPTCOMMIT` succeeds. `gsc.py --upload`
+      picks single-`SCRIPTLOAD` vs. chunked automatically based on size.
+      This firmware's `platformio.ini` now sets
+      `GAACE_SCRIPT_MAX_CODE_LEN=2048` (up from the library default 128) —
+      meaningfully raisable now that it bounds what `SCRIPTAPPEND` can
+      assemble, not what one command can transfer. Verified: fresh
+      `GAACE_Script` pull (commit `24a5135`), full build with the new
+      define, RAM delta exactly matching the expected `+7680` bytes
+      (4 slots x (2048-128)). **Not yet hardware-tested** — real-hardware
+      validation is on hold until the first Hub Carrier boards are
+      built (expected ~1-2 weeks from 2026-10-27); a flash attempt this
+      session got stuck waiting for the Teensy to enter bootloader mode
+      and was abandoned rather than chased further, since hardware
+      validation overall is blocked on boards anyway.
 - [x] Standard command set for load/start/stop/rate/limits, and whether N
       and per-VM limits should be per-project defines — all decided and
       implemented in `GAACE_Script`'s `ScriptRuntime` (see above): `N`
@@ -614,7 +638,12 @@ a new constraint.
       rather than adding new commands
 - [ ] Script *persistence* across reboot — still RAM-only. The
       filesystem-based save/load/load-on-boot idea (for platforms that have
-      one, e.g. Teensy 4.1's LittleFS) is still just an idea, not built
+      one, e.g. Teensy 4.1's LittleFS) is still just an idea, not built.
+      Explicitly the next piece of work after `SCRIPTAPPEND`/`SCRIPTCOMMIT`
+      above (per the user, 2026-10-27) — scoped as a following step, not
+      part of that round. Composes cleanly once started: saving/restoring a
+      slot's buffer to/from a file is plain buffer<->file I/O with no size
+      ceiling of its own, unlike the serial transfer that just got fixed
 - [ ] A general "device just rebooted" notification — raised during design
       discussion as a real gap (a host has no way to know a script's state
       was lost to an unexpected reset), but it's a GAACE_Core-level concern
