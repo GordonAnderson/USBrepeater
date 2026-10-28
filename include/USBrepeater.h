@@ -51,8 +51,10 @@ typedef struct
 
   // ── Downstream device selection (Hub Carrier board, 4 ports) ─────────────
   //  See USBrepeater.cpp Section 6. ActiveDevice is which downstream port the
-  //  single switchable upstream data path (Serial + EthDataPort) is bridged
-  //  to, settable via SDEV,<n>. AdcTargetDevice is which port ADCThread/the
+  //  single switchable Serial upstream path is bridged to, settable via
+  //  SDEV,<n> (each port also has its own always-reachable dedicated
+  //  Ethernet data port, independent of this selection — see EthDataPortBase
+  //  below). AdcTargetDevice is which port ADCThread/the
   //  GAACE_Script demo sends to — independent of ActiveDevice on purpose:
   //  switching which device the host is interactively looking at must not
   //  interrupt a background ADC feed to a different one. Both are 1-based,
@@ -79,20 +81,23 @@ typedef struct
   // (GTENA/STENA,Script0 and GTINT/STINT,Script0) rather than persisted
   // Data fields — see TODO.md for why that's RAM-only for now.
 
-  // ── Ethernet (single downstream device) ─────────────────────────────────
+  // ── Ethernet (control port + one dedicated data port per downstream device) ──
   //  See USBrepeater.cpp Section 6c. EthIP/EthSubnet/EthGateway are packed
   //  IPAddress values (uint32_t), used only when EthDHCP is false. All five
   //  fields take effect on the next boot (EthernetSetup() in setup()), not
   //  live — same "change now, SAVE, reboot to apply" convention as the
   //  Template's STWIADD. EthCtrlPort is a second command-processor stream
-  //  (same commands as SerialUSB1, over TCP); EthDataPort is a second
-  //  passthrough source for RepeaterModeLoop() (see `pcSide`, Section 6).
+  //  (same commands as SerialUSB1, over TCP). EthDataPortBase is device 1's
+  //  dedicated passthrough TCP port; devices 2-4 use EthDataPortBase+1,
+  //  +2, +3 — 4 independent, always-reachable ports, not one switchable
+  //  port like Serial/SDEV, since Ethernet isn't endpoint-limited the way
+  //  USB is. See `pcSide`/ethDataClient[], Section 6/6c.
   bool          EthDHCP;        // TRUE = DHCP, FALSE = the three static fields below
   uint32_t      EthIP;          // Static IP (only used when EthDHCP == FALSE)
   uint32_t      EthSubnet;      // Static subnet mask
   uint32_t      EthGateway;     // Static gateway
   int           EthCtrlPort;    // TCP port for the network control port (commandProcessor)
-  int           EthDataPort;    // TCP port for network passthrough
+  int           EthDataPortBase; // TCP port for device 1's passthrough; devices 2-4 use +1..+3
 
   unsigned int  Signature;      // Must equal SIGNATURE for the struct to be considered valid
 } Data;

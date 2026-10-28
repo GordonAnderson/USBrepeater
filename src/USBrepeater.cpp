@@ -22,11 +22,14 @@
 //  -------------------------------------------------------------------------
 //  4 downstream USB-A ports, all connected/auto-reconnecting continuously
 //  and each capturing incoming bytes into its own ring buffer regardless of
-//  selection (see Section 6). Only one is bridged to the upstream data path
-//  (Serial + EthDataPort) at a time — data.ActiveDevice, set via SDEV/GDEV —
-//  because the hardware doesn't have upstream USB endpoints to spare for
-//  more. The host is responsible for mapping port number to device identity:
-//  it switches SDEV through 1-4 and asks each one GNAME/GVER itself over the
+//  selection (see Section 6). On the USB side only one is bridged to the
+//  single switchable upstream path (Serial) at a time — data.ActiveDevice,
+//  set via SDEV/GDEV — because the hardware doesn't have upstream USB
+//  endpoints to spare for more. Ethernet isn't endpoint-limited the same
+//  way: each of the 4 ports also has its own dedicated, always-reachable
+//  TCP data port (EthDataPortBase+0..3, Section 6c), independent of SDEV.
+//  The host is responsible for mapping port number to device identity: it
+//  switches SDEV through 1-4 and asks each one GNAME/GVER itself over the
 //  ordinary passthrough path; firmware never tries to identify what's
 //  plugged in. ADCThread/the script demo (below) target a second,
 //  independent selection (data.AdcTargetDevice, SADCDEV/GADCDEV) so
@@ -173,8 +176,8 @@ Data DefaultData =
   0,              // EthIP        — 0.0.0.0; set explicitly before switching off DHCP
   0x00FFFFFF,     // EthSubnet    — 255.255.255.0 (packed as IPAddress(255,255,255,0))
   0,              // EthGateway   — 0.0.0.0; set explicitly before switching off DHCP
-  5000,           // EthCtrlPort  — TCP control port (same commands as SerialUSB1)
-  5001,           // EthDataPort  — TCP passthrough port
+  5000,           // EthCtrlPort     — TCP control port (same commands as SerialUSB1)
+  5001,           // EthDataPortBase — device 1's TCP passthrough port; devices 2-4 get 5002-5004
 
   SIGNATURE       // Signature — always last
 };
@@ -307,34 +310,39 @@ Command cmds[] =
   {"SBAUD",    CMDfunction,  1, (void *)cmdSetBaud,        NULL, "Set downstream baud rate; needed for Ethernet-only use (no Serial.baud() to follow)"},
 
   // ── Downstream device selection (Hub Carrier board, 4 ports) ────────────────
-  //  SDEV switches which port the upstream data path (Serial + EthDataPort)
-  //  bridges to; each port keeps capturing into its own ring buffer whether
-  //  selected or not, so switching never loses what a non-selected device
-  //  said — see Section 6. SADCDEV is a completely independent selection for
-  //  ADCThread/the script demo, so background monitoring of one device isn't
-  //  interrupted by switching interactive focus to another.
+  //  SDEV switches which port the single switchable Serial upstream path
+  //  bridges to (each port also has its own always-reachable Ethernet data
+  //  port, unaffected by this — see Section 6c); each port keeps capturing
+  //  into its own ring buffer whether selected or not, so switching never
+  //  loses what a non-selected device said — see Section 6. SADCDEV is a
+  //  completely independent selection for ADCThread/the script demo, so
+  //  background monitoring of one device isn't interrupted by switching
+  //  interactive focus to another.
   {"GDEV",     CMDfunction, -1, (void *)cmdGetDev,         NULL, "Get the active downstream device, 1-4"},
   {"SDEV",     CMDfunction, -1, (void *)cmdSetDev,         NULL, "Set the active downstream device, 1-4"},
   {"GADCDEV",  CMDfunction, -1, (void *)cmdGetAdcDev,      NULL, "Get ADCThread/script target device, 1-4"},
   {"SADCDEV",  CMDfunction, -1, (void *)cmdSetAdcDev,      NULL, "Set ADCThread/script target device, 1-4"},
   {"GDEVSTAT", CMDfunction,  0, (void *)cmdGetDevStat,     NULL, "Per-port status: dev,connected,bytesWaiting,bytesDropped"},
 
-  // ── Ethernet (single downstream device; see Section 6c) ────────────────────
-  //  EthCtrlPort mirrors every SerialUSB1 command over TCP. EthDataPort is a
-  //  second passthrough source for RepeaterModeLoop() alongside Serial — see
+  // ── Ethernet (control port + one dedicated data port per device; Section 6c) ─
+  //  EthCtrlPort mirrors every SerialUSB1 command over TCP. EthDataPortBase
+  //  is device 1's own dedicated passthrough TCP port; devices 2-4 get
+  //  EthDataPortBase+1/+2/+3 — 4 independent, always-reachable data ports,
+  //  not one switchable port like Serial. For the currently-SDEV-selected
+  //  device, that device's Ethernet port still competes with Serial — see
   //  `pcSide` in Section 6 for how replies are routed back to whichever one
-  //  spoke most recently. EthDHCP/EthIP/EthMask/EthGw take effect on the next
-  //  boot, not live; GETHSTAT always reflects live state.
-  {"?ETHDHCP",     CMDbool,     -1, (void *)&data.EthDHCP,      NULL, "Use DHCP (TRUE) or static IP (FALSE); reboot to apply"},
-  {"GETHIP",       CMDfunction, -1, (void *)cmdGetEthIp,        NULL, "Static IP address a.b.c.d; reboot to apply"},
-  {"SETHIP",       CMDfunction, -1, (void *)cmdSetEthIp,        NULL, "Set static IP address a.b.c.d; reboot to apply"},
-  {"GETHMASK",     CMDfunction, -1, (void *)cmdGetEthMask,      NULL, "Static subnet mask a.b.c.d; reboot to apply"},
-  {"SETHMASK",     CMDfunction, -1, (void *)cmdSetEthMask,      NULL, "Set static subnet mask a.b.c.d; reboot to apply"},
-  {"GETHGW",       CMDfunction, -1, (void *)cmdGetEthGw,        NULL, "Static gateway a.b.c.d; reboot to apply"},
-  {"SETHGW",       CMDfunction, -1, (void *)cmdSetEthGw,        NULL, "Set static gateway a.b.c.d; reboot to apply"},
-  {"?ETHCTRLPORT", CMDint,      -1, (void *)&data.EthCtrlPort,  portLimits, "TCP port for the network control port; reboot to apply"},
-  {"?ETHDATAPORT", CMDint,      -1, (void *)&data.EthDataPort,  portLimits, "TCP port for network passthrough; reboot to apply"},
-  {"GETHSTAT",     CMDfunction,  0, (void *)cmdGetEthStat,      NULL, "Live status: link,mode,ip,ctrlConnected,dataConnected"},
+  //  spoke most recently. EthDHCP/EthIP/EthMask/EthGw/EthDataPortBase take
+  //  effect on the next boot, not live; GETHSTAT always reflects live state.
+  {"?ETHDHCP",     CMDbool,     -1, (void *)&data.EthDHCP,         NULL, "Use DHCP (TRUE) or static IP (FALSE); reboot to apply"},
+  {"GETHIP",       CMDfunction, -1, (void *)cmdGetEthIp,           NULL, "Static IP address a.b.c.d; reboot to apply"},
+  {"SETHIP",       CMDfunction, -1, (void *)cmdSetEthIp,           NULL, "Set static IP address a.b.c.d; reboot to apply"},
+  {"GETHMASK",     CMDfunction, -1, (void *)cmdGetEthMask,         NULL, "Static subnet mask a.b.c.d; reboot to apply"},
+  {"SETHMASK",     CMDfunction, -1, (void *)cmdSetEthMask,         NULL, "Set static subnet mask a.b.c.d; reboot to apply"},
+  {"GETHGW",       CMDfunction, -1, (void *)cmdGetEthGw,           NULL, "Static gateway a.b.c.d; reboot to apply"},
+  {"SETHGW",       CMDfunction, -1, (void *)cmdSetEthGw,           NULL, "Set static gateway a.b.c.d; reboot to apply"},
+  {"?ETHCTRLPORT", CMDint,      -1, (void *)&data.EthCtrlPort,     portLimits, "TCP port for the network control port; reboot to apply"},
+  {"?ETHDATAPORT", CMDint,      -1, (void *)&data.EthDataPortBase, portLimits, "TCP base port for per-device passthrough: device N uses base+(N-1), N=1-4; reboot to apply"},
+  {"GETHSTAT",     CMDfunction,  0, (void *)cmdGetEthStat,         NULL, "Live status: link,mode,ip,ctrlConnected,dataConnected1,dataConnected2,dataConnected3,dataConnected4"},
 
   // ── Periodic ADC -> downstream-device command update ───────────────────────
   //  Runs on ADCThread regardless of the active mode. Each cycle sends
@@ -403,9 +411,9 @@ static void cmdSetMode(void)
 // currently enumerated. isDeviceConnected() etc. are declared earlier in this
 // section (forward declarations, implemented in Section 6).
 // -----------------------------------------------------------------------------
-extern uint32_t       curBaud;         // defined in Section 6
-extern EthernetClient ethCtrlClient;    // defined in Section 6c
-extern EthernetClient ethDataClient;    // defined in Section 6c
+extern uint32_t       curBaud;                        // defined in Section 6
+extern EthernetClient ethCtrlClient;                  // defined in Section 6c
+extern EthernetClient ethDataClient[DEVPORT_COUNT];   // defined in Section 6c
 
 static void cmdGetLink(void)
 {
@@ -414,11 +422,13 @@ static void cmdGetLink(void)
 }
 
 // -----------------------------------------------------------------------------
-// GDEV / SDEV,<n> — get/set which downstream port (1-4) the upstream data
-// path (Serial + EthDataPort) is bridged to. The newly-selected port's ring
-// buffer (Section 6) starts flushing to the upstream on the very next
-// RepeaterModeLoop() pass — no separate "flush on switch" step is needed,
-// since the loop always flushes whichever port is currently selected.
+// GDEV / SDEV,<n> — get/set which downstream port (1-4) Serial (the single
+// switchable USB upstream path) is bridged to. Does not affect Ethernet: each
+// port has its own dedicated, always-reachable data port there (Section 6c),
+// independent of this selection. The newly-selected port's ring buffer
+// (Section 6) starts flushing to Serial on the very next RepeaterModeLoop()
+// pass — no separate "flush on switch" step is needed, since the loop always
+// flushes the selected port's backlog to whoever last spoke to it.
 // -----------------------------------------------------------------------------
 static void cmdGetDev(void)
 {
@@ -596,9 +606,11 @@ static void cmdSetEthGw(void)
 }
 
 // -----------------------------------------------------------------------------
-// GETHSTAT — live network status: link,mode,ip,ctrlConnected,dataConnected.
-// Always reflects current runtime state (unlike the config getters above,
-// which read back the stored, possibly-not-yet-applied, EthIP/EthMask/EthGw).
+// GETHSTAT — live network status: link,mode,ip,ctrlConnected, then one
+// dataConnected flag per downstream device (1-4, each its own dedicated
+// Ethernet data port — Section 6c). Always reflects current runtime state
+// (unlike the config getters above, which read back the stored, possibly-
+// not-yet-applied, EthIP/EthMask/EthGw).
 // -----------------------------------------------------------------------------
 static void cmdGetEthStat(void)
 {
@@ -608,8 +620,13 @@ static void cmdGetEthStat(void)
   cp.print(Ethernet.linkState() ? "LINKUP" : "LINKDOWN"); cp.print(",");
   cp.print(data.EthDHCP ? "DHCP" : "STATIC");             cp.print(",");
   printIpAddr(Ethernet.localIP());                        cp.print(",");
-  cp.print((bool)ethCtrlClient && ethCtrlClient.connected()); cp.print(",");
-  cp.println((bool)ethDataClient && ethDataClient.connected());
+  cp.print((bool)ethCtrlClient && ethCtrlClient.connected());
+  for (uint8_t i = 0; i < DEVPORT_COUNT; i++)
+  {
+    cp.print(",");
+    cp.print((bool)ethDataClient[i] && ethDataClient[i].connected());
+  }
+  cp.print();   // bare newline — see commandProcessor.h; there's no println(void)
 }
 
 // -----------------------------------------------------------------------------
@@ -699,8 +716,11 @@ static void cmdGetAdc(void)
 //
 //  PC <-> Teensy device port (micro-USB, SerialUSB1 shares the connector) <->
 //  Teensy host port (5-pin header) <-> USB2514B hub <-> one of 4 downstream
-//  USB-A ports. As of Section 6c, a connected Ethernet client on EthDataPort
-//  is a second possible "PC" for this same link — see `pcSide` below.
+//  USB-A ports. As of Section 6c, each downstream port also has its own
+//  dedicated Ethernet data port; for the one port Serial is currently bridged
+//  to (SDEV), its own Ethernet port is a second possible "PC" for that same
+//  link — see `pcSide` below. Every other port's Ethernet data port is its
+//  only upstream path, with no arbitration needed.
 //
 //  TOPOLOGY
 //  --------
@@ -709,10 +729,12 @@ static void cmdGetAdc(void)
 //  below runs on all 4 every tick). Each port has its own ring buffer
 //  (devPort[i].rxbuf) that captures incoming bytes continuously too — so a
 //  device that chatters unsolicited while not selected is never silently
-//  lost. Only ONE port at a time can be bridged to the upstream data path
-//  (Serial + EthDataPort): the hardware doesn't have more upstream USB
-//  endpoints to spare (see TODO.md), and giving every port its own Ethernet
-//  port is still future work. data.ActiveDevice (1-4, SDEV/GDEV) selects it.
+//  lost. Only ONE port at a time can be bridged to Serial, the single
+//  switchable USB upstream path: the hardware doesn't have more upstream USB
+//  endpoints to spare (see TODO.md). data.ActiveDevice (1-4, SDEV/GDEV)
+//  selects it. Ethernet isn't endpoint-limited the same way — every port
+//  also has its own dedicated, always-reachable Ethernet data port
+//  (Section 6c), independent of this selection.
 //
 //  The host is responsible for mapping port number to device identity/
 //  function — it does this itself, by switching SDEV through 1-4 and asking
@@ -724,13 +746,17 @@ static void cmdGetAdc(void)
 //  RING BUFFER / FLUSH MODEL
 //  -------------------------
 //  Every tick: drain available bytes from ALL 4 ports into their own ring
-//  buffers (devPortDrainIncoming()), unconditionally. Then flush ONLY the
-//  currently-selected port's buffer out to the upstream (devPortFlush()).
-//  This one mechanism covers both live forwarding (the selected port's
-//  buffer drains about as fast as it fills, so latency in steady state is
-//  the same as direct passthrough) and "deliver the backlog" when SDEV
-//  switches to a port that's been accumulating in the background — nothing
-//  special has to happen at the moment of switching, because the flush step
+//  buffers (devPortDrainIncoming()), unconditionally. Every port is then also
+//  flushed every tick (devPortFlush()) — the selected port to whoever last
+//  spoke to it over its shared Serial/Ethernet path (`pcSide`), every other
+//  port to its own dedicated Ethernet data client, only once that client is
+//  actually connected (if not, bytes just stay buffered — connecting to a
+//  port's Ethernet data port is this design's equivalent of "SDEV switches to
+//  it" for delivering backlog). This one mechanism covers both live
+//  forwarding (a connected port's buffer drains about as fast as it fills,
+//  so latency in steady state is the same as direct passthrough) and
+//  "deliver the backlog" the moment a port starts actually being read —
+//  nothing special has to happen at that moment, because the flush step
 //  doesn't care whether the backlog built up over one tick or a thousand.
 //
 //  Overflow policy (decided): drop incoming bytes once a port's buffer is
@@ -771,18 +797,21 @@ struct DevPort
 
 DevPort devPort[DEVPORT_COUNT];
 
-// Whichever source (Serial, or the Ethernet data client — Section 6c) most
-// recently sent bytes to whichever device is currently selected. Downstream
-// device -> PC bytes are written only here: "last speaker wins", the same
-// pattern commandProcessor::processStreams() already uses
+// Whichever source — Serial, or the currently-selected device's OWN
+// dedicated Ethernet data client (Section 6c) — most recently sent bytes to
+// it. Only the selected device has two competing upstream sources (Serial
+// follows SDEV; every device's Ethernet data port exists regardless of
+// SDEV), so this arbitration only ever applies to data.ActiveDevice — every
+// other port's only upstream path is its own Ethernet client, with nothing
+// to arbitrate. "Last speaker wins", the same pattern
+// commandProcessor::processStreams() already uses
 // (`serial = streams[i]; // route replies back to the stream that sent the command`).
-// This settles *who gets the reply*; it does not stop two sources from
-// writing to the same device in the same loop pass if both have data
-// available at once — see Section 6c for why that's accepted as a known
-// edge case rather than solved with hard exclusivity. Not per-port: it's
-// about which upstream *channel* the host is using, independent of which
-// device SDEV currently points at (switching devices over the control port
-// doesn't change which passthrough channel the host is using for data).
+// This settles *who gets the reply*; it does not stop both sources writing
+// to the selected device in the same loop pass if both have data available
+// at once — see Section 6c for why that's accepted as a known edge case
+// rather than solved with hard exclusivity. Reset implicitly to &Serial on
+// boot; stays valid even if the operator later switches SDEV away and back,
+// since it's only consulted for whichever device is selected *now*.
 Stream *pcSide = &Serial;
 
 // -----------------------------------------------------------------------------
@@ -918,13 +947,13 @@ void RepeaterModeLoop(void)
     if (connected) sel->begin(curBaud);
   }
 
-  // PC -> device: only meaningful if the selected device is actually
-  // connected. Both Serial and a connected Ethernet data client can drive
-  // it; whichever one actually sends bytes this pass becomes pcSide, and
-  // also marks this port as "just heard from the host" for ADCUpdate()'s
-  // quiet guard (Section 6a). If both have data in the same pass, both
-  // still get forwarded here (in this order) and can interleave on the
-  // wire — see Section 6c.
+  // PC -> selected device: only meaningful if it's actually connected. Both
+  // Serial and that device's own Ethernet data client can drive it;
+  // whichever one actually sends bytes this pass becomes pcSide, and also
+  // marks this port as "just heard from the host" for ADCUpdate()'s quiet
+  // guard (Section 6a). If both have data in the same pass, both still get
+  // forwarded here (in this order) and can interleave on the wire — see
+  // Section 6c.
   if (connected)
   {
     int n = Serial.available();
@@ -936,23 +965,55 @@ void RepeaterModeLoop(void)
       pcSide = &Serial;
     }
 
-    if (ethDataClient && ethDataClient.connected())
+    if (ethDataClient[selIdx] && ethDataClient[selIdx].connected())
     {
-      int n2 = ethDataClient.available();
+      int n2 = ethDataClient[selIdx].available();
       if (n2 > 0)
       {
-        n2 = ethDataClient.read(repeaterBuf, min(n2, (int)sizeof(repeaterBuf)));
+        n2 = ethDataClient[selIdx].read(repeaterBuf, min(n2, (int)sizeof(repeaterBuf)));
         sel->write(repeaterBuf, n2);
         devPort[selIdx].lastHostToDeviceMs = millis();
-        pcSide = &ethDataClient;
+        pcSide = &ethDataClient[selIdx];
       }
     }
   }
 
-  // Device -> PC: flush whatever's buffered for the selected port, to
-  // whoever last spoke. Flushed even if the device isn't connected right
-  // now — a backlog captured before a disconnect is still worth delivering.
+  // PC -> every OTHER device, over its own dedicated Ethernet data port —
+  // independent of SDEV, since Ethernet isn't endpoint-limited the way USB
+  // is: each device is always reachable on its own port, not just the one
+  // switchable path Serial/SDEV share.
+  for (uint8_t i = 0; i < DEVPORT_COUNT; i++)
+  {
+    if (i == selIdx) continue;   // handled above, arbitrated with Serial
+    if (!(ethDataClient[i] && ethDataClient[i].connected())) continue;
+    if (!(bool)(*userialPtr[i])) continue;   // nothing connected to write to
+
+    int n = ethDataClient[i].available();
+    if (n > 0)
+    {
+      n = ethDataClient[i].read(repeaterBuf, min(n, (int)sizeof(repeaterBuf)));
+      userialPtr[i]->write(repeaterBuf, n);
+      devPort[i].lastHostToDeviceMs = millis();
+    }
+  }
+
+  // Device -> PC: the selected device's backlog goes to whoever last spoke
+  // to it (pcSide, arbitrated above) — flushed even if the device isn't
+  // connected right now, since a backlog captured before a disconnect is
+  // still worth delivering. Every other device flushes to its own dedicated
+  // Ethernet client only once that client is actually connected — if not,
+  // the backlog just stays buffered (see the ring-buffer/flush header
+  // comment above for why that's the right default rather than discarding
+  // it or forcing it onto Serial).
   devPortFlush(selIdx, pcSide);
+  for (uint8_t i = 0; i < DEVPORT_COUNT; i++)
+  {
+    if (i == selIdx) continue;
+    if (ethDataClient[i] && ethDataClient[i].connected())
+    {
+      devPortFlush(i, &ethDataClient[i]);
+    }
+  }
 }
 
 // =============================================================================
@@ -1093,53 +1154,59 @@ static int32_t sys_scale_send(int32_t *args, uint8_t argc)
 //  SECTION 6c — ETHERNET
 // =============================================================================
 //
-//  Two independent TCP servers, both single-session ("latest connection
-//  wins" — same policy every commercial serial-to-Ethernet device server
-//  uses, because two live sessions driving the same downstream link would
-//  corrupt each other's traffic regardless of arbitration):
+//  5 TCP servers total, every one single-session ("latest connection wins" —
+//  same policy every commercial serial-to-Ethernet device server uses,
+//  because two live sessions driving the same downstream link would corrupt
+//  each other's traffic regardless of arbitration):
 //
 //    ethCtrlServer / ethCtrlClient — mirrors SerialUSB1: registered with
 //      cp.registerStream() once in EthernetSetup(), so every command
 //      (GVER, GMODE, SDEV, SADCxxx, ...) works verbatim over this TCP port
-//      with no command-processor changes.
+//      with no command-processor changes. One port, data.EthCtrlPort.
 //
-//    ethDataServer / ethDataClient — a second passthrough source for
-//      RepeaterModeLoop() (Section 6), alongside Serial, bridged to
-//      whichever port data.ActiveDevice currently selects. See `pcSide`
+//    ethDataServer[i] / ethDataClient[i] — one dedicated passthrough port per
+//      downstream device (data.EthDataPortBase+0..3), always reachable
+//      regardless of which device data.ActiveDevice/SDEV currently selects —
+//      unlike Serial's single switchable path, Ethernet isn't endpoint-
+//      limited, so every device gets its own port rather than sharing one.
+//      For whichever device is currently selected, its Ethernet port still
+//      competes with Serial for RepeaterModeLoop() (Section 6); see `pcSide`
 //      there for how replies are routed back to whichever source spoke most
-//      recently. One data port shared across all 4 downstream devices for
-//      now (matching Serial's single switchable upstream path) — a
-//      dedicated TCP port per device is still future work (see TODO.md).
+//      recently. Every other device's Ethernet port is its only upstream
+//      path, so there's nothing to arbitrate there.
 //
-//  Both client globals are reused across reconnects (`ethXClient = newClient`
+//  All client globals are reused across reconnects (`ethXClient = newClient`
 //  inside EthernetUpdate() below) rather than replaced, because
 //  cp.registerStream() has no matching "unregister"/"replace" call — it
 //  records a Stream* once, so that address must stay the same object for the
-//  life of the program. QNEthernet's EthernetClient supports this: it's a
-//  copyable handle around a connection, and calling available()/connected()
-//  on one that was never connected (or has since disconnected) safely
-//  returns 0/false rather than crashing or blocking.
+//  life of the program (true of ethCtrlClient specifically; the per-device
+//  ethDataClient[] array elements follow the same reuse pattern for
+//  consistency even though nothing registers them with cp). QNEthernet's
+//  EthernetClient supports this: it's a copyable handle around a connection,
+//  and calling available()/connected() on one that was never connected (or
+//  has since disconnected) safely returns 0/false rather than crashing or
+//  blocking.
 //
 //  KNOWN LIMITATION (carried over from design discussion, not solved here):
 //  pcSide (Section 6) resolves who gets a reply, not simultaneous writes. If
-//  Serial and ethDataClient both have bytes available in the same
-//  RepeaterModeLoop() pass, both still get forwarded to the selected
-//  device's userial that pass and can interleave on the wire. This only bites
-//  under sustained
-//  concurrent traffic from both sides at once, not "one connected while the
-//  other is idle" — accepted as a known edge case, same as the equivalent
-//  ADC-injection guards are heuristics rather than a real bus-arbitration
-//  protocol.
+//  Serial and the selected device's own ethDataClient[] both have bytes
+//  available in the same RepeaterModeLoop() pass, both still get forwarded
+//  to that device's userial that pass and can interleave on the wire. This
+//  only bites under sustained concurrent traffic from both sides at once,
+//  not "one connected while the other is idle" — accepted as a known edge
+//  case, same as the equivalent ADC-injection guards are heuristics rather
+//  than a real bus-arbitration protocol. Doesn't apply to a non-selected
+//  device's Ethernet port at all, since Serial never reaches it.
 //
 //  BAUD RATE: Serial.baud() (Section 6) only exists for a USB CDC host; a
 //  pure-Ethernet client has no equivalent way to signal a baud rate, so
 //  GBAUD/SBAUD (Section 5) exist for that case — set it once after boot if
 //  you're not also using the USB side.
 
-EthernetServer ethCtrlServer;   // port bound in EthernetSetup() from data.EthCtrlPort
-EthernetServer ethDataServer;   // port bound in EthernetSetup() from data.EthDataPort
+EthernetServer ethCtrlServer;                      // port bound in EthernetSetup() from data.EthCtrlPort
+EthernetServer ethDataServer[DEVPORT_COUNT];        // port i bound from data.EthDataPortBase + i
 EthernetClient ethCtrlClient;
-EthernetClient ethDataClient;
+EthernetClient ethDataClient[DEVPORT_COUNT];
 
 static void EthernetSetup(void)
 {
@@ -1153,7 +1220,10 @@ static void EthernetSetup(void)
   }
 
   ethCtrlServer.begin(data.EthCtrlPort);
-  ethDataServer.begin(data.EthDataPort);
+  for (uint8_t i = 0; i < DEVPORT_COUNT; i++)
+  {
+    ethDataServer[i].begin(data.EthDataPortBase + i);
+  }
 
   // Registered once; see the comment above for why the same object is
   // reused across reconnects instead of re-registering a new one.
@@ -1169,8 +1239,11 @@ static void EthernetUpdate(void)
   EthernetClient nc = ethCtrlServer.accept();
   if (nc) { if (ethCtrlClient) ethCtrlClient.stop(); ethCtrlClient = nc; }
 
-  EthernetClient nd = ethDataServer.accept();
-  if (nd) { if (ethDataClient) ethDataClient.stop(); ethDataClient = nd; }
+  for (uint8_t i = 0; i < DEVPORT_COUNT; i++)
+  {
+    EthernetClient nd = ethDataServer[i].accept();
+    if (nd) { if (ethDataClient[i]) ethDataClient[i].stop(); ethDataClient[i] = nd; }
+  }
 }
 
 // =============================================================================

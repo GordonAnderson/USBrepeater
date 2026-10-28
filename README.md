@@ -43,40 +43,47 @@ settings without ever touching the data stream.
 ## Ethernet
 
 [QNEthernet](https://github.com/ssilverman/QNEthernet) drives the Teensy
-4.1's built-in Ethernet MAC/PHY, adding two more ports — this time TCP, not
-USB — that mirror the two USB ones:
+4.1's built-in Ethernet MAC/PHY, adding 5 TCP ports — one control port plus
+one dedicated passthrough port per downstream device:
 
 | Port | Purpose |
 | --- | --- |
 | `EthCtrlPort` (default 5000) | Control port: every `SerialUSB1` command works verbatim over this TCP connection — same commandProcessor, same ASCII protocol. |
-| `EthDataPort` (default 5001) | Passthrough port: a second source for the repeater byte pump, alongside `Serial`. |
+| `EthDataPortBase` (default 5001) | Device 1's dedicated passthrough port. Devices 2-4 get `EthDataPortBase`+1/+2/+3 (5002-5004 by default) — always reachable regardless of which device `SDEV` currently has Serial pointed at, since Ethernet isn't endpoint-limited the way USB is. |
 
-Both are single-session — a new connection takes over from whatever was
-previously connected, same policy every commercial serial-to-Ethernet device
-server uses.
+All 5 are single-session — a new connection on a given port takes over from
+whatever was previously connected on that same port, same policy every
+commercial serial-to-Ethernet device server uses. Each device's port is
+independent of the others.
 
-**Passthrough arbitration — "last speaker wins".** `Serial` and the Ethernet
-data client can both drive the downstream device; whichever one most
-recently sent bytes becomes `pcSide` (`src/USBrepeater.cpp`, Section 6), and
-the downstream device's replies are routed back only to it — the same
-pattern `commandProcessor::processStreams()` already uses internally
-(`serial = streams[i];`). This resolves *who gets the reply*; it does not
-prevent both sources writing to the device in the same loop pass if both
-have data available at once — accepted as a known edge case under sustained
-concurrent traffic from both sides, not solved with hard exclusivity. See
-Section 6c's header comment for the full reasoning.
+**Passthrough arbitration — "last speaker wins", scoped to the selected
+device.** `Serial` only ever talks to whichever device `SDEV` currently
+selects, so only that device has two competing upstream sources: `Serial`
+and its own dedicated Ethernet client. Whichever one most recently sent
+bytes to it becomes `pcSide` (`src/USBrepeater.cpp`, Section 6), and that
+device's replies are routed back only to it — the same pattern
+`commandProcessor::processStreams()` already uses internally
+(`serial = streams[i];`). Every other device has only one upstream path (its
+own Ethernet port), so there's nothing to arbitrate there — it's always
+read from and flushed to, independent of `SDEV`. This resolves *who gets the
+reply* for the selected device; it does not prevent both sources writing to
+it in the same loop pass if both have data available at once — accepted as
+a known edge case under sustained concurrent traffic from both sides, not
+solved with hard exclusivity. See Section 6c's header comment for the full
+reasoning.
 
 **Baud rate**: `Serial.baud()` auto-follows the PC's chosen baud for the USB
 side; there's no TCP equivalent, so `GBAUD`/`SBAUD` exist for a pure-Ethernet
 client to set it explicitly.
 
 **Configuration**: `?ETHDHCP` (DHCP vs. static), `SETHIP`/`SETHMASK`/`SETHGW`
-(static IP config, dotted-quad), and `?ETHCTRLPORT`/`?ETHDATAPORT` all take
+(static IP config, dotted-quad), and `?ETHCTRLPORT`/`?ETHDATAPORT` (the
+latter being the per-device *base* port — see the table above) all take
 effect on the **next boot** (`SAVE` first to persist), not live — same
 convention as other reboot-required settings in this codebase. `GETHSTAT`
 always reflects live state (link up/down, DHCP vs. static, current IP,
-whether each TCP port has a connected client) regardless of pending config
-changes.
+whether the control port and each of the 4 per-device data ports has a
+connected client) regardless of pending config changes.
 
 **Hardware status (fully verified 2026-10-06)**: tested end-to-end on real
 hardware with the magjack installed, a real downstream MIPS device attached,
@@ -101,7 +108,12 @@ and a second machine actually reachable on the Teensy's network:
   cleanly in both directions, not just once.
 
 Nothing left unverified from the original design discussion for a single
-downstream device.
+downstream device. **The 4-dedicated-port expansion above (2026-10-27) is
+compile-verified only** — real hardware for the 4-port hub isn't built yet
+(see [TODO.md](TODO.md)); the single-device Ethernet mechanics it reuses
+(TCP servers, `cp.registerStream()`, "last speaker wins") are the
+hardware-proven parts, generalized to 4 independent data ports rather than
+rewritten.
 
 **Licensing**: QNEthernet is AGPL-3.0-or-later, unlike `GAACE_Core` (GPLv3)
 or `ArduinoThread` (Public Domain) — AGPL carries network-use
@@ -137,12 +149,23 @@ Adding a mode: append to the `SystemMode` enum, write a
 auto-reconnecting continuously, and each one **keeps capturing incoming
 bytes into its own buffer regardless of whether it's currently
 selected** — so a device that sends unsolicited chatter while not in focus
-is never silently lost. Only one port at a time is bridged to the upstream
-data path (`Serial` + the Ethernet data port): `SDEV,<n>` / `GDEV` selects
-it. Switching delivers that port's buffered backlog on the very next tick,
-with no separate "flush" step — the firmware always flushes whichever port
-is currently selected, so the backlog built up while it wasn't just goes out
-immediately once it is.
+is never silently lost.
+
+On the USB side, only one port at a time is bridged to `Serial`:
+`SDEV,<n>` / `GDEV` selects it (the hardware has only one switchable USB
+upstream path to spare). Switching delivers that port's buffered backlog on
+the very next tick, with no separate "flush" step — the firmware always
+flushes the selected port's backlog to whoever last spoke to it, so what
+built up while it wasn't selected goes out immediately once it is.
+
+On the Ethernet side, every port is independent of `SDEV`: each of the 4
+downstream devices has its own dedicated, always-reachable TCP data port
+(see the Ethernet section above), so a client connected to device 3's port
+gets device 3's traffic whether or not `SDEV` currently points Serial at
+device 3. For whichever device *is* currently selected, its Ethernet port
+also competes with `Serial` for who gets its replies ("last speaker wins",
+`pcSide`); every other device's Ethernet port is its only upstream path, so
+there's no arbitration to do there.
 
 Identifying what's plugged into which port is **the host's job, not
 firmware's**: switch `SDEV` through 1–4 and ask each one `GNAME`/`GVER`
@@ -330,10 +353,10 @@ manual vendoring required.
 
 ## Planned work
 
-Single-device Ethernet, hub bring-up, and 4-device downstream support are
-all implemented (above) — see [TODO.md](TODO.md) for exactly what's
-real-hardware-verified versus compile-verified-only so far. Remaining open
-work there: real-hardware validation of the 4-port hub and the downstream
-ring buffers, the REF-channel ADC calibration correction, digital I/O
-command support, and giving each downstream device its own Ethernet TCP
-port instead of sharing the one switchable data port.
+Single-device Ethernet, hub bring-up, 4-device downstream support, and
+per-device Ethernet data ports are all implemented (above) — see
+[TODO.md](TODO.md) for exactly what's real-hardware-verified versus
+compile-verified-only so far. Remaining open work there: real-hardware
+validation of the 4-port hub, the downstream ring buffers, and the
+per-device Ethernet ports; the REF-channel ADC calibration correction; and
+digital I/O command support.

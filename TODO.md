@@ -301,6 +301,34 @@ multi-device generalization: one TCP port *per device* instead of today's
 single data port, and the USB-side `SDEV` switching since USB can't give
 every device its own port the way Ethernet can.
 
+**Resolved (2026-10-27): per-device Ethernet data ports.** Implemented,
+compile-verified only (no 4-port hub hardware yet to test against — same
+caveat as Phase 2's USB-side multi-device work above). `data.EthDataPort`
+was renamed `data.EthDataPortBase`: device 1 gets that port, devices 2-4 get
+`EthDataPortBase`+1/+2/+3 (5001-5004 by default) — `EthernetServer
+ethDataServer[DEVPORT_COUNT]` / `EthernetClient ethDataClient[DEVPORT_COUNT]`
+in `src/USBrepeater.cpp` Section 6c, each bound/accepted independently in
+`EthernetSetup()`/`EthernetUpdate()`. Every port is always reachable
+regardless of `SDEV` — exactly the "no switching needed" design below.
+`pcSide` (the single "last speaker wins" `Stream *`, Section 6) turned out
+not to need becoming a per-device array: arbitration between `Serial` and
+an Ethernet client only ever matters for `data.ActiveDevice` (the one device
+`Serial` can currently reach at all), so `pcSide` stays scoped to whichever
+device is selected *right now* and is simply never consulted for any other
+port — those just always flush to their own dedicated Ethernet client once
+it's connected (same "stays buffered until read" policy as everything else,
+not forced onto `Serial` or discarded). `GETHSTAT` extended to report one
+`dataConnected` flag per device instead of one overall. Build: `pio run`
+clean, no new warnings.
+- [ ] **Not yet tested on real hardware** — no 4-port hub/4 downstream
+      devices or a second machine with real routes to 4 extra TCP ports
+      here yet. First real test, once hardware arrives: open a TCP
+      connection to each of the 4 data ports concurrently, with `SDEV`
+      pointed at just one of the 4 devices, and confirm every connection
+      only ever sees its own device's traffic regardless of which one
+      `SDEV` currently selects — the actual point of giving each device its
+      own port instead of sharing one.
+
 ### Device (downstream) side
 
 - All 4 downstream devices stay connected continuously via a hub on the
@@ -404,13 +432,19 @@ every device its own port the way Ethernet can.
 
 ### Open implementation details (not yet decided)
 
-- [ ] Exact ring buffer size per device
-- [ ] Exact command names/args (`SDEV`, `SADCDEV`, `SBAUD`, Ethernet IP config
-      commands)
-- [ ] `Data` struct layout additions (active device, per-device baud, IP
-      config, ADC target device) and the resulting `Signature` bump
+- [x] Exact ring buffer size per device — `DEVPORT_RINGBUF_SIZE`, 2048 bytes,
+      tunable `#define` (Section 6)
+- [x] Exact command names/args — `SDEV`/`GDEV`, `SADCDEV`/`GADCDEV`,
+      `SBAUD`/`GBAUD`, `?ETHCTRLPORT`/`?ETHDATAPORT` (the latter now the
+      per-device base port), `?ETHDHCP`/`SETHIP`/`SETHMASK`/`SETHGW` — all
+      implemented
+- [x] `Data` struct layout additions — `ActiveDevice`, `AdcTargetDevice`,
+      `EthDataPortBase` (renamed from the single-device `EthDataPort`); no
+      per-device baud field was needed (`curBaud` stays shared across all 4
+      ports, same as before)
 - [ ] Whether the 2nd USB data-port headroom is worth using now or left for
-      later
+      later — still open; not needed yet since Ethernet now covers the
+      "more than one simultaneous upstream view" case per-device
 - [ ] Confirm power budget / recommend a specific powered hub part in
       hardware docs once hardware is sourced
 
