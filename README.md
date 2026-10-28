@@ -332,6 +332,28 @@ single-`SCRIPTLOAD` vs. chunked automatically based on size, so this is
 usually invisible day to day. See that repo's `WORKFLOW.md` for the full
 walkthrough.
 
+### Syscalls: one table, no declarations in scripts
+
+The script syscalls (`link_ready`, `read_adc`, `scale_send`, `dio_set_dir`,
+`dio_write`, `dio_read`) are described once, in the `scriptSyscalls[]` table
+in `setup()` ([src/USBrepeater.cpp](src/USBrepeater.cpp), Section 8). A
+syscall's id is its index there; **add new ones at the end** (inserting or
+reordering renumbers the later ones and changes the table's hash, so scripts
+compiled earlier are then refused until recompiled). `GSYSCALLS` reports the
+table, so `gsc.py --upload` compiles a script against it directly — a script
+just calls `v = read_adc();` with no `syscall ...;` lines. List what this
+board offers with:
+
+```
+python3 ../GAACE_Script/tools/gsc.py --list-syscalls /dev/cu.usbmodemXXXX
+```
+
+Uploads of scripts that call syscalls carry the table's hash, and the board
+NAKs a script compiled against a different table. `gaace_scripts/adc_demo.gs`
+is the exception: its bytecode is compiled into the firmware at build time
+(there's no device to ask), so it keeps explicit declarations that must match
+the table's order — it works because the first three entries haven't moved.
+
 ### Script persistence across reboot
 
 A `SCRIPTLOAD`/`SCRIPTAPPEND`-loaded script is RAM-only as far as
@@ -343,6 +365,17 @@ one per slot). `SCRIPTRESTORE,<slot>` reloads it on demand; **every slot
 is also attempted automatically at boot** (`setup()`, Section 8), so a
 saved script resumes running on its own after a power cycle or reflash —
 no manual re-load needed.
+
+A script that calls syscalls is saved with the hash of the syscall table it
+was compiled against (`/script<N>.sig`, 4 bytes, next to its `.bin`). On
+restore — at boot or via `SCRIPTRESTORE` — the hash is compared with this
+firmware's own table: if a firmware update changed the syscalls, the saved
+script is **not** run (it would call different functions than it was written
+for); the slot stays unloaded (at boot, slot 0 falls back to the compiled-in
+demo), and `SCRIPTRESTORE` NAKs with `ERR_BADARG` rather than the
+`ERR_NOSDCARD` of "nothing saved". Recompile and re-upload it. Scripts saved
+before this existed, or loaded unchecked, have no `.sig` and restore as
+before.
 
 A restored script is left **enabled**, at its default 1000 mS interval
 (`?TENA`/`?TINT,Script<n>` to change either) — deliberately different from
@@ -446,13 +479,14 @@ every registered command and its help string, `HELP,<cmd>` looks up one.
 | `GDIODIR` / `SDIODIR,TRUE\|FALSE` | Get/set the DIO line's direction: `TRUE`=output, `FALSE`=input (power-up default) |
 | `GDOUT` / `SDOUT,TRUE\|FALSE` | Get/set the DIO output level; only reaches the external line while direction is output |
 | `GDIN` | Read the DIO line's actual level now (valid in either direction) |
-| `SCRIPTLOAD,<slot>,<hex>` | Load a compiled script (`gsc.py --format hex`) into a `GAACE_Script` slot in one call — capped at roughly 250 decoded bytes by `commandProcessor`'s shared 512-byte scratch arena, regardless of `GAACE_SCRIPT_MAX_CODE_LEN` |
+| `GSYSCALLS` | The script syscall table: `count,hash`, then `index,name,argc,int\|float` per syscall (what `gsc.py --upload` compiles against) |
+| `SCRIPTLOAD,<slot>,<hex>[,<hash>]` | Load a compiled script (`gsc.py --format hex`) into a `GAACE_Script` slot in one call — capped at roughly 250 decoded bytes by `commandProcessor`'s shared 512-byte scratch arena, regardless of `GAACE_SCRIPT_MAX_CODE_LEN` |
 | `SCRIPTAPPEND,<slot>,<offset>,<hexchunk>` | Write one chunk of a larger script into a slot's buffer at `offset`; marks the slot not-loaded until `SCRIPTCOMMIT` finalizes it |
-| `SCRIPTCOMMIT,<slot>,<totalLen>` | Finalize a buffer assembled via `SCRIPTAPPEND` calls and make the slot runnable |
+| `SCRIPTCOMMIT,<slot>,<totalLen>[,<hash>]` | Finalize a buffer assembled via `SCRIPTAPPEND` calls and make the slot runnable |
 | `GSCRIPTLIMITS` | `slots,maxCodeLen,stackSize,varSlots,maxSyscalls` for the script runtime |
 | `GSCRIPTST,<slot>` | `loaded(0\|1),lastStatus` for one script slot |
 | `SCRIPTSAVE,<slot>` | Save a loaded slot's buffer to on-chip flash (survives reboot/power loss) |
-| `SCRIPTRESTORE,<slot>` | Reload a slot's buffer from flash now (also attempted automatically at boot) |
+| `SCRIPTRESTORE,<slot>` | Reload a slot's buffer from flash now (also attempted automatically at boot); refused if it was compiled against a different syscall table than this firmware has |
 | `GCMDS` | List all commands and help strings |
 | `HELP,<cmd>` | Help for one command |
 | `TLIST` / `?TENA` / `?TINT` / `TTRIG` / `TDELAY` / `TSTOPALL` / `TSTARTALL` / `TREM` | Thread introspection/control (see GAACE_Core's `threadCommands`) — also how the ADC demo's `Script0` is started/stopped/re-timed: `?TENA,Script0,...` / `?TINT,Script0,...` |

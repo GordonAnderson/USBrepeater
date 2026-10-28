@@ -8,8 +8,11 @@
 // whenever this file changes — there is no build-time codegen step yet
 // (see USBrepeater/TODO.md, "Host-side compiler" open item).
 //
-// Syscall ids below must match the vmRegisterSyscall() call order in
-// src/USBrepeater.cpp, Section 6b:
+// Syscall ids below must match the scriptSyscalls[] table in
+// src/USBrepeater.cpp's setup() (a syscall's id is its index there). Scripts
+// uploaded at runtime need no such declarations (gsc.py --upload reads the
+// table from the board); these are only here because this one is compiled
+// into the firmware at build time, with no board to ask:
 //   0 = link_ready()     -- userial connected AND quiet-guard elapsed
 //   1 = read_adc()        -- readAdcCounts() rounded to int32 (12-bit, hardware
 //                             + software averaged -- see src/USBrepeater.cpp)

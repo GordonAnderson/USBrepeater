@@ -871,6 +871,28 @@ a new constraint.
             upload`, which doesn't prove persistence the way an actual
             power loss does), and confirm `GSCRIPTST`/`GTENA` show it
             loaded and running without any commands sent after boot.
+- [x] **Resolved (2026-10-28): syscall table + persisted-script safety.**
+      The six script syscalls are now one `scriptSyscalls[]` table in
+      `setup()` (`GAACEScript::SyscallDesc`: name, function, argc, returns
+      float) instead of six hand-ordered `registerSyscall()` calls — ids are
+      unchanged (the table keeps the old order) so the compiled-in ADC demo
+      still works. `GSYSCALLS` reports the table and `gsc.py --upload`
+      compiles scripts against it (no per-script declarations); uploads carry
+      the table's hash and the board NAKs a mismatch. Persistence now stores
+      each slot's hash in `/script<N>.sig` beside its `.bin`, and
+      `restoreScriptSlotFromFlash()` refuses a script whose hash no longer
+      matches (`ScriptRestoreResult`: OK / NONE / STALE) — so a firmware
+      update that reorders syscalls can't make a saved script quietly call
+      the wrong function; `SCRIPTRESTORE` NAKs `ERR_BADARG` for that case
+      (vs. `ERR_NOSDCARD` for "nothing saved"). Files saved before this
+      existed have no `.sig` and restore unchecked, as before.
+      - [ ] **Not yet tested on real hardware** (compile-verified against the
+            local GAACE_Script, Teensy 4.1). To test: flash, `GSYSCALLS`
+            (expect 6 syscalls), `gsc.py --upload` a script that calls one,
+            `SCRIPTSAVE`, then change the table order and reflash —
+            `SCRIPTRESTORE` should NAK and the slot should stay unloaded.
+      - [ ] **Needs the GAACE_Script commit with `registerSyscalls()`**
+            pushed before this builds from GitHub (`lib_deps`).
 - [ ] A general "device just rebooted" notification — raised during design
       discussion as a real gap (a host has no way to know a script's state
       was lost to an unexpected reset), but it's a GAACE_Core-level concern

@@ -341,11 +341,17 @@ bool     dioRead(void);
 extern bool dioOutLevel;
 
 // Script-slot flash persistence — implemented in Section 6b, where the
-// GAACE_Script runtime (`scripts`) lives. Plain bool(uint8_t) signatures
-// here (no GAACEScript:: types) so these can be forward-declared before
-// Section 6b's `using namespace GAACEScript;` takes effect.
-bool     saveScriptSlotToFlash(uint8_t slot);
-bool     restoreScriptSlotFromFlash(uint8_t slot);
+// GAACE_Script runtime (`scripts`) lives. Plain integer signatures here (no
+// GAACEScript:: types) so these can be forward-declared before Section 6b's
+// `using namespace GAACEScript;` takes effect.
+enum ScriptRestoreResult : uint8_t
+{
+  SCRIPT_RESTORE_OK,      // slot restored and loaded
+  SCRIPT_RESTORE_NONE,    // nothing saved for this slot, or the file didn't validate
+  SCRIPT_RESTORE_STALE    // saved against different syscalls than this firmware has
+};
+bool                saveScriptSlotToFlash(uint8_t slot);
+ScriptRestoreResult restoreScriptSlotFromFlash(uint8_t slot);
 
 Command cmds[] =
 {
@@ -1066,7 +1072,13 @@ static void cmdScriptRestore(void)
     return;
   }
 
-  if (!restoreScriptSlotFromFlash((uint8_t)slot))
+  ScriptRestoreResult result = restoreScriptSlotFromFlash((uint8_t)slot);
+  if (result == SCRIPT_RESTORE_STALE)
+  {
+    cp.sendNAK(ERR_BADARG);     // saved against different syscalls: recompile + re-upload
+    return;
+  }
+  if (result != SCRIPT_RESTORE_OK)
   {
     cp.sendNAK(ERR_NOSDCARD);   // no saved file for this slot (or it failed to parse)
     return;
@@ -1533,8 +1545,14 @@ void ADCUpdate(void)
 //  ScriptSlot::run() (GAACE_Script's runtime module) only resets pc/sp
 //  between calls, not vmInit()'s full reset.
 //
-//  Syscall ids (must match scripts.registerSyscall() call order in setup(),
-//  and the `syscall NAME(...) = ID;` declarations in gaace_scripts/adc_demo.gs):
+//  Syscalls are described once, in the `scriptSyscalls[]` table in setup()
+//  (Section 8): that table is the single source of truth for each syscall's
+//  name, argument count, return type and id (its index). The device reports
+//  it to gsc.py (GSYSCALLS), so scripts need no hand-written declarations;
+//  gaace_scripts/adc_demo.gs keeps explicit ones only because its bytecode
+//  is compiled in at build time (include/ScriptBytecode.h) without a device
+//  to ask. Keep these ids (the current table order) if that file is not
+//  regenerated:
 //    0 = link_ready()      — data.AdcTargetDevice connected AND quiet-guard elapsed
 //    1 = read_adc()         — readAdcCounts() rounded to int32 via lroundf()
 //                             (the VM is int32-only; see readAdcCounts()'s
@@ -1613,6 +1631,18 @@ static void scriptSlotPath(uint8_t slot, char *buf, size_t bufLen)
   snprintf(buf, bufLen, "/script%u.bin", (unsigned)slot);
 }
 
+// A slot's syscall-table hash (ScriptSlot::syscallHash) is saved beside its
+// buffer in "/script<N>.sig" (4 bytes, little-endian), so a script compiled
+// against one set of syscalls is never silently restored into firmware whose
+// syscalls have since changed (e.g. after a firmware update that added or
+// reordered one) -- see restoreScriptSlotFromFlash(). A slot loaded unchecked
+// (hash 0) has no .sig file, and a .bin saved before this existed has none
+// either; both restore as before, unchecked.
+static void scriptSigPath(uint8_t slot, char *buf, size_t bufLen)
+{
+  snprintf(buf, bufLen, "/script%u.sig", (unsigned)slot);
+}
+
 // finalizeScriptSlot — identical validation/finalization logic to
 // GAACEScriptRuntime.cpp's cmdScriptCommit(), applied directly to a slot
 // whose buffer was just filled by restoreScriptSlotFromFlash() below
@@ -1659,38 +1689,80 @@ bool saveScriptSlotToFlash(uint8_t slot)
 
   size_t written = f.write(s.code, totalLen);
   f.close();
-  return written == totalLen;
+  if (written != totalLen) return false;
+
+  // The .sig is removed first so a stale one from the slot's previous
+  // script can never outlive it; only a checked script gets a new one.
+  char sigPath[20];
+  scriptSigPath(slot, sigPath, sizeof(sigPath));
+  scriptFS.remove(sigPath);
+  if (s.syscallHash != 0)
+  {
+    File sig = scriptFS.open(sigPath, FILE_WRITE_BEGIN);
+    if (!sig) return false;
+    uint8_t hashBytes[4] = {(uint8_t)(s.syscallHash), (uint8_t)(s.syscallHash >> 8),
+                            (uint8_t)(s.syscallHash >> 16), (uint8_t)(s.syscallHash >> 24)};
+    size_t sigWritten = sig.write(hashBytes, sizeof(hashBytes));
+    sig.close();
+    if (sigWritten != sizeof(hashBytes)) return false;
+  }
+  return true;
 }
 
 // restoreScriptSlotFromFlash — read a slot's file back into its buffer and
-// finalize it exactly like SCRIPTCOMMIT would. Fails (false, slot
-// untouched) if the filesystem isn't mounted, no file exists for this
-// slot, or the file's own [codeLen][code][pool] layout doesn't validate —
-// a corrupt/foreign file must not leave the slot in a half-updated state.
-bool restoreScriptSlotFromFlash(uint8_t slot)
+// finalize it exactly like SCRIPTCOMMIT would. Fails (slot untouched) if the
+// filesystem isn't mounted, no file exists for this slot, or the file's own
+// [codeLen][code][pool] layout doesn't validate — a corrupt/foreign file
+// must not leave the slot in a half-updated state. SCRIPT_RESTORE_STALE: the
+// saved script was compiled against a different syscall table than this
+// firmware has (its .sig hash differs from scripts.syscallHash()); it is
+// refused, not run, since its CALL ids would now mean different functions.
+// Recompile and re-upload it.
+ScriptRestoreResult restoreScriptSlotFromFlash(uint8_t slot)
 {
-  if (!scriptFSReady || slot >= SCRIPT_SLOTS) return false;
+  if (!scriptFSReady || slot >= SCRIPT_SLOTS) return SCRIPT_RESTORE_NONE;
 
   char path[20];
   scriptSlotPath(slot, path, sizeof(path));
-  if (!scriptFS.exists(path)) return false;
+  if (!scriptFS.exists(path)) return SCRIPT_RESTORE_NONE;
+
+  // Check the syscall hash before touching the slot's buffer.
+  uint32_t savedHash = 0;
+  char sigPath[20];
+  scriptSigPath(slot, sigPath, sizeof(sigPath));
+  if (scriptFS.exists(sigPath))
+  {
+    File sig = scriptFS.open(sigPath, FILE_READ);
+    uint8_t hashBytes[4];
+    if (!sig || sig.readBytes((char *)hashBytes, 4) != 4)
+    {
+      if (sig) sig.close();
+      return SCRIPT_RESTORE_STALE;   // unreadable signature: can't prove it's safe
+    }
+    sig.close();
+    savedHash = (uint32_t)hashBytes[0] | ((uint32_t)hashBytes[1] << 8) |
+                ((uint32_t)hashBytes[2] << 16) | ((uint32_t)hashBytes[3] << 24);
+    if (savedHash != scripts.syscallHash()) return SCRIPT_RESTORE_STALE;
+  }
 
   File f = scriptFS.open(path, FILE_READ);
-  if (!f) return false;
+  if (!f) return SCRIPT_RESTORE_NONE;
 
   uint64_t fileSize = f.size();
   if (fileSize < 2 || fileSize > SCRIPT_MAX_CODE_LEN)
   {
     f.close();
-    return false;
+    return SCRIPT_RESTORE_NONE;
   }
 
   ScriptSlot &s = scripts.slots[slot];
   size_t readBytesN = f.readBytes((char *)s.code, (size_t)fileSize);
   f.close();
 
-  if (readBytesN != (size_t)fileSize) return false;
-  return finalizeScriptSlot(slot, (uint16_t)fileSize);
+  if (readBytesN != (size_t)fileSize) return SCRIPT_RESTORE_NONE;
+  if (!finalizeScriptSlot(slot, (uint16_t)fileSize)) return SCRIPT_RESTORE_NONE;
+  s.syscallHash = savedHash;
+  return SCRIPT_RESTORE_OK;
 }
 
 // =============================================================================
@@ -1874,8 +1946,8 @@ static void dioInit(void)
   dioSetDirection(data.DioOutputEnabled);   // re-apply whatever was persisted
 }
 
-// Script syscalls — ids registered in setup() (Section 8) alongside the
-// ADC demo's (Section 6b). Direction is deliberately included here (not
+// Script syscalls — listed in the scriptSyscalls[] table in setup()
+// (Section 8) alongside the ADC demo's (Section 6b). Direction is deliberately included here (not
 // just read/write) per the design decision above: a script needs to be
 // able to set up its own direction on load.
 static int32_t sys_dio_set_dir(int32_t *args, uint8_t argc)
@@ -1994,12 +2066,24 @@ void setup()
   EthernetThread.setInterval(20);   // ms; keeps Ethernet.loop() ticking promptly
   control.add(&EthernetThread);
 
-  scripts.registerSyscall(sys_link_ready);   // id 0 — see Section 6b
-  scripts.registerSyscall(sys_read_adc);     // id 1
-  scripts.registerSyscall(sys_scale_send);   // id 2
-  scripts.registerSyscall(sys_dio_set_dir);  // id 3 — see Section 6d
-  scripts.registerSyscall(sys_dio_write);    // id 4
-  scripts.registerSyscall(sys_dio_read);     // id 5
+  //  Script syscalls. THE table: each syscall's id is its index here, and the
+  //  names/arg counts/return types are what GSYSCALLS reports to gsc.py, so a
+  //  script written as `set = dio_read();` compiles against exactly this list
+  //  with no declarations to keep in sync. Append new syscalls at the END —
+  //  inserting or reordering renumbers the ones after it (and changes the
+  //  table hash, so scripts compiled before are refused rather than run
+  //  wrong; recompile them).  Sections 6b (ADC demo) and 6d (DIO) have the
+  //  implementations.
+  static const GAACEScript::SyscallDesc scriptSyscalls[] = {
+    {"link_ready",  sys_link_ready,  0, false},   // id 0 — see Section 6b
+    {"read_adc",    sys_read_adc,    0, false},   // id 1
+    {"scale_send",  sys_scale_send,  1, false},   // id 2
+    {"dio_set_dir", sys_dio_set_dir, 1, false},   // id 3 — see Section 6d
+    {"dio_write",   sys_dio_write,   1, false},   // id 4
+    {"dio_read",    sys_dio_read,    0, false},   // id 5
+  };
+  scripts.registerSyscalls(scriptSyscalls,
+                           sizeof(scriptSyscalls) / sizeof(scriptSyscalls[0]));
 
   // ── 5b. Script slot persistence (flash; Section 6b) ─────────────────────────
   //  Mount the on-chip flash filesystem, then try restoring every slot from
@@ -2018,7 +2102,7 @@ void setup()
   bool slot0Restored = false;
   for (uint8_t i = 0; i < GAACE_SCRIPT_SLOTS; i++)
   {
-    bool restored = restoreScriptSlotFromFlash(i);
+    bool restored = (restoreScriptSlotFromFlash(i) == SCRIPT_RESTORE_OK);
     if (i == 0) slot0Restored = restored;
   }
 
