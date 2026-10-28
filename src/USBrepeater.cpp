@@ -74,6 +74,7 @@
 #include <stdio.h>   // snprintf() — used by ADCUpdate() (Section 6a)
 #include <string.h>  // memcpy() — used by setup() to preload a default script
 #include <math.h>    // lroundf() — used by sys_read_adc() (Section 6b)
+#include <strings.h> // strcasecmp() — used to parse TRUE/FALSE args (Section 5, DIO)
 
 //  UsbHubBoot — USB2514B strap/reset sequencing for the USBrepeater Hub
 //  Carrier board (Section 6). Required any time this firmware runs on that
@@ -179,6 +180,8 @@ Data DefaultData =
   5000,           // EthCtrlPort     — TCP control port (same commands as SerialUSB1)
   5001,           // EthDataPortBase — device 1's TCP passthrough port; devices 2-4 get 5002-5004
 
+  false,          // DioOutputEnabled — input/high-Z by default (hardware already pulls OE_N disabled on its own)
+
   SIGNATURE       // Signature — always last
 };
 
@@ -279,6 +282,11 @@ static void cmdSetDev(void);
 static void cmdGetAdcDev(void);
 static void cmdSetAdcDev(void);
 static void cmdGetDevStat(void);
+static void cmdGetDioDir(void);
+static void cmdSetDioDir(void);
+static void cmdGetDout(void);
+static void cmdSetDout(void);
+static void cmdGetDin(void);
 
 static int portLimits[] = {1, 65535};  // range check for ?ETHCTRLPORT / ?ETHDATAPORT
 
@@ -291,6 +299,14 @@ bool     isDeviceConnected(uint8_t dev1based);
 uint16_t deviceBytesWaiting(uint8_t dev1based);
 uint32_t deviceBytesDropped(uint8_t dev1based);
 void     reinitDeviceBaud(uint8_t dev1based, uint32_t baud);
+
+// DIO accessors — implemented in Section 6d, shared by the control-port
+// handlers below and the script syscalls (sys_dio_*). dioOutLevel mirrors
+// curBaud's extern-declared-here/defined-there pattern just above.
+void     dioSetDirection(bool outputEnabled);
+void     dioWrite(bool level);
+bool     dioRead(void);
+extern bool dioOutLevel;
 
 Command cmds[] =
 {
@@ -357,6 +373,20 @@ Command cmds[] =
   {"?ADCM",    CMDfloat,    -1, (void *)&data.AdcScaleM,   NULL, "ADC scale slope: value = M * counts + B"},
   {"?ADCB",    CMDfloat,    -1, (void *)&data.AdcScaleB,   NULL, "ADC scale offset: value = M * counts + B"},
   {"GADC",     CMDfunction,  0, (void *)cmdGetAdc,         NULL, "Read ADC now: averaged counts (2dp) and scaled value (4dp)"},
+
+  // ── Digital I/O (DIO, SMA connector; see Section 6d) ────────────────────
+  //  One external line, independent of the 4 downstream ports. Direction
+  //  and level are function pairs, not plain CMDbool fields, because
+  //  setting either has an immediate hardware side effect (driving
+  //  DIO_OE_N / DIO_OUT) a plain field write can't do on its own. Scripts
+  //  get the identical operations via dio_set_dir()/dio_write()/dio_read()
+  //  syscalls (Section 6b/8) through the same underlying functions, so the
+  //  control port and scripts can never see it differently.
+  {"GDIODIR",  CMDfunction, -1, (void *)cmdGetDioDir,      NULL, "Get DIO direction: TRUE=output, FALSE=input (power-up default)"},
+  {"SDIODIR",  CMDfunction, -1, (void *)cmdSetDioDir,      NULL, "Set DIO direction, TRUE|FALSE"},
+  {"GDOUT",    CMDfunction, -1, (void *)cmdGetDout,        NULL, "Get DIO output level (meaningful only while direction is output)"},
+  {"SDOUT",    CMDfunction, -1, (void *)cmdSetDout,        NULL, "Set DIO output level, TRUE|FALSE"},
+  {"GDIN",     CMDfunction,  0, (void *)cmdGetDin,         NULL, "Read DIO line level now (valid in either direction)"},
 
   // ── GAACE_Script ADC demo (Section 6b) ──────────────────────────────────
   //  SCRIPTLOAD/GSCRIPTLIMITS/GSCRIPTST come from GAACEScriptRuntime.h
@@ -708,6 +738,89 @@ static void cmdGetAdc(void)
   cp.print(counts, 2);
   cp.print(",");
   cp.println(value, 4);
+}
+
+// -----------------------------------------------------------------------------
+// parseBoolArg — shared TRUE/FALSE token parser for the DIO function-pair
+// commands below. Mirrors commandProcessor.cpp's own CMDbool case
+// (tokenS == "TRUE"/"FALSE") but case-insensitively and via a plain
+// cp.getValue(char**) token, since these are CMDfunction handlers (a
+// side-effecting direction/level change, not a bare field write) rather than
+// CMDbool fields.
+// -----------------------------------------------------------------------------
+static bool parseBoolArg(bool *out)
+{
+  char *tok;
+  if (!cp.getValue(&tok)) return false;
+
+  bool ok = true;
+  if      (strcasecmp(tok, "TRUE")  == 0) *out = true;
+  else if (strcasecmp(tok, "FALSE") == 0) *out = false;
+  else ok = false;
+
+  cp.ca->free(tok);
+  return ok;
+}
+
+// -----------------------------------------------------------------------------
+// GDIODIR / SDIODIR,<TRUE|FALSE> — get/set the DIO line's direction.
+// dioSetDirection() (Section 6d) is the single point of truth, shared with
+// the dio_set_dir() script syscall, so the control port and a script can
+// never leave the hardware and data.DioOutputEnabled disagreeing about which
+// direction is actually active.
+// -----------------------------------------------------------------------------
+static void cmdGetDioDir(void)
+{
+  if (!cp.checkExpectedArgs(0)) return;
+  cp.sendACK(false);
+  cp.println(data.DioOutputEnabled);
+}
+
+static void cmdSetDioDir(void)
+{
+  if (!cp.checkExpectedArgs(1)) return;
+
+  bool v;
+  if (!parseBoolArg(&v)) { cp.sendNAK(ERR_BADARG); return; }
+
+  dioSetDirection(v);
+  cp.sendACK();
+}
+
+// -----------------------------------------------------------------------------
+// GDOUT / SDOUT,<TRUE|FALSE> — get/set the DIO output level. Only reaches
+// the external line while direction is output (GDIODIR TRUE); setting it
+// while direction is input is accepted but has no external effect until the
+// direction is switched.
+// -----------------------------------------------------------------------------
+static void cmdGetDout(void)
+{
+  if (!cp.checkExpectedArgs(0)) return;
+  cp.sendACK(false);
+  cp.println(dioOutLevel);
+}
+
+static void cmdSetDout(void)
+{
+  if (!cp.checkExpectedArgs(1)) return;
+
+  bool v;
+  if (!parseBoolArg(&v)) { cp.sendNAK(ERR_BADARG); return; }
+
+  dioWrite(v);
+  cp.sendACK();
+}
+
+// -----------------------------------------------------------------------------
+// GDIN — read the DIO line's actual level right now. Valid in either
+// direction: with output enabled, comparing this against GDOUT's last-set
+// value can reveal a shorted or contended line.
+// -----------------------------------------------------------------------------
+static void cmdGetDin(void)
+{
+  if (!cp.checkExpectedArgs(0)) return;
+  cp.sendACK(false);
+  cp.println(dioRead());
 }
 
 // =============================================================================
@@ -1247,6 +1360,115 @@ static void EthernetUpdate(void)
 }
 
 // =============================================================================
+//  SECTION 6d — DIGITAL I/O (DIO, SMA)
+// =============================================================================
+//
+//  One external line (SMA connector), independent of the 4 downstream
+//  ports — a board-level feature like the AIN input, not per-device. Can be
+//  switched between input and output at runtime, from both the control
+//  port (GDIODIR/SDIODIR, GDOUT/SDOUT, GDIN above) and scripts
+//  (dio_set_dir()/dio_write()/dio_read() syscalls, registered in setup())
+//  via the identical functions below — same pattern as
+//  readAdcCounts()/sys_read_adc() (Section 5/6a/6b).
+//
+//  HARDWARE (confirmed via a kicad-cli-exported netlist of the real
+//  schematic, same method used for the hub-strap pins in TODO.md):
+//    Teensy pin 2  — DIO_OUT: data input ('A') to a 74AHCT1G125 tri-state
+//      buffer. Only actually reaches the external line while DIO_OE_N is
+//      driven low.
+//    Teensy pin 3  — DIO_OE_N: that buffer's active-low output enable.
+//      Pulled up to 3.3V on-board via R15 — defaults HIGH (disabled/input)
+//      on its own, with no firmware involvement at all, including the boot
+//      window before setup() runs. Firmware only ever needs to drive it
+//      LOW to enable output; there's no undefined floating state to race.
+//    Teensy pin 4  — DIO_IN: output ('Y') of a 74LVC1G17 Schmitt buffer
+//      reading the external line — valid in both directions, so reading
+//      it back while output is enabled can reveal a shorted/contended line
+//      (see GDIN's comment above).
+//
+//  PERSISTENCE: only direction (data.DioOutputEnabled) is persisted. The
+//  output level itself is not — it resets to LOW every boot until the host
+//  or a script sets it. Direction is deliberately settable from scripts,
+//  not just the control port: a script loaded at startup needs to be able
+//  to configure its own direction without depending on the host having
+//  already set it via SDIODIR.
+//
+//  BOOT SAFETY: dioInit() (called from setup(), Section 8, independent of
+//  mode) still explicitly drives DIO_OE_N HIGH before touching DIO_OUT at
+//  all, even though R15's pull-up already makes that the hardware default —
+//  belt-and-suspenders, and it's what actually re-asserts the disabled
+//  state before deciding whether to re-enable it per whatever direction was
+//  restored from EEPROM.
+
+#define DIO_OUT_PIN   2   // 74AHCT1G125 'A' — SDOUT / dio_write() drive this
+#define DIO_OE_N_PIN  3   // 74AHCT1G125 OE-bar, active low, pulled up via R15 — SDIODIR / dio_set_dir() drive this
+#define DIO_IN_PIN    4   // 74LVC1G17 'Y' — GDIN / dio_read() read this
+
+bool dioOutLevel = false;   // last level SDOUT/dio_write() set; not persisted (see above)
+
+// dioSetDirection — single point of truth for changing DIO direction, used
+// by both SDIODIR (Section 5) and the dio_set_dir() script syscall (below).
+void dioSetDirection(bool outputEnabled)
+{
+  data.DioOutputEnabled = outputEnabled;
+  digitalWriteFast(DIO_OE_N_PIN, outputEnabled ? LOW : HIGH);   // active low
+}
+
+// dioWrite — drives DIO_OUT. Only reaches the external line while direction
+// is output; harmless to call while direction is input.
+void dioWrite(bool level)
+{
+  dioOutLevel = level;
+  digitalWriteFast(DIO_OUT_PIN, level ? HIGH : LOW);
+}
+
+// dioRead — reads DIO_IN. Valid in both directions — see the header comment
+// above for why that matters with output enabled.
+bool dioRead(void)
+{
+  return digitalReadFast(DIO_IN_PIN) != 0;
+}
+
+// dioInit — boot-time setup, independent of mode (called once from setup(),
+// Section 8, before command registration). Establishes the disabled/input
+// state explicitly before anything else touches these pins, then re-applies
+// whatever direction was persisted.
+static void dioInit(void)
+{
+  pinMode(DIO_OE_N_PIN, OUTPUT);
+  digitalWriteFast(DIO_OE_N_PIN, HIGH);   // disabled, before DIO_OUT is touched at all
+  pinMode(DIO_OUT_PIN, OUTPUT);
+  digitalWriteFast(DIO_OUT_PIN, LOW);
+  pinMode(DIO_IN_PIN, INPUT);
+
+  dioSetDirection(data.DioOutputEnabled);   // re-apply whatever was persisted
+}
+
+// Script syscalls — ids registered in setup() (Section 8) alongside the
+// ADC demo's (Section 6b). Direction is deliberately included here (not
+// just read/write) per the design decision above: a script needs to be
+// able to set up its own direction on load.
+static int32_t sys_dio_set_dir(int32_t *args, uint8_t argc)
+{
+  (void)argc;
+  dioSetDirection(args[0] != 0);
+  return 1;
+}
+
+static int32_t sys_dio_write(int32_t *args, uint8_t argc)
+{
+  (void)argc;
+  dioWrite(args[0] != 0);
+  return 1;
+}
+
+static int32_t sys_dio_read(int32_t *args, uint8_t argc)
+{
+  (void)args; (void)argc;
+  return dioRead() ? 1 : 0;
+}
+
+// =============================================================================
 //  SECTION 7 — SETTINGS PERSISTENCE (EEPROM)
 // =============================================================================
 
@@ -1300,6 +1522,12 @@ void setup()
   analogReadResolution(ADC_RESOLUTION_BITS);
   analogReadAveraging(ADC_HW_AVERAGING);
 
+  // ── 2a. Digital I/O boot safety (Section 6d) ────────────────────────────────
+  //  Independent of mode, same as the ADC config above. Must run before
+  //  anything else so DIO_OE_N is explicitly driven disabled before DIO_OUT
+  //  is touched at all — see Section 6d's header comment.
+  dioInit();
+
   // ── 3. Command / control USB port ───────────────────────────────────────────
   //  Kept separate from Serial (see the port-layout note at the top of this
   //  file) so the two never collide.
@@ -1343,6 +1571,9 @@ void setup()
   scripts.registerSyscall(sys_link_ready);   // id 0 — see Section 6b
   scripts.registerSyscall(sys_read_adc);     // id 1
   scripts.registerSyscall(sys_scale_send);   // id 2
+  scripts.registerSyscall(sys_dio_set_dir);  // id 3 — see Section 6d
+  scripts.registerSyscall(sys_dio_write);    // id 4
+  scripts.registerSyscall(sys_dio_read);     // id 5
 
   memcpy(scripts.slots[0].code, scriptDemo, scriptDemo_len);
   scripts.slots[0].codeLen = scriptDemo_len;

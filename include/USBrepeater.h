@@ -16,9 +16,9 @@
 // SIGNATURE is written into EEPROM so we can detect un-initialised storage.
 // Change this value if you ever change the layout of the Data struct — doing
 // so forces a reset to defaults on the next boot rather than reading garbage.
-// Bumped from 0xAA55A5A9 when ActiveDevice/AdcTargetDevice were added below
-// for the 4-downstream-port USBrepeater Hub Carrier board.
-#define SIGNATURE  0xAA55A5AA
+// Bumped from 0xAA55A5AA when DioOutputEnabled was added below for the DIO
+// (SMA) connector on the USBrepeater Hub Carrier board.
+#define SIGNATURE  0xAA55A5AB
 
 // Number of downstream USB ports on the Hub Carrier board (one USB2514B
 // 4-port hub). ActiveDevice/AdcTargetDevice below are 1-based indices into
@@ -98,6 +98,19 @@ typedef struct
   uint32_t      EthGateway;     // Static gateway
   int           EthCtrlPort;    // TCP port for the network control port (commandProcessor)
   int           EthDataPortBase; // TCP port for device 1's passthrough; devices 2-4 use +1..+3
+
+  // ── Digital I/O (DIO, SMA connector) ─────────────────────────────────────
+  //  See USBrepeater.cpp Section 6d. One external line, independent of the
+  //  4 downstream ports — a board-level feature like the AIN input, not
+  //  per-device. Only direction is persisted; the output level itself
+  //  resets to LOW every boot until the host or a script sets it (SDOUT /
+  //  dio_write()). TRUE = output enabled; FALSE = input/high-Z, the
+  //  power-up default (the hardware also pulls this disabled on its own,
+  //  independent of firmware — see Section 6d). Settable from both the
+  //  control port (?DIODIR/SDIODIR) and scripts (dio_set_dir() syscall) —
+  //  deliberately, so a script can configure its own direction on load
+  //  rather than depending on the host having set it first.
+  bool          DioOutputEnabled;
 
   unsigned int  Signature;      // Must equal SIGNATURE for the struct to be considered valid
 } Data;

@@ -284,6 +284,37 @@ single-`SCRIPTLOAD` vs. chunked automatically based on size, so this is
 usually invisible day to day. See that repo's `WORKFLOW.md` for the full
 walkthrough.
 
+### Digital I/O (DIO, SMA)
+
+One external line, independent of the 4 downstream ports — a board-level
+feature like the AIN input, not per-device. Switchable between input and
+output at runtime, from **both** the control port (`GDIODIR`/`SDIODIR`,
+`GDOUT`/`SDOUT`, `GDIN`) and scripts (`dio_set_dir()`/`dio_write()`/
+`dio_read()` syscalls) through the same underlying functions — same pattern
+as the ADC's `readAdcCounts()`/`sys_read_adc()`, so the two paths can never
+see it differently.
+
+Direction is deliberately scriptable, not just control-port-settable: a
+script loaded at startup can configure its own direction without depending
+on the host having set it first via `SDIODIR`. Only direction is persisted
+(`SAVE`/`RESTORE`); the output level itself resets to `FALSE` every boot
+until the host or a script sets it.
+
+**Hardware** (Teensy pins 2/3/4, confirmed via a `kicad-cli`-exported
+netlist of the real schematic): pin 2 drives a 74AHCT1G125 tri-state
+buffer's data input (only reaches the external line while enabled); pin 3
+is that buffer's active-low output enable, pulled up on-board (R15) so it
+defaults disabled/input with no firmware involvement at all, including the
+boot window before `setup()` runs; pin 4 reads a 74LVC1G17 Schmitt buffer's
+output — valid in either direction, so `GDIN` while output is enabled can
+reveal a shorted or contended line. `dioInit()` (`src/USBrepeater.cpp`,
+Section 6d) still explicitly drives the enable pin disabled as the very
+first thing in `setup()`, before touching the output pin at all, as a
+deliberate belt-and-suspenders on top of the hardware pull-up.
+
+Compile-verified only — no DIO hardware here yet to test against (same
+caveat as the rest of the Hub Carrier work).
+
 ### Persistence
 
 Settings live in the `Data` struct (`include/USBrepeater.h`), saved to and
@@ -325,6 +356,9 @@ every registered command and its help string, `HELP,<cmd>` looks up one.
 | `GADCM` / `SADCM,<m>` | ADC scale slope |
 | `GADCB` / `SADCB,<b>` | ADC scale offset |
 | `GADC` | Read ADC now: averaged counts (2 decimals) + scaled value (4 decimals), no send |
+| `GDIODIR` / `SDIODIR,TRUE\|FALSE` | Get/set the DIO line's direction: `TRUE`=output, `FALSE`=input (power-up default) |
+| `GDOUT` / `SDOUT,TRUE\|FALSE` | Get/set the DIO output level; only reaches the external line while direction is output |
+| `GDIN` | Read the DIO line's actual level now (valid in either direction) |
 | `SCRIPTLOAD,<slot>,<hex>` | Load a compiled script (`gsc.py --format hex`) into a `GAACE_Script` slot in one call — capped at roughly 250 decoded bytes by `commandProcessor`'s shared 512-byte scratch arena, regardless of `GAACE_SCRIPT_MAX_CODE_LEN` |
 | `SCRIPTAPPEND,<slot>,<offset>,<hexchunk>` | Write one chunk of a larger script into a slot's buffer at `offset`; marks the slot not-loaded until `SCRIPTCOMMIT` finalizes it |
 | `SCRIPTCOMMIT,<slot>,<totalLen>` | Finalize a buffer assembled via `SCRIPTAPPEND` calls and make the slot runnable |
@@ -353,10 +387,10 @@ manual vendoring required.
 
 ## Planned work
 
-Single-device Ethernet, hub bring-up, 4-device downstream support, and
-per-device Ethernet data ports are all implemented (above) — see
-[TODO.md](TODO.md) for exactly what's real-hardware-verified versus
-compile-verified-only so far. Remaining open work there: real-hardware
-validation of the 4-port hub, the downstream ring buffers, and the
-per-device Ethernet ports; the REF-channel ADC calibration correction; and
-digital I/O command support.
+Single-device Ethernet, hub bring-up, 4-device downstream support,
+per-device Ethernet data ports, and digital I/O are all implemented
+(above) — see [TODO.md](TODO.md) for exactly what's real-hardware-verified
+versus compile-verified-only so far. Remaining open work there:
+real-hardware validation of the 4-port hub, the downstream ring buffers,
+the per-device Ethernet ports, and DIO; plus the REF-channel ADC
+calibration correction.

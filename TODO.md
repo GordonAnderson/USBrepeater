@@ -243,33 +243,58 @@ one shared `readAdcCounts()` read path — exactly what the design guide's
       match whichever range was actually populated on the boards that were
       ordered.
 
-### Phase 4 — Digital I/O (DIO, SMA) — new feature, nothing exists yet
+### Phase 4 — Digital I/O (DIO, SMA)
 
-Confirmed via the netlist: logical pin 2 → `74AHCT1G125` tri-state driver
-(`DIO_OUT`), pin 3 → that driver's `OE_N` (`DIO_OE_N`, pulled up on-board —
-defaults to input/disabled at power-up, before firmware ever runs), pin 4 →
+Confirmed via the netlist: Teensy pin 2 → `74AHCT1G125` tri-state driver
+(`DIO_OUT`), pin 3 → that driver's `OE_N` (`DIO_OE_N`; pulled up to 3.3V
+on-board via **R15** — confirmed by re-checking the net directly against
+the schematic, correcting an earlier pass through this same netlist that
+missed R15 and wrongly flagged this as undriven/floating — defaults to
+input/disabled at power-up, before firmware ever runs), pin 4 →
 `74LVC1G17` Schmitt input (`DIO_IN`). Matches the docx's §5.8 proposal
 exactly for this one connector (unlike the hub-strap and Board-ID pins,
 which didn't make it into the real board as proposed).
 
-- [ ] New `Data` fields: at minimum a persisted `DioOutputEnabled`
-      (`Signature` bump).
-- [ ] New commands, roughly per the docx's own suggestion: `?DIODIR`
-      (`TRUE`=output enabled, drives `OE_N` low; `FALSE`=input/high-Z,
-      the safe default) and `?DOUT` (drives `DIO_OUT` when direction is
-      output) as bidirectional `CMDbool`s; `GDIN` (reads `DIO_IN`,
+**Implemented (2026-10-27), compile-verified only — no DIO hardware here
+yet to test against.** `src/USBrepeater.cpp` Section 6d:
+- [x] New `Data` field: `DioOutputEnabled` (`Signature` bumped
+      `0xAA55A5AA` -> `0xAA55A5AB`).
+- [x] New commands: `GDIODIR`/`SDIODIR` (`TRUE`=output enabled, drives
+      `OE_N` low; `FALSE`=input/high-Z, the safe default), `GDOUT`/`SDOUT`
+      (drives `DIO_OUT` when direction is output), `GDIN` (reads `DIO_IN`,
       meaningful in both directions — with output enabled it reads back
-      the actual line level, so firmware can detect a shorted or contended
-      output).
-- [ ] Boot safety: set `DIO_OE_N` `OUTPUT`/`HIGH` (disabled) *before*
-      touching `DIO_OUT` at all, so the driver can never glitch into an
-      unintended output state during `setup()`.
+      the actual line level, so a shorted or contended output is
+      detectable). Implemented as `CMDfunction` pairs, not bidirectional
+      `CMDbool` fields as originally sketched — direction/level changes
+      have an immediate hardware side effect (driving a pin) that a plain
+      field write can't do on its own, same reasoning as `SADCINT`.
+- [x] Boot safety: `dioInit()` sets `DIO_OE_N` `OUTPUT`/`HIGH` (disabled)
+      *before* touching `DIO_OUT` at all, called from `setup()`
+      independent of mode, before command registration.
+- [x] **Design decision (2026-10-27, per the user): direction is
+      scriptable, not just control-port-settable.** `dio_set_dir()`,
+      `dio_write()`, and `dio_read()` are all exposed as `GAACE_Script`
+      syscalls (ids 3-5, alongside the ADC demo's 0-2), sharing the exact
+      same `dioSetDirection()`/`dioWrite()`/`dioRead()` functions the
+      control-port commands call — so a script loaded at startup can
+      configure its own direction without depending on the host having
+      set it first. This was a deliberate choice, not the default
+      considered earlier in this file (which would have kept direction
+      control-port-only); the user's stated reason: a script needs to be
+      able to set up its direction on load.
 - [ ] Not needed for V1: pin 2 is PWM-capable and pin 4 is
       interrupt/capture-capable specifically so a later feature (pulse
       output, edge-triggered ADC sampling — the docx explicitly raises "DIO
       edge triggers an ADC sample/send" as a future idea) doesn't need a
-      board respin. Keep the V1 command handlers simple (static levels
-      only); don't build the PWM/capture path now.
+      board respin. Kept the V1 command/syscall handlers simple (static
+      levels only); did not build the PWM/capture path now.
+- [ ] **Not yet tested on real hardware** — no DIO connector/line here yet
+      to test against. First real test, once hardware arrives: toggle
+      direction and level via `SDIODIR`/`SDOUT`, confirm `GDIN` reads back
+      correctly in both directions, then repeat the same sequence from a
+      script via `dio_set_dir()`/`dio_write()`/`dio_read()` and confirm
+      `GDIODIR`/`GDOUT` on the control port agree with whatever the script
+      just set (the actual point of sharing one function per operation).
 
 ### Phase 5 — Documentation follow-up
 
