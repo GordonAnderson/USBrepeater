@@ -840,14 +840,37 @@ a new constraint.
       (`GAACE_SCRIPT_SLOTS`), max script size, stack/var/syscall counts are
       all `#define`s with defaults; start/stop/rate reuse `threadCommands`
       rather than adding new commands
-- [ ] Script *persistence* across reboot — still RAM-only. The
-      filesystem-based save/load/load-on-boot idea (for platforms that have
-      one, e.g. Teensy 4.1's LittleFS) is still just an idea, not built.
-      Explicitly the next piece of work after `SCRIPTAPPEND`/`SCRIPTCOMMIT`
-      above (per the user, 2026-10-27) — scoped as a following step, not
-      part of that round. Composes cleanly once started: saving/restoring a
-      slot's buffer to/from a file is plain buffer<->file I/O with no size
-      ceiling of its own, unlike the serial transfer that just got fixed
+- [x] **Resolved (2026-10-27): script persistence across reboot.**
+      `SCRIPTSAVE,<slot>` / `SCRIPTRESTORE,<slot>` (`src/USBrepeater.cpp`,
+      "Script slot persistence" in Section 6b) save/reload a slot's exact
+      buffer to/from a `LittleFS_Program` filesystem reserved in on-chip
+      flash (`SCRIPT_FS_RESERVE_BYTES`, 256 KB, tunable `#define`) — one
+      file per slot (`/script<N>.bin`). No new wire format: a slot's
+      `code[]` buffer already *is* the `[codeLen][code][pool]` payload
+      `SCRIPTLOAD` uses, so persisting it is plain whole-buffer file I/O,
+      exactly as anticipated below. `VM::codeLen`/`VM::poolLen` (public
+      fields in `GAACEScript.h`) recover the exact byte count to write,
+      since `ScriptSlot` itself doesn't retain `poolLen` after a load.
+      **Boot-time auto-restore**: `setup()` attempts every slot; slot 0
+      falls back to the compiled-in ADC demo only if it has no saved file.
+      A restored script is left **enabled** (Thread's own default),
+      unlike a fresh `SCRIPTLOAD` (which always starts disabled) — a
+      deliberate difference, since the entire point of persistence is a
+      script that resumes working on its own after a reboot (e.g. setting
+      up its own DIO direction on load, the user's original motivating
+      example), not one that still needs a manual `STENA` every boot.
+      Implemented entirely in USBrepeater, not `GAACE_Script` itself — see
+      that repo's own `TODO.md`/`WORKFLOW.md` for why (keeping the library
+      hardware-agnostic).
+      - [ ] **Not yet tested on real hardware** — no actual power-cycle
+            test run in this environment yet (unlike the rest of the
+            Hub Carrier work, this specifically doesn't need that
+            hardware — `LittleFS_Program` is on-chip flash on the bare
+            Teensy 4.1 already in hand). First real test: `SCRIPTSAVE` a
+            script into a slot, power-cycle (not just re-run `pio run -t
+            upload`, which doesn't prove persistence the way an actual
+            power loss does), and confirm `GSCRIPTST`/`GTENA` show it
+            loaded and running without any commands sent after boot.
 - [ ] A general "device just rebooted" notification — raised during design
       discussion as a real gap (a host has no way to know a script's state
       was lost to an unexpected reset), but it's a GAACE_Core-level concern

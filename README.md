@@ -332,6 +332,40 @@ single-`SCRIPTLOAD` vs. chunked automatically based on size, so this is
 usually invisible day to day. See that repo's `WORKFLOW.md` for the full
 walkthrough.
 
+### Script persistence across reboot
+
+A `SCRIPTLOAD`/`SCRIPTAPPEND`-loaded script is RAM-only as far as
+`GAACE_Script` itself is concerned. `SCRIPTSAVE,<slot>` writes that slot's
+exact current buffer — the same `[codeLen][code][pool]` payload
+`SCRIPTLOAD` uses, verbatim, no new format — to a file on a small
+`LittleFS_Program` filesystem reserved in on-chip flash (`/script<N>.bin`,
+one per slot). `SCRIPTRESTORE,<slot>` reloads it on demand; **every slot
+is also attempted automatically at boot** (`setup()`, Section 8), so a
+saved script resumes running on its own after a power cycle or reflash —
+no manual re-load needed.
+
+A restored script is left **enabled**, at its default 1000 mS interval
+(`?TENA`/`?TINT,Script<n>` to change either) — deliberately different from
+a freshly-`SCRIPTLOAD`-ed script, which always starts disabled. The point
+of persistence is a script that configures itself and starts working
+immediately on boot (e.g. setting up its own DIO direction, per the design
+discussion that motivated this feature) without the host having to
+re-enable it every time. Slot 0 falls back to the compiled-in ADC demo
+(below) only if it has no saved file to restore instead — a persisted
+slot 0 script takes priority over the demo.
+
+This is implemented entirely in USBrepeater (`src/USBrepeater.cpp`,
+"Script slot persistence" in Section 6b), not inside `GAACE_Script`
+itself — that library stays hardware-agnostic (no Teensy-specific code in
+its core), and `LittleFS_Program` is Teensy-only. `ScriptSlot::code[]` and
+`VM::codeLen`/`VM::poolLen` being public fields was enough to build this
+with zero changes to the library.
+
+Compile-verified only — no persistent hardware state to actually test a
+power-cycle against yet in this environment, though `LittleFS_Program`
+itself needs no Hub Carrier hardware (it's on-chip flash on the bare
+Teensy 4.1).
+
 ### Digital I/O (DIO, SMA)
 
 One external line, independent of the 4 downstream ports — a board-level
@@ -417,6 +451,8 @@ every registered command and its help string, `HELP,<cmd>` looks up one.
 | `SCRIPTCOMMIT,<slot>,<totalLen>` | Finalize a buffer assembled via `SCRIPTAPPEND` calls and make the slot runnable |
 | `GSCRIPTLIMITS` | `slots,maxCodeLen,stackSize,varSlots,maxSyscalls` for the script runtime |
 | `GSCRIPTST,<slot>` | `loaded(0\|1),lastStatus` for one script slot |
+| `SCRIPTSAVE,<slot>` | Save a loaded slot's buffer to on-chip flash (survives reboot/power loss) |
+| `SCRIPTRESTORE,<slot>` | Reload a slot's buffer from flash now (also attempted automatically at boot) |
 | `GCMDS` | List all commands and help strings |
 | `HELP,<cmd>` | Help for one command |
 | `TLIST` / `?TENA` / `?TINT` / `TTRIG` / `TDELAY` / `TSTOPALL` / `TSTARTALL` / `TREM` | Thread introspection/control (see GAACE_Core's `threadCommands`) — also how the ADC demo's `Script0` is started/stopped/re-timed: `?TENA,Script0,...` / `?TINT,Script0,...` |
@@ -442,9 +478,10 @@ manual vendoring required.
 
 Single-device Ethernet, hub bring-up, 4-device downstream support,
 per-device Ethernet data ports, the second switchable USB data port,
-digital I/O, and the AIN range/REF-correction/low-pass-filter work are all
-implemented (above) — see [TODO.md](TODO.md) for exactly what's
-real-hardware-verified versus compile-verified-only so far. Remaining open
-work there: real-hardware validation of the 4-port hub, the downstream
-ring buffers, both switchable USB ports together, the per-device Ethernet
+digital I/O, script persistence across reboot, and the AIN range/REF-
+correction/low-pass-filter work are all implemented (above) — see
+[TODO.md](TODO.md) for exactly what's real-hardware-verified versus
+compile-verified-only so far. Remaining open work there: real-hardware
+validation of the 4-port hub, the downstream ring buffers, both
+switchable USB ports together, the per-device Ethernet
 ports, DIO, and the REF correction/filter.

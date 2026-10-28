@@ -75,6 +75,7 @@
 #include <string.h>  // memcpy() — used by setup() to preload a default script
 #include <math.h>    // lroundf() — used by sys_read_adc() (Section 6b)
 #include <strings.h> // strcasecmp() — used to parse TRUE/FALSE args (Section 5, DIO)
+#include <LittleFS.h> // LittleFS_Program — script slot persistence on-chip flash (Section 6b)
 
 //  UsbHubBoot — USB2514B strap/reset sequencing for the USBrepeater Hub
 //  Carrier board (Section 6). Required any time this firmware runs on that
@@ -315,6 +316,8 @@ static void cmdGetDioDir(void);
 static void cmdSetDioDir(void);
 static void cmdGetDout(void);
 static void cmdSetDout(void);
+static void cmdScriptSave(void);
+static void cmdScriptRestore(void);
 static void cmdGetDin(void);
 
 static int portLimits[] = {1, 65535};  // range check for ?ETHCTRLPORT / ?ETHDATAPORT
@@ -336,6 +339,13 @@ void     dioSetDirection(bool outputEnabled);
 void     dioWrite(bool level);
 bool     dioRead(void);
 extern bool dioOutLevel;
+
+// Script-slot flash persistence — implemented in Section 6b, where the
+// GAACE_Script runtime (`scripts`) lives. Plain bool(uint8_t) signatures
+// here (no GAACEScript:: types) so these can be forward-declared before
+// Section 6b's `using namespace GAACEScript;` takes effect.
+bool     saveScriptSlotToFlash(uint8_t slot);
+bool     restoreScriptSlotFromFlash(uint8_t slot);
 
 Command cmds[] =
 {
@@ -435,6 +445,14 @@ Command cmds[] =
   //  STINT,Script0,<mS>. Reuses ?ADCPIN/?ADCM/?ADCB/?ADCCMD above. Don't
   //  enable both Script0 and ADCEN against the same downstream command —
   //  they'd double-send.
+
+  // ── Script slot persistence (flash; see Section 6b) ────────────────────
+  //  USBrepeater-specific, not part of GAACE_Script itself (that library
+  //  stays hardware-agnostic — LittleFS_Program is Teensy-only). Every
+  //  slot is attempted at boot (setup(), Section 8), overriding the
+  //  compiled-in ADC demo for slot 0 if slot 0 has a saved file.
+  {"SCRIPTSAVE",    CMDfunction, -1, (void *)cmdScriptSave,    NULL, "SCRIPTSAVE,<slot> -- save a loaded script's buffer to flash"},
+  {"SCRIPTRESTORE", CMDfunction, -1, (void *)cmdScriptRestore, NULL, "SCRIPTRESTORE,<slot> -- reload a slot's buffer from flash"},
 
   {NULL}  // Sentinel — must remain as the last entry
 };
@@ -1005,6 +1023,57 @@ static void cmdGetDin(void)
   cp.println(dioRead());
 }
 
+// -----------------------------------------------------------------------------
+// SCRIPTSAVE,<slot> / SCRIPTRESTORE,<slot> — save/reload a script slot's
+// buffer to/from on-chip flash (Section 6b). ERR_BADARG for a bad slot
+// index or (SCRIPTSAVE only) a slot that isn't currently loaded —
+// consistent with SCRIPTLOAD/SCRIPTCOMMIT's own range checks above.
+// ERR_NOSDCARD for "no persisted file exists to restore" (SCRIPTRESTORE
+// only), same reuse RestoreSettings() (Section 7) already makes of that
+// code for "no valid record has ever been saved".
+// -----------------------------------------------------------------------------
+static void cmdScriptSave(void)
+{
+  if (!cp.checkExpectedArgs(1)) return;
+
+  // Not cp.getValue(&slot, 0, GAACE_SCRIPT_SLOTS - 1): commandProcessor
+  // treats ll==0 && ul==0 as "no range check" (see GAACEScriptRuntime.cpp's
+  // identical note), which would silently disable bounds checking whenever
+  // GAACE_SCRIPT_SLOTS==1.
+  int slot;
+  if (!cp.getValue(&slot) || slot < 0 || slot >= GAACE_SCRIPT_SLOTS)
+  {
+    cp.sendNAK(ERR_BADARG);
+    return;
+  }
+
+  if (!saveScriptSlotToFlash((uint8_t)slot))
+  {
+    cp.sendNAK(ERR_BADARG);   // not currently loaded, or the write itself failed
+    return;
+  }
+  cp.sendACK();
+}
+
+static void cmdScriptRestore(void)
+{
+  if (!cp.checkExpectedArgs(1)) return;
+
+  int slot;   // see cmdScriptSave()'s comment above for why this isn't cp.getValue(&slot, 0, ...)
+  if (!cp.getValue(&slot) || slot < 0 || slot >= GAACE_SCRIPT_SLOTS)
+  {
+    cp.sendNAK(ERR_BADARG);
+    return;
+  }
+
+  if (!restoreScriptSlotFromFlash((uint8_t)slot))
+  {
+    cp.sendNAK(ERR_NOSDCARD);   // no saved file for this slot (or it failed to parse)
+    return;
+  }
+  cp.sendACK();
+}
+
 // =============================================================================
 //  SECTION 6 — REPEATER MODE (4 downstream ports, Hub Carrier board)
 // =============================================================================
@@ -1514,6 +1583,116 @@ static int32_t sys_scale_send(int32_t *args, uint8_t argc)
   return 1;
 }
 
+// -----------------------------------------------------------------------------
+// Script slot persistence (flash) — USBrepeater-specific, not part of
+// GAACE_Script itself: that library stays hardware-agnostic (no Serial, no
+// Teensy headers in its core), and LittleFS_Program is Teensy-only. A
+// slot's buffer (ScriptSlot::code[]) is exactly the wire-format payload
+// SCRIPTLOAD/SCRIPTAPPEND+SCRIPTCOMMIT already use — [codeLen:u16 LE][code
+// bytes][pool bytes] — so saving/restoring it is plain whole-buffer file
+// I/O; no new format to invent. codeLen/poolLen aren't stored directly on
+// ScriptSlot after a load, but VM::codeLen/VM::poolLen (public fields,
+// GAACEScript.h) are exactly those values, so totalLen = 2 + vm.codeLen +
+// vm.poolLen is recoverable without any GAACE_Script changes.
+//
+// One file per slot ("/script<N>.bin") on a small LittleFS_Program flash
+// filesystem — reserved program flash, not the EEPROM Data{} uses, and not
+// a microSD card (there isn't one). SCRIPT_FS_RESERVE_BYTES is generous
+// for how little this needs: GAACE_SCRIPT_SLOTS slots x
+// GAACE_SCRIPT_MAX_CODE_LEN bytes each is the absolute ceiling (today,
+// 4 x 2048 = 8 KB), and Teensy 4.1's program flash has megabytes to spare
+// (see any `pio run` size report's "free for files" line).
+// -----------------------------------------------------------------------------
+#define SCRIPT_FS_RESERVE_BYTES (256UL * 1024UL)
+
+LittleFS_Program scriptFS;
+bool scriptFSReady = false;   // set in setup() (Section 8); every function below checks it first
+
+static void scriptSlotPath(uint8_t slot, char *buf, size_t bufLen)
+{
+  snprintf(buf, bufLen, "/script%u.bin", (unsigned)slot);
+}
+
+// finalizeScriptSlot — identical validation/finalization logic to
+// GAACEScriptRuntime.cpp's cmdScriptCommit(), applied directly to a slot
+// whose buffer was just filled by restoreScriptSlotFromFlash() below
+// (reading raw bytes from a file, not decoding hex from a command line, so
+// SCRIPTCOMMIT itself can't be called/reused as-is).
+static bool finalizeScriptSlot(uint8_t slot, uint16_t totalLen)
+{
+  if (totalLen < 2 || totalLen > SCRIPT_MAX_CODE_LEN) return false;
+
+  ScriptSlot &s = scripts.slots[slot];
+  uint16_t codeLen = (uint16_t)((uint8_t)s.code[0] | ((uint8_t)s.code[1] << 8));
+  if (codeLen > (uint16_t)totalLen - 2) return false;
+  uint16_t poolLen = (uint16_t)((uint16_t)totalLen - 2 - codeLen);
+
+  s.codeLen = codeLen;
+  vmInit(s.vm, s.code + 2, codeLen);
+  vmSetPool(s.vm, s.code + 2 + codeLen, poolLen);
+  s.loaded = true;
+  s.lastStatus = VM_OK;
+  return true;
+}
+
+// saveScriptSlotToFlash — write a loaded slot's exact current buffer
+// (header + code + pool) to its file. Fails (false, no file written/
+// touched) if the slot isn't loaded or the filesystem isn't mounted; a
+// slot mid-SCRIPTAPPEND (loaded==false) must never be persisted as if it
+// were a complete, runnable script.
+bool saveScriptSlotToFlash(uint8_t slot)
+{
+  if (!scriptFSReady || slot >= SCRIPT_SLOTS) return false;
+
+  ScriptSlot &s = scripts.slots[slot];
+  if (!s.loaded) return false;
+
+  uint16_t totalLen = (uint16_t)(2 + s.vm.codeLen + s.vm.poolLen);
+  if (totalLen > SCRIPT_MAX_CODE_LEN) return false;   // defensive; should be unreachable
+
+  char path[20];
+  scriptSlotPath(slot, path, sizeof(path));
+
+  scriptFS.remove(path);   // start from empty so a shorter script doesn't leave trailing garbage
+  File f = scriptFS.open(path, FILE_WRITE_BEGIN);
+  if (!f) return false;
+
+  size_t written = f.write(s.code, totalLen);
+  f.close();
+  return written == totalLen;
+}
+
+// restoreScriptSlotFromFlash — read a slot's file back into its buffer and
+// finalize it exactly like SCRIPTCOMMIT would. Fails (false, slot
+// untouched) if the filesystem isn't mounted, no file exists for this
+// slot, or the file's own [codeLen][code][pool] layout doesn't validate —
+// a corrupt/foreign file must not leave the slot in a half-updated state.
+bool restoreScriptSlotFromFlash(uint8_t slot)
+{
+  if (!scriptFSReady || slot >= SCRIPT_SLOTS) return false;
+
+  char path[20];
+  scriptSlotPath(slot, path, sizeof(path));
+  if (!scriptFS.exists(path)) return false;
+
+  File f = scriptFS.open(path, FILE_READ);
+  if (!f) return false;
+
+  uint64_t fileSize = f.size();
+  if (fileSize < 2 || fileSize > SCRIPT_MAX_CODE_LEN)
+  {
+    f.close();
+    return false;
+  }
+
+  ScriptSlot &s = scripts.slots[slot];
+  size_t readBytesN = f.readBytes((char *)s.code, (size_t)fileSize);
+  f.close();
+
+  if (readBytesN != (size_t)fileSize) return false;
+  return finalizeScriptSlot(slot, (uint16_t)fileSize);
+}
+
 // =============================================================================
 //  SECTION 6c — ETHERNET
 // =============================================================================
@@ -1815,10 +1994,6 @@ void setup()
   EthernetThread.setInterval(20);   // ms; keeps Ethernet.loop() ticking promptly
   control.add(&EthernetThread);
 
-  // Preload the ADC demo (Section 6b) into slot 0, the same way a project
-  // preloads any default script: fill code[]/codeLen, vmInit(), loaded=true.
-  // Starts disabled -- see Section 6b for why (double-send risk with
-  // ADCThread); enable with STENA,Script0,TRUE once ready to compare them.
   scripts.registerSyscall(sys_link_ready);   // id 0 — see Section 6b
   scripts.registerSyscall(sys_read_adc);     // id 1
   scripts.registerSyscall(sys_scale_send);   // id 2
@@ -1826,11 +2001,40 @@ void setup()
   scripts.registerSyscall(sys_dio_write);    // id 4
   scripts.registerSyscall(sys_dio_read);     // id 5
 
-  memcpy(scripts.slots[0].code, scriptDemo, scriptDemo_len);
-  scripts.slots[0].codeLen = scriptDemo_len;
-  vmInit(scripts.slots[0].vm, scripts.slots[0].code, scripts.slots[0].codeLen);
-  scripts.slots[0].loaded  = true;
-  scripts.slots[0].enabled = false;
+  // ── 5b. Script slot persistence (flash; Section 6b) ─────────────────────────
+  //  Mount the on-chip flash filesystem, then try restoring every slot from
+  //  its saved file. A slot with no saved file (or a filesystem that fails
+  //  to mount) just stays unloaded — except slot 0, which falls back to the
+  //  compiled-in ADC demo below, exactly as before this feature existed.
+  //  Restored scripts are left at Thread's own default (enabled=true,
+  //  1000 mS interval, from ScriptRuntime's constructor) so a persisted
+  //  script resumes running on its own at boot — the actual point of
+  //  persistence (e.g. a script that sets up DIO direction on load, per the
+  //  user's original motivating use case). This differs deliberately from
+  //  the compiled-in demo's explicit enabled=false below, which exists for
+  //  an unrelated, demo-specific reason (avoiding a double-send with
+  //  ADCThread by default).
+  scriptFSReady = scriptFS.begin(SCRIPT_FS_RESERVE_BYTES);
+  bool slot0Restored = false;
+  for (uint8_t i = 0; i < GAACE_SCRIPT_SLOTS; i++)
+  {
+    bool restored = restoreScriptSlotFromFlash(i);
+    if (i == 0) slot0Restored = restored;
+  }
+
+  // Preload the ADC demo (Section 6b) into slot 0, the same way a project
+  // preloads any default script: fill code[]/codeLen, vmInit(), loaded=true.
+  // Only if slot 0 had no persisted script to restore instead (above).
+  // Starts disabled -- see Section 6b for why (double-send risk with
+  // ADCThread); enable with STENA,Script0,TRUE once ready to compare them.
+  if (!slot0Restored)
+  {
+    memcpy(scripts.slots[0].code, scriptDemo, scriptDemo_len);
+    scripts.slots[0].codeLen = scriptDemo_len;
+    vmInit(scripts.slots[0].vm, scripts.slots[0].code, scripts.slots[0].codeLen);
+    scripts.slots[0].loaded  = true;
+    scripts.slots[0].enabled = false;
+  }
 
   // ── 6. Active mode ───────────────────────────────────────────────────────────
   modeTable[currentMode].setup();
