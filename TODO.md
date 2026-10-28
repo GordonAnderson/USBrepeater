@@ -215,33 +215,80 @@ again if firmware-side identification is ever revisited.)
 one shared `readAdcCounts()` read path — exactly what the design guide's
 §5.6.2 recommends. No firmware change needed for this part.
 
-**Still needed**:
-- [ ] On-hardware calibration once boards arrive: apply known voltages at
-      the AIN SMA and fit `SADCM`/`SADCB` from the real board, per the
-      docx's bring-up plan. Starting points (12-bit-adjusted from the
-      docx's §5.6/§5.6.2 transfer functions — confirm against the actual
-      populated range before trusting them):
-      - ±10 V range: `SADCM,0.005348` `SADCB,-10.96`
-      - 0–10 V range: `SADCM,0.002705` `SADCB,-0.496`
-- [ ] **REF channel (A1/pin 15) ratiometric correction — not implemented
-      at all yet.** The board has a 2.5 V precision reference
-      (`ISL21070CIH325Z`, confirmed on A1 via the netlist) specifically so
-      firmware can cancel gain drift from the Teensy's 3.3 V rail (which is
-      both the ADC reference and the AIN summing network's offset
-      reference). Per the docx's §5.6.1 formula:
-      `value_corrected = (REF_cal / REF_now) × (AdcScaleM × AIN_counts + AdcScaleB)`.
-      Concrete firmware work: add a `RefCal` field to `Data` (`Signature`
-      bump), read A1 through the same averaged-read path as AIN, and a way
-      to capture `REF_cal` at calibration time (e.g. a `CALREF` command
-      that reads the current A1 average into `data.RefCal`, then `SAVE`).
-      Until this exists, the channel is wired but unused — the board works
-      exactly as it does today without it.
-- [ ] `AinRange` (±10 V vs. 0–10 V) is a **population option, not a
-      firmware feature** — confirmed by the docx itself ("gain, offset and
-      sign are all absorbed by `AdcScaleM`/`AdcScaleB`, so no firmware
-      change is needed"). Just make sure the calibration constants above
-      match whichever range was actually populated on the boards that were
-      ordered.
+**Implemented (2026-10-27), compile-verified only — no AIN hardware here
+yet to test against.** `src/USBrepeater.cpp` Section 5:
+- [x] **`AinRange` promoted from "population option, no firmware change
+      needed" to an explicit build-time `#define`.** Still true that
+      `AdcScaleM`/`AdcScaleB` fully absorb gain/offset/sign either way
+      (nothing *requires* the `#define`) — but `AIN_RANGE_UNIPOLAR` /
+      `AIN_RANGE_BIPOLAR` (`platformio.ini`, default `BIPOLAR`) now selects
+      the correct starting-point `AdcScaleM`/`AdcScaleB` as the factory
+      default, so a fresh board reads real volts out of the box instead of
+      raw counts until someone manually calibrates it. `SADCM`/`SADCB`
+      still override live afterward, same as before. Starting-point values
+      (12-bit-adjusted from the docx's §5.6/§5.6.2 transfer functions —
+      confirm against the actual populated range before trusting them):
+      - ±10 V range (`AIN_RANGE_BIPOLAR`, the default): `AdcScaleM=0.005348,
+        AdcScaleB=-10.96`
+      - 0–10 V range (`AIN_RANGE_UNIPOLAR`): `AdcScaleM=0.002705,
+        AdcScaleB=-0.496`
+      Neither build flag is currently set in `platformio.ini` — it's
+      unknown which range was actually populated on the boards that were
+      ordered; set the matching one once that's known (the default,
+      bipolar, applies until then).
+- [x] **REF channel (A1) ratiometric correction — implemented.** Added
+      `RefCal` to `Data` (`Signature` bumped `0xAA55A5AB` -> `0xAA55A5AC`
+      alongside the filter field below), `readRefCounts()` (same averaged-
+      read path as AIN, on `AIN_REF_PIN`=`A1`), `CALREF` (captures the
+      current A1 average into `data.RefCal`, live; `SAVE` to persist), and
+      `GREFCAL` (reads it back). `scaleAdcValue()` is now the single shared
+      function computing `AdcScaleM*counts+AdcScaleB` and then, if
+      `RefCal > 0`, multiplying by `RefCal/REF_now` per the docx's §5.6.1
+      formula — used by `GADC`, `ADCUpdate()`, and the script
+      `scale_send()` syscall, so all three apply the correction (or don't,
+      before `CALREF` has ever been run) identically. `RefCal <= 0` (the
+      factory default) disables the correction entirely — until `CALREF`
+      is run, the channel is wired but unused, exactly as before this
+      change.
+- [ ] **Not yet tested on real hardware** — no AIN/REF signal here yet to
+      apply known voltages to. First real test, once hardware arrives: the
+      on-hardware calibration pass above (fit `SADCM`/`SADCB` against known
+      voltages), then `CALREF` with the REF input in its known-good state,
+      then confirm `GADC`'s reported value tracks a deliberately drifted
+      3.3V rail correctly with the correction enabled vs. not.
+
+### Phase 3a — AIN low-pass filter (tunable without reflashing)
+
+**Implemented (2026-10-27), compile-verified only.** Not something the
+docx specified — raised directly by the user: oversampling (already done,
+Phase 3 above) addresses quantization noise within one read; it does
+nothing for noise *between* reads on a genuinely noisy signal, which is
+what a low-pass filter is for, and it needed to be tunable live, not a
+rebuild-to-change `#define`.
+
+`applyAdcLowPass()` (`src/USBrepeater.cpp`, Section 5) is a dt-corrected
+exponential moving average applied on top of `readAveragedCounts()` inside
+`readAdcCounts()` — so `GADC`/`ADCUpdate()`/the script `read_adc()`
+syscall all get the filtered value identically, same single-source-of-
+truth pattern as everything else in this file. New persisted field
+`AdcFilterTauMs` (time constant in mS; `<= 0` disables it, today's
+original raw-averaged behavior), settable live via `GADCFILTER`/
+`SADCFILTER` — no reflash needed, per the requirement. dt-corrected
+(computed from actual elapsed `millis()` each call, not a fixed per-call
+coefficient) because `GADC` can be called on demand at any time, not just
+on `ADCThread`'s own schedule — a fixed coefficient would make the
+filter's real time constant drift with whichever caller happens to trigger
+a given read. Deliberately *not* applied to the REF channel
+(`readRefCounts()`) — REF is a slowly-drifting calibration factor, not a
+noisy signal to track quickly, so plain averaging is the right amount of
+smoothing there; only `readAdcCounts()` (AIN) runs through the filter.
+
+- [ ] **Not yet tested on real hardware** — no noisy AIN signal here yet
+      to filter. First real test, once hardware arrives: feed a known-noisy
+      source into AIN, compare `GADC`'s reported counts with the filter
+      disabled vs. a few different `SADCFILTER` time constants, and confirm
+      the response settles over roughly the expected number of time
+      constants after a step change.
 
 ### Phase 4 — Digital I/O (DIO, SMA)
 

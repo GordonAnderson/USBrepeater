@@ -151,6 +151,26 @@ using namespace qindesign::network;
 // up if a real device's unsolicited chatter between host visits needs more.
 #define DEVPORT_RINGBUF_SIZE 2048
 
+// AIN range — a build-time hardware decision (which input divider/offset
+// network is populated on the board), not something firmware can detect or
+// change at runtime. Selects the factory-default AdcScaleM/AdcScaleB below
+// so a fresh board reads real volts out of the box instead of raw counts
+// until someone manually calibrates it; SADCM/SADCB can always override
+// live afterward, same as today. Starting-point values per the carrier-
+// board design guide's §5.6/§5.6.2 transfer functions (12-bit-adjusted) —
+// confirm against the actual populated range before trusting them on a
+// specific board. Define exactly one of these two in platformio.ini
+// build_flags; BIPOLAR is the default if neither is defined, since it's
+// the one consulted most often in this project's hardware docs so far —
+// not a claim about which variant any particular board actually has.
+#if defined(AIN_RANGE_UNIPOLAR)
+  #define AIN_DEFAULT_SCALE_M  0.002705f   // 0-10V range
+  #define AIN_DEFAULT_SCALE_B -0.496f
+#else
+  #define AIN_DEFAULT_SCALE_M  0.005348f   // +/-10V range (default)
+  #define AIN_DEFAULT_SCALE_B -10.96f
+#endif
+
 // Active runtime data. Loaded from EEPROM on boot; written back by SAVE.
 Data data;
 
@@ -170,8 +190,11 @@ Data DefaultData =
   A0,             // AdcPin
   1000,           // AdcInterval — 1000 mS
   "SETVAL",       // AdcCmdName  — placeholder; set to match the downstream command
-  1.0f,           // AdcScaleM   — value = counts (identity scale) until calibrated
-  0.0f,           // AdcScaleB
+  AIN_DEFAULT_SCALE_M,  // AdcScaleM — range-dependent default (AIN_RANGE_UNIPOLAR/BIPOLAR above)
+  AIN_DEFAULT_SCALE_B,  // AdcScaleB
+
+  0.0f,           // RefCal          — correction disabled until CALREF is run
+  0.0f,           // AdcFilterTauMs  — low-pass disabled; raw averaged passthrough
 
   true,           // EthDHCP      — DHCP by default, zero-config on a typical LAN
   0,              // EthIP        — 0.0.0.0; set explicitly before switching off DHCP
@@ -268,6 +291,8 @@ static void cmdGetLink(void);
 static void cmdGetAdcInterval(void);
 static void cmdSetAdcInterval(void);
 static void cmdGetAdc(void);
+static void cmdCalRef(void);
+static void cmdGetRefCal(void);
 static void cmdGetBaud(void);
 static void cmdSetBaud(void);
 static void cmdGetEthIp(void);
@@ -372,7 +397,10 @@ Command cmds[] =
   {"?ADCCMD",  CMDstr,      -1, (void *)&data.AdcCmdName,  NULL, "Command name sent to the downstream device"},
   {"?ADCM",    CMDfloat,    -1, (void *)&data.AdcScaleM,   NULL, "ADC scale slope: value = M * counts + B"},
   {"?ADCB",    CMDfloat,    -1, (void *)&data.AdcScaleB,   NULL, "ADC scale offset: value = M * counts + B"},
-  {"GADC",     CMDfunction,  0, (void *)cmdGetAdc,         NULL, "Read ADC now: averaged counts (2dp) and scaled value (4dp)"},
+  {"?ADCFILTER", CMDfloat,  -1, (void *)&data.AdcFilterTauMs, NULL, "AIN low-pass time constant, mS (0 = disabled); tunable live, no reflash"},
+  {"CALREF",   CMDfunction,  0, (void *)cmdCalRef,        NULL, "Capture the current REF reading into RefCal (then SAVE to persist)"},
+  {"GREFCAL",  CMDfunction,  0, (void *)cmdGetRefCal,      NULL, "Get RefCal; 0 = REF ratiometric correction disabled"},
+  {"GADC",     CMDfunction,  0, (void *)cmdGetAdc,         NULL, "Read ADC now: averaged+filtered counts (2dp) and scaled value (4dp)"},
 
   // ── Digital I/O (DIO, SMA connector; see Section 6d) ────────────────────
   //  One external line, independent of the 4 downstream ports. Direction
@@ -689,16 +717,11 @@ static void cmdSetAdcInterval(void)
 }
 
 // -----------------------------------------------------------------------------
-// readAdcCounts — single point of truth for reading the ADC, per the
-// carrier-board design guide §5.6.2. Hardware oversampling
-// (analogReadAveraging(), configured once in setup() alongside
-// analogReadResolution()) plus a software average on top smooths out noise
-// further than either alone. Every reader — ADCUpdate(), GADC, and the
-// script read_adc() syscall — goes through this, so there's exactly one
-// averaging behavior to reason about. Returns counts as a float (not
-// rounded) so AdcScaleM*counts+AdcScaleB keeps full precision; a caller
-// that needs an integer (sys_read_adc(), Section 6b — the VM is int32)
-// rounds it itself.
+// readAveragedCounts — hardware oversampling (analogReadAveraging(),
+// configured once in setup() alongside analogReadResolution()) plus a
+// software average on top, per the carrier-board design guide §5.6.2.
+// Shared by readAdcCounts() (AIN, data.AdcPin) and readRefCounts() (REF,
+// AIN_REF_PIN below) so both channels get identical averaging behavior.
 //
 // NOTE: this runs at 12-bit resolution (0-4095 counts). Earlier builds read
 // the ADC at Teensy's default 10-bit resolution (0-1023) with no averaging
@@ -713,31 +736,144 @@ static void cmdSetAdcInterval(void)
 #define ADC_HW_AVERAGING     32   // analogReadAveraging() — hardware oversampling
 #define ADC_SW_SAMPLES       16   // additional software average on top of the above
 
-static float readAdcCounts(void)
+#define AIN_REF_PIN  A1   // ISL21070CIH325Z 2.5V precision reference (confirmed via netlist, TODO.md)
+
+static float readAveragedCounts(uint8_t pin)
 {
   uint32_t sum = 0;
   for (uint8_t i = 0; i < ADC_SW_SAMPLES; i++)
   {
-    sum += analogRead(data.AdcPin);
+    sum += analogRead(pin);
   }
   return (float)sum / (float)ADC_SW_SAMPLES;
 }
 
 // -----------------------------------------------------------------------------
-// GADC — read the ADC pin right now and report both the averaged counts and
-// the scaled value, without waiting for the next ADCThread cycle or sending
-// anything to the downstream device. Useful for checking AdcScaleM/AdcScaleB
-// before enabling ADCEN.
+// applyAdcLowPass — a dt-corrected exponential moving average, applied on
+// top of readAveragedCounts() to smooth noise *between* reads (which
+// oversampling within a single read cannot). data.AdcFilterTauMs is the
+// time constant in mS, tunable live via ?ADCFILTER — no reflash needed.
+// <= 0 disables it (raw averaged passthrough, today's original behavior).
+//
+// dt-corrected rather than a fixed per-call alpha because readAdcCounts()
+// is called both periodically (ADCThread's own interval) and on demand
+// (GADC, whenever a host asks) — computing alpha from the actual elapsed
+// time keeps the filter's real-world time constant correct regardless of
+// which caller triggers a given read, rather than drifting with call rate.
+// -----------------------------------------------------------------------------
+static float  adcFilterState   = 0.0f;
+static bool   adcFilterInit    = false;
+static uint32_t adcFilterLastMs = 0;
+
+static float applyAdcLowPass(float raw)
+{
+  if (data.AdcFilterTauMs <= 0.0f)
+  {
+    adcFilterInit = false;   // disabled; re-seed cleanly from raw if re-enabled later
+    return raw;
+  }
+
+  uint32_t now = millis();
+  if (!adcFilterInit)
+  {
+    adcFilterState  = raw;   // seed from the first sample -- no startup transient from 0
+    adcFilterLastMs = now;
+    adcFilterInit   = true;
+    return raw;
+  }
+
+  uint32_t dtMs = now - adcFilterLastMs;
+  if (dtMs == 0) return adcFilterState;   // called again within the same mS; nothing new to incorporate
+
+  adcFilterLastMs = now;
+  float alpha = (float)dtMs / (data.AdcFilterTauMs + (float)dtMs);
+  adcFilterState += alpha * (raw - adcFilterState);
+  return adcFilterState;
+}
+
+// readAdcCounts — single point of truth for reading the AIN channel.
+// Every reader — ADCUpdate(), GADC, and the script read_adc() syscall —
+// goes through this, so there's exactly one averaging+filtering behavior
+// to reason about. Returns counts as a float (not rounded) so
+// scaleAdcValue() keeps full precision; a caller that needs an integer
+// (sys_read_adc(), Section 6b — the VM is int32) rounds it itself.
+static float readAdcCounts(void)
+{
+  return applyAdcLowPass(readAveragedCounts(data.AdcPin));
+}
+
+// readRefCounts — same averaging as readAdcCounts(), on the REF channel.
+// Deliberately NOT run through applyAdcLowPass(): REF is a slowly-drifting
+// calibration correction factor, not a noisy signal to track quickly, so
+// plain averaging is the right amount of smoothing for it.
+static float readRefCounts(void)
+{
+  return readAveragedCounts(AIN_REF_PIN);
+}
+
+// -----------------------------------------------------------------------------
+// scaleAdcValue — single point of truth for turning AIN counts into a real
+// value: value = AdcScaleM*counts + AdcScaleB, then the REF-channel
+// ratiometric correction (carrier-board design guide §5.6.1) if a RefCal
+// has been captured: value *= (RefCal / REF_now). RefCal <= 0 means CALREF
+// has never been run — correction stays disabled, plain M/B passthrough.
+// Used by cmdGetAdc() (GADC), ADCUpdate(), and sys_scale_send() (Section
+// 6b) so all three apply the correction identically once it's configured.
+// -----------------------------------------------------------------------------
+static float scaleAdcValue(float counts)
+{
+  float value = data.AdcScaleM * counts + data.AdcScaleB;
+
+  if (data.RefCal > 0.0f)
+  {
+    float refNow = readRefCounts();
+    if (refNow > 0.0f) value *= (data.RefCal / refNow);
+  }
+
+  return value;
+}
+
+// -----------------------------------------------------------------------------
+// GADC — read the ADC pin right now and report both the averaged+filtered
+// counts and the scaled (and, if configured, REF-corrected) value, without
+// waiting for the next ADCThread cycle or sending anything to the
+// downstream device. Useful for checking AdcScaleM/AdcScaleB before
+// enabling ADCEN.
 // -----------------------------------------------------------------------------
 static void cmdGetAdc(void)
 {
   float counts = readAdcCounts();
-  float value  = data.AdcScaleM * counts + data.AdcScaleB;
+  float value  = scaleAdcValue(counts);
 
   cp.sendACK(false);
   cp.print(counts, 2);
   cp.print(",");
   cp.println(value, 4);
+}
+
+// -----------------------------------------------------------------------------
+// CALREF — capture the REF channel's current averaged reading into
+// data.RefCal, enabling the ratiometric correction in scaleAdcValue() from
+// this point on (live; SAVE to persist). Run this once, with the REF input
+// in its known-good state, as part of initial calibration.
+// -----------------------------------------------------------------------------
+static void cmdCalRef(void)
+{
+  if (!cp.checkExpectedArgs(0)) return;
+  data.RefCal = readRefCounts();
+  cp.sendACK();
+}
+
+// -----------------------------------------------------------------------------
+// GREFCAL — read back the captured RefCal. 0 means CALREF has never been
+// run (or was explicitly cleared via RESTORE to factory defaults) and the
+// REF correction is disabled.
+// -----------------------------------------------------------------------------
+static void cmdGetRefCal(void)
+{
+  if (!cp.checkExpectedArgs(0)) return;
+  cp.sendACK(false);
+  cp.println(data.RefCal, 2);
 }
 
 // -----------------------------------------------------------------------------
@@ -1177,7 +1313,7 @@ void ADCUpdate(void)
   if ((millis() - devPort[idx].lastHostToDeviceMs) < ADC_QUIET_GUARD_MS) return;  // link busy, try next cycle
 
   float counts = readAdcCounts();
-  float value  = data.AdcScaleM * counts + data.AdcScaleB;
+  float value  = scaleAdcValue(counts);
 
   char cmdLine[48];
   int  len = snprintf(cmdLine, sizeof(cmdLine), "%s,%.3f\n", data.AdcCmdName, value);
@@ -1221,7 +1357,9 @@ void ADCUpdate(void)
 //    1 = read_adc()         — readAdcCounts() rounded to int32 via lroundf()
 //                             (the VM is int32-only; see readAdcCounts()'s
 //                             own comment in Section 5 for the averaging)
-//    2 = scale_send(counts) — AdcScaleM*counts+AdcScaleB, sent downstream
+//    2 = scale_send(counts) — scaleAdcValue(counts) (Section 5: AdcScaleM*
+//                             counts+AdcScaleB, plus the REF correction if
+//                             RefCal is set), sent downstream
 
 #include "ScriptBytecode.h"
 
@@ -1251,7 +1389,7 @@ static int32_t sys_scale_send(int32_t *args, uint8_t argc)
   uint8_t idx = (uint8_t)(data.AdcTargetDevice - 1);
   if (idx >= DEVPORT_COUNT) return 0;
 
-  float value = data.AdcScaleM * (float)args[0] + data.AdcScaleB;
+  float value = scaleAdcValue((float)args[0]);
 
   char cmdLine[48];
   int  len = snprintf(cmdLine, sizeof(cmdLine), "%s,%.3f\n", data.AdcCmdName, value);

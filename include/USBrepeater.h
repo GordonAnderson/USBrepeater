@@ -16,9 +16,9 @@
 // SIGNATURE is written into EEPROM so we can detect un-initialised storage.
 // Change this value if you ever change the layout of the Data struct — doing
 // so forces a reset to defaults on the next boot rather than reading garbage.
-// Bumped from 0xAA55A5AA when DioOutputEnabled was added below for the DIO
-// (SMA) connector on the USBrepeater Hub Carrier board.
-#define SIGNATURE  0xAA55A5AB
+// Bumped from 0xAA55A5AB when RefCal/AdcFilterTauMs were added below for the
+// REF-channel ratiometric correction and the tunable AIN low-pass filter.
+#define SIGNATURE  0xAA55A5AC
 
 // Number of downstream USB ports on the Hub Carrier board (one USB2514B
 // 4-port hub). ActiveDevice/AdcTargetDevice below are 1-based indices into
@@ -73,7 +73,26 @@ typedef struct
   uint32_t      AdcInterval;    // Update period in mS, settable via SADCINT
   char          AdcCmdName[20]; // Command name sent to the downstream device
   float         AdcScaleM;      // value = AdcScaleM * counts + AdcScaleB
-  float         AdcScaleB;
+  float         AdcScaleB;      // Range-dependent defaults — see AIN_RANGE_UNIPOLAR/BIPOLAR in USBrepeater.cpp Section 5
+
+  // ── REF-channel ratiometric correction ──────────────────────────────────
+  //  See USBrepeater.cpp Section 5 (readRefCounts()/scaleAdcValue()). The
+  //  2.5V precision reference on A1 lets firmware cancel AIN gain drift
+  //  against the Teensy's 3.3V rail (both the ADC reference and the AIN
+  //  summing network's offset reference): value_corrected = (RefCal /
+  //  REF_now) * (AdcScaleM*counts + AdcScaleB). RefCal <= 0 disables the
+  //  correction (plain AdcScaleM/AdcScaleB passthrough) — the state until
+  //  CALREF is run at least once.
+  float         RefCal;         // Captured via CALREF; 0 = correction disabled
+
+  // ── AIN low-pass filter (tunable without reflashing) ────────────────────
+  //  See USBrepeater.cpp Section 5 (applyAdcLowPass()). A dt-corrected
+  //  exponential moving average applied on top of the existing hardware+
+  //  software averaging in readAdcCounts() — smooths noise between reads,
+  //  which oversampling within a single read cannot. 0 disables it (raw
+  //  averaged passthrough, today's behavior); >0 is the filter's time
+  //  constant in milliseconds, settable live via ?ADCFILTER.
+  float         AdcFilterTauMs; // 0 = disabled
 
   // Note: the GAACE_Script ADC demo (USBrepeater.cpp Section 6b) has no
   // fields here. Its enable state and update rate are GAACEScript::

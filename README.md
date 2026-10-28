@@ -203,8 +203,8 @@ command — independent of the active mode, so it keeps running during REPEATER
 mode:
 
 ```
-counts      = readAdcCounts(AdcPin)   // 12-bit, hardware + software averaged
-scaledValue = AdcScaleM * counts + AdcScaleB
+counts      = readAdcCounts(AdcPin)   // 12-bit, hardware + software averaged, then low-pass filtered
+scaledValue = scaleAdcValue(counts)   // AdcScaleM * counts + AdcScaleB, then REF-corrected if RefCal is set
 downstream device <- "<AdcCmdName>,<scaledValue>\n"
 ```
 
@@ -212,9 +212,12 @@ downstream device <- "<AdcCmdName>,<scaledValue>\n"
 truth for reading the ADC: 12-bit resolution and 32x hardware oversampling
 (`analogReadResolution()`/`analogReadAveraging()`, configured once in
 `setup()`), plus a 16-sample software average on top — all three tunable
-via `#define`s (`ADC_RESOLUTION_BITS`/`ADC_HW_AVERAGING`/`ADC_SW_SAMPLES`).
-Every reader — `ADCUpdate()`, `GADC`, and the script `read_adc()` syscall —
-goes through it, so there's exactly one averaging behavior to reason about.
+via `#define`s (`ADC_RESOLUTION_BITS`/`ADC_HW_AVERAGING`/`ADC_SW_SAMPLES`),
+then the tunable low-pass filter below. `scaleAdcValue()` is the matching
+single point of truth for turning counts into a real value. Every reader —
+`ADCUpdate()`, `GADC`, and the script `read_adc()`/`scale_send()` syscalls —
+goes through both, so there's exactly one averaging/filtering/scaling
+behavior to reason about.
 
 **Upgrading from an older build**: earlier firmware read the ADC at
 Teensy's default 10-bit resolution (0–1023 counts) with no averaging at
@@ -222,6 +225,34 @@ all. The same physical input now reads roughly **4x higher** in raw counts
 at 12-bit resolution (0–4095) — any `AdcScaleM`/`AdcScaleB` calibrated and
 saved under that older firmware is 4x off and needs recalibrating, not
 just reusing as-is.
+
+**AIN range** (0–10V vs ±10V) is a hardware population option, selected by
+a build-time `#define` (`AIN_RANGE_UNIPOLAR`/`AIN_RANGE_BIPOLAR` in
+`platformio.ini`, default `BIPOLAR`) rather than anything firmware can
+detect at runtime — it only changes the factory-default `AdcScaleM`/
+`AdcScaleB`, which `SADCM`/`SADCB` can always override live afterward.
+
+**AIN low-pass filter** — a dt-corrected exponential moving average
+(`applyAdcLowPass()`) applied on top of the averaging above, to smooth
+noise *between* reads (which oversampling within a single read can't).
+`GADCFILTER`/`SADCFILTER,<mS>` sets its time constant live, no reflash
+needed; `0` disables it (today's original raw-averaged behavior). dt-
+corrected rather than a fixed per-call coefficient because `GADC` can be
+called on demand at any time, not just on `ADCThread`'s own schedule — the
+filter's real-world time constant stays correct regardless of which
+caller triggers a given read.
+
+**REF-channel ratiometric correction** — the board's 2.5V precision
+reference (on `A1`) lets firmware cancel AIN gain drift against the
+Teensy's 3.3V rail. Run `CALREF` once, with the REF input in its
+known-good state, to capture the current reading into `RefCal` (`SAVE` to
+persist); from then on, `scaleAdcValue()` multiplies by
+`RefCal`/`REF_now` on every read. `GREFCAL` reads back the captured value;
+`0` means `CALREF` has never been run and the correction stays disabled
+(plain `AdcScaleM`/`AdcScaleB` passthrough). Deliberately *not* run
+through the low-pass filter above — REF is a slowly-drifting calibration
+factor, not a noisy signal to track quickly, so plain averaging is the
+right amount of smoothing for it.
 
 Because this writes to the same link the repeater pumps PC<->device traffic
 over, two guards keep it from colliding with ordinary passthrough traffic
@@ -355,7 +386,10 @@ every registered command and its help string, `HELP,<cmd>` looks up one.
 | `GADCCMD` / `SADCCMD,<name>` | Command name sent to the downstream device |
 | `GADCM` / `SADCM,<m>` | ADC scale slope |
 | `GADCB` / `SADCB,<b>` | ADC scale offset |
-| `GADC` | Read ADC now: averaged counts (2 decimals) + scaled value (4 decimals), no send |
+| `GADCFILTER` / `SADCFILTER,<mS>` | AIN low-pass filter time constant, mS (`0`=disabled); tunable live, no reflash |
+| `CALREF` | Capture the current REF reading into `RefCal`, enabling ratiometric correction (`SAVE` to persist) |
+| `GREFCAL` | Read back `RefCal`; `0` means the REF correction is disabled |
+| `GADC` | Read ADC now: averaged+filtered counts (2 decimals) + scaled, REF-corrected value (4 decimals), no send |
 | `GDIODIR` / `SDIODIR,TRUE\|FALSE` | Get/set the DIO line's direction: `TRUE`=output, `FALSE`=input (power-up default) |
 | `GDOUT` / `SDOUT,TRUE\|FALSE` | Get/set the DIO output level; only reaches the external line while direction is output |
 | `GDIN` | Read the DIO line's actual level now (valid in either direction) |
@@ -388,9 +422,9 @@ manual vendoring required.
 ## Planned work
 
 Single-device Ethernet, hub bring-up, 4-device downstream support,
-per-device Ethernet data ports, and digital I/O are all implemented
-(above) — see [TODO.md](TODO.md) for exactly what's real-hardware-verified
-versus compile-verified-only so far. Remaining open work there:
-real-hardware validation of the 4-port hub, the downstream ring buffers,
-the per-device Ethernet ports, and DIO; plus the REF-channel ADC
-calibration correction.
+per-device Ethernet data ports, digital I/O, and the AIN range/REF-
+correction/low-pass-filter work are all implemented (above) — see
+[TODO.md](TODO.md) for exactly what's real-hardware-verified versus
+compile-verified-only so far. Remaining open work there: real-hardware
+validation of the 4-port hub, the downstream ring buffers, the per-device
+Ethernet ports, DIO, and the REF correction/filter.
