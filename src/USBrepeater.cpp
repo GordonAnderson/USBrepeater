@@ -184,7 +184,8 @@ Data DefaultData =
   MODE_REPEATER,  // Mode — boot into repeater mode by default
 
   1,              // ActiveDevice    — downstream port 1, boots selected by default
-  1,              // AdcTargetDevice — same, independent selection
+  2,              // ActiveDevice2   — port 2, distinct from ActiveDevice (mutually exclusive, see USBrepeater.h)
+  1,              // AdcTargetDevice — independent selection, no exclusivity constraint
 
   false,          // AdcEnabled  — off until a pin/command/scale is configured
   A0,             // AdcPin
@@ -288,6 +289,7 @@ ModeDescriptor modeTable[NUM_MODES] =
 static void cmdGetMode(void);
 static void cmdSetMode(void);
 static void cmdGetLink(void);
+static void cmdGetLink2(void);
 static void cmdGetAdcInterval(void);
 static void cmdSetAdcInterval(void);
 static void cmdGetAdc(void);
@@ -304,6 +306,8 @@ static void cmdSetEthGw(void);
 static void cmdGetEthStat(void);
 static void cmdGetDev(void);
 static void cmdSetDev(void);
+static void cmdGetDev2(void);
+static void cmdSetDev2(void);
 static void cmdGetAdcDev(void);
 static void cmdSetAdcDev(void);
 static void cmdGetDevStat(void);
@@ -351,19 +355,25 @@ Command cmds[] =
   {"SBAUD",    CMDfunction,  1, (void *)cmdSetBaud,        NULL, "Set downstream baud rate; needed for Ethernet-only use (no Serial.baud() to follow)"},
 
   // ── Downstream device selection (Hub Carrier board, 4 ports) ────────────────
-  //  SDEV switches which port the single switchable Serial upstream path
-  //  bridges to (each port also has its own always-reachable Ethernet data
-  //  port, unaffected by this — see Section 6c); each port keeps capturing
-  //  into its own ring buffer whether selected or not, so switching never
-  //  loses what a non-selected device said — see Section 6. SADCDEV is a
-  //  completely independent selection for ADCThread/the script demo, so
-  //  background monitoring of one device isn't interrupted by switching
-  //  interactive focus to another.
-  {"GDEV",     CMDfunction, -1, (void *)cmdGetDev,         NULL, "Get the active downstream device, 1-4"},
-  {"SDEV",     CMDfunction, -1, (void *)cmdSetDev,         NULL, "Set the active downstream device, 1-4"},
+  //  SDEV switches which port Serial (the first switchable USB upstream
+  //  path) bridges to; SDEV2 is the identical thing for SerialUSB2 (the
+  //  second switchable path). Each port also has its own always-reachable
+  //  Ethernet data port, unaffected by either — see Section 6c. Every port
+  //  keeps capturing into its own ring buffer whether selected or not, so
+  //  switching never loses what a non-selected device said — see Section 6.
+  //  SDEV and SDEV2 are kept mutually exclusive: setting one to the other's
+  //  current value is rejected (NAK) — see Section 6's header comment for
+  //  why. SADCDEV is a completely independent selection for ADCThread/the
+  //  script demo, so background monitoring of one device isn't interrupted
+  //  by switching either port's interactive focus.
+  {"GDEV",     CMDfunction, -1, (void *)cmdGetDev,         NULL, "Get Serial's active downstream device, 1-4"},
+  {"SDEV",     CMDfunction, -1, (void *)cmdSetDev,         NULL, "Set Serial's active downstream device, 1-4 (must differ from ActiveDevice2)"},
+  {"GDEV2",    CMDfunction, -1, (void *)cmdGetDev2,        NULL, "Get SerialUSB2's active downstream device, 1-4"},
+  {"SDEV2",    CMDfunction, -1, (void *)cmdSetDev2,        NULL, "Set SerialUSB2's active downstream device, 1-4 (must differ from ActiveDevice)"},
   {"GADCDEV",  CMDfunction, -1, (void *)cmdGetAdcDev,      NULL, "Get ADCThread/script target device, 1-4"},
   {"SADCDEV",  CMDfunction, -1, (void *)cmdSetAdcDev,      NULL, "Set ADCThread/script target device, 1-4"},
   {"GDEVSTAT", CMDfunction,  0, (void *)cmdGetDevStat,     NULL, "Per-port status: dev,connected,bytesWaiting,bytesDropped"},
+  {"GLINK2",   CMDfunction,  0, (void *)cmdGetLink2,       NULL, "ActiveDevice2's USB connection state"},
 
   // ── Ethernet (control port + one dedicated data port per device; Section 6c) ─
   //  EthCtrlPort mirrors every SerialUSB1 command over TCP. EthDataPortBase
@@ -479,14 +489,28 @@ static void cmdGetLink(void)
   cp.println(isDeviceConnected(data.ActiveDevice));
 }
 
+// GLINK2 — same as GLINK, for SerialUSB2's selection (ActiveDevice2).
+static void cmdGetLink2(void)
+{
+  cp.sendACK(false);
+  cp.println(isDeviceConnected(data.ActiveDevice2));
+}
+
 // -----------------------------------------------------------------------------
-// GDEV / SDEV,<n> — get/set which downstream port (1-4) Serial (the single
-// switchable USB upstream path) is bridged to. Does not affect Ethernet: each
-// port has its own dedicated, always-reachable data port there (Section 6c),
-// independent of this selection. The newly-selected port's ring buffer
-// (Section 6) starts flushing to Serial on the very next RepeaterModeLoop()
-// pass — no separate "flush on switch" step is needed, since the loop always
-// flushes the selected port's backlog to whoever last spoke to it.
+// GDEV / SDEV,<n> and GDEV2 / SDEV2,<n> — get/set which downstream port
+// (1-4) Serial / SerialUSB2 (the two switchable USB upstream paths) are
+// each bridged to. Does not affect Ethernet: each port has its own
+// dedicated, always-reachable data port there (Section 6c), independent of
+// either selection. The newly-selected port's ring buffer (Section 6)
+// starts flushing to Serial/SerialUSB2 on the very next RepeaterModeLoop()
+// pass — no separate "flush on switch" step is needed, since the loop
+// always flushes each selected port's backlog to whoever last spoke to it.
+//
+// ActiveDevice and ActiveDevice2 are kept mutually exclusive — SDEV/SDEV2
+// NAK a value that would make them equal. See Section 6's header comment
+// for why: it keeps each device's upstream arbitration to at most one
+// switchable USB port plus its own Ethernet client, never both switchable
+// ports at once.
 // -----------------------------------------------------------------------------
 static void cmdGetDev(void)
 {
@@ -500,13 +524,35 @@ static void cmdSetDev(void)
   if (!cp.checkExpectedArgs(1)) return;
 
   int n;
-  if (!cp.getValue(&n, 1, DEVPORT_COUNT))
+  if (!cp.getValue(&n, 1, DEVPORT_COUNT) || n == (int)data.ActiveDevice2)
   {
     cp.sendNAK(ERR_BADARG);
     return;
   }
 
   data.ActiveDevice = (uint8_t)n;
+  cp.sendACK();
+}
+
+static void cmdGetDev2(void)
+{
+  if (!cp.checkExpectedArgs(0)) return;
+  cp.sendACK(false);
+  cp.println((int)data.ActiveDevice2);
+}
+
+static void cmdSetDev2(void)
+{
+  if (!cp.checkExpectedArgs(1)) return;
+
+  int n;
+  if (!cp.getValue(&n, 1, DEVPORT_COUNT) || n == (int)data.ActiveDevice)
+  {
+    cp.sendNAK(ERR_BADARG);
+    return;
+  }
+
+  data.ActiveDevice2 = (uint8_t)n;
   cp.sendACK();
 }
 
@@ -965,48 +1011,57 @@ static void cmdGetDin(void)
 //
 //  PC <-> Teensy device port (micro-USB, SerialUSB1 shares the connector) <->
 //  Teensy host port (5-pin header) <-> USB2514B hub <-> one of 4 downstream
-//  USB-A ports. As of Section 6c, each downstream port also has its own
-//  dedicated Ethernet data port; for the one port Serial is currently bridged
-//  to (SDEV), its own Ethernet port is a second possible "PC" for that same
-//  link — see `pcSide` below. Every other port's Ethernet data port is its
-//  only upstream path, with no arbitration needed.
+//  USB-A ports. There are now TWO independently switchable USB upstream
+//  paths (Serial/SDEV and SerialUSB2/SDEV2 — USB_TRIPLE_SERIAL), plus, as of
+//  Section 6c, each downstream port's own dedicated Ethernet data port. For
+//  whichever device Serial is currently bridged to, its own Ethernet port is
+//  a second possible "PC" for that same link — see `pcSide` below; same for
+//  SerialUSB2 and `pcSide2`. ActiveDevice and ActiveDevice2 are kept
+//  mutually exclusive (enforced at SDEV/SDEV2 time, Section 5), so no device
+//  ever has to arbitrate between THREE sources — every device has at most
+//  one switchable USB port plus its own Ethernet client contending for it,
+//  the same 2-way case, just possibly via either Serial or SerialUSB2
+//  depending on which one (if either) currently selects it.
 //
 //  TOPOLOGY
 //  --------
 //  All 4 downstream ports stay connected/auto-reconnecting continuously,
-//  independent of which one the host is looking at (devPortUpdateConnection()
-//  below runs on all 4 every tick). Each port has its own ring buffer
-//  (devPort[i].rxbuf) that captures incoming bytes continuously too — so a
-//  device that chatters unsolicited while not selected is never silently
-//  lost. Only ONE port at a time can be bridged to Serial, the single
-//  switchable USB upstream path: the hardware doesn't have more upstream USB
-//  endpoints to spare (see TODO.md). data.ActiveDevice (1-4, SDEV/GDEV)
-//  selects it. Ethernet isn't endpoint-limited the same way — every port
-//  also has its own dedicated, always-reachable Ethernet data port
-//  (Section 6c), independent of this selection.
+//  independent of which one(s) the host is looking at
+//  (devPortUpdateConnection() below runs on all 4 every tick). Each port has
+//  its own ring buffer (devPort[i].rxbuf) that captures incoming bytes
+//  continuously too — so a device that chatters unsolicited while not
+//  selected by anything is never silently lost. Only ONE port at a time can
+//  be bridged to Serial, and only one (a different one) to SerialUSB2 — the
+//  hardware's 3-CDC-port ceiling means two switchable USB paths is the most
+//  available (see TODO.md). data.ActiveDevice/ActiveDevice2 (1-4, SDEV/GDEV,
+//  SDEV2/GDEV2) select them. Ethernet isn't endpoint-limited the same way —
+//  every port also has its own dedicated, always-reachable Ethernet data
+//  port (Section 6c), independent of either USB selection.
 //
 //  The host is responsible for mapping port number to device identity/
-//  function — it does this itself, by switching SDEV through 1-4 and asking
-//  each one GNAME/GVER over the ordinary passthrough path. Firmware doesn't
-//  try to identify what's plugged into a port; that would require injecting
-//  and parsing a command on every connect, which is real complexity this
-//  design deliberately avoids by pushing the decision to the host instead.
+//  function — it does this itself, by switching SDEV/SDEV2 through 1-4 and
+//  asking each one GNAME/GVER over the ordinary passthrough path. Firmware
+//  doesn't try to identify what's plugged into a port; that would require
+//  injecting and parsing a command on every connect, which is real
+//  complexity this design deliberately avoids by pushing the decision to
+//  the host instead.
 //
 //  RING BUFFER / FLUSH MODEL
 //  -------------------------
 //  Every tick: drain available bytes from ALL 4 ports into their own ring
-//  buffers (devPortDrainIncoming()), unconditionally. Every port is then also
-//  flushed every tick (devPortFlush()) — the selected port to whoever last
-//  spoke to it over its shared Serial/Ethernet path (`pcSide`), every other
-//  port to its own dedicated Ethernet data client, only once that client is
-//  actually connected (if not, bytes just stay buffered — connecting to a
-//  port's Ethernet data port is this design's equivalent of "SDEV switches to
-//  it" for delivering backlog). This one mechanism covers both live
-//  forwarding (a connected port's buffer drains about as fast as it fills,
-//  so latency in steady state is the same as direct passthrough) and
-//  "deliver the backlog" the moment a port starts actually being read —
-//  nothing special has to happen at that moment, because the flush step
-//  doesn't care whether the backlog built up over one tick or a thousand.
+//  buffers (devPortDrainIncoming()), unconditionally. Every port is then
+//  also flushed every tick (devPortFlush()) — a port selected by Serial or
+//  SerialUSB2 flushes to whoever last spoke to it over that shared USB/
+//  Ethernet path (`pcSide`/`pcSide2`); every other port flushes to its own
+//  dedicated Ethernet data client, only once that client is actually
+//  connected (if not, bytes just stay buffered — connecting to a port's
+//  Ethernet data port is this design's equivalent of "SDEV switches to it"
+//  for delivering backlog). This one mechanism covers both live forwarding
+//  (a connected port's buffer drains about as fast as it fills, so latency
+//  in steady state is the same as direct passthrough) and "deliver the
+//  backlog" the moment a port starts actually being read — nothing special
+//  has to happen at that moment, because the flush step doesn't care
+//  whether the backlog built up over one tick or a thousand.
 //
 //  Overflow policy (decided): drop incoming bytes once a port's buffer is
 //  full, preserving the order of what's already queued, rather than
@@ -1029,7 +1084,15 @@ USBSerial_BigBuffer userial4(myusb);
 // 1-based device numbers throughout (dev1based - 1 to index in here).
 USBSerial_BigBuffer *userialPtr[DEVPORT_COUNT] = { &userial1, &userial2, &userial3, &userial4 };
 
-uint32_t curBaud = 115200;   // shared across all 4 ports; set via SBAUD or Serial.baud() auto-follow
+// Shared across all 4 ports; set via SBAUD, or Serial.baud() auto-follow
+// (RepeaterModeLoop(), below). SerialUSB2 does NOT get its own auto-follow —
+// a known limitation, not an oversight: curBaud is one value for the whole
+// system, so if Serial and SerialUSB2 are both in use against two different
+// devices that genuinely need two different baud rates, SBAUD is the only
+// way to set the second one (Serial's auto-follow will fight it on its own
+// next change). Fine for today's primarily-ASCII-command-at-one-baud
+// downstream devices; revisit with a per-port baud if that stops being true.
+uint32_t curBaud = 115200;
 uint8_t  repeaterBuf[512];   // shared scratch buffer for all per-port USB reads
 
 struct DevPort
@@ -1046,22 +1109,31 @@ struct DevPort
 
 DevPort devPort[DEVPORT_COUNT];
 
-// Whichever source — Serial, or the currently-selected device's OWN
-// dedicated Ethernet data client (Section 6c) — most recently sent bytes to
-// it. Only the selected device has two competing upstream sources (Serial
-// follows SDEV; every device's Ethernet data port exists regardless of
-// SDEV), so this arbitration only ever applies to data.ActiveDevice — every
-// other port's only upstream path is its own Ethernet client, with nothing
-// to arbitrate. "Last speaker wins", the same pattern
-// commandProcessor::processStreams() already uses
+// Whichever source — Serial, or ActiveDevice's OWN dedicated Ethernet data
+// client (Section 6c) — most recently sent bytes to it. Only ActiveDevice
+// has two competing upstream sources (Serial follows SDEV; every device's
+// Ethernet data port exists regardless of SDEV), so this arbitration only
+// ever applies to data.ActiveDevice — every other port's only upstream path
+// is its own Ethernet client (or, for ActiveDevice2, SerialUSB2 — see
+// pcSide2 below), with nothing to arbitrate. "Last speaker wins", the same
+// pattern commandProcessor::processStreams() already uses
 // (`serial = streams[i]; // route replies back to the stream that sent the command`).
 // This settles *who gets the reply*; it does not stop both sources writing
 // to the selected device in the same loop pass if both have data available
 // at once — see Section 6c for why that's accepted as a known edge case
 // rather than solved with hard exclusivity. Reset implicitly to &Serial on
 // boot; stays valid even if the operator later switches SDEV away and back,
-// since it's only consulted for whichever device is selected *now*.
+// since it's only consulted for whichever device is selected *now* — and
+// ActiveDevice/ActiveDevice2 are kept mutually exclusive, so this is never
+// consulted for a device that's actually ActiveDevice2's right now.
 Stream *pcSide = &Serial;
+
+// Identical to pcSide, for SerialUSB2/ActiveDevice2. A separate variable,
+// not an array indexed by device, for the same reason pcSide itself isn't:
+// each only ever needs to track one device (whichever its own ActiveDeviceN
+// currently is), and the mutual-exclusivity constraint above means the two
+// never need to agree about the same device at the same time.
+Stream *pcSide2 = &SerialUSB2;
 
 // -----------------------------------------------------------------------------
 // Per-port accessors — forward-declared in Section 5 for the command
@@ -1157,6 +1229,7 @@ void RepeaterModeSetup(void)
 {
   pinMode(LED_BUILTIN, OUTPUT);       // LED = ActiveDevice connected
   Serial.begin(115200);               // native USB, baud value ignored
+  SerialUSB2.begin(115200);           // native USB, baud value ignored — second switchable data port
 
   // Strap + reset the USB2514B hub (no hardware straps on this board — see
   // UsbHubBoot.h). Must happen before myusb.begin(): run() leaves the hub
@@ -1185,10 +1258,19 @@ void RepeaterModeLoop(void)
   USBSerial_BigBuffer *sel = userialPtr[selIdx];
   bool connected = (bool)(*sel);
 
-  digitalWriteFast(LED_BUILTIN, connected ? HIGH : LOW);
+  uint8_t selIdx2 = (uint8_t)(data.ActiveDevice2 - 1);
+  if (selIdx2 >= DEVPORT_COUNT) selIdx2 = 0;   // defensive; ActiveDevice2 is range-checked at SDEV2 time
+  if (selIdx2 == selIdx) selIdx2 = DEVPORT_COUNT;   // defensive: SDEV/SDEV2 enforce exclusivity, so this
+                                                     // should never happen; an out-of-range sentinel disables
+                                                     // the port2 block below rather than double-handling selIdx
+  USBSerial_BigBuffer *sel2       = (selIdx2 < DEVPORT_COUNT) ? userialPtr[selIdx2] : NULL;
+  bool                 connected2 = (sel2 != NULL) && (bool)(*sel2);
+
+  digitalWriteFast(LED_BUILTIN, connected ? HIGH : LOW);   // reflects ActiveDevice (port 1) only
 
   // Follow the baud rate the PC application sets (matters for FTDI/CP210x/CH340 bridges).
-  // Applies only to the selected device — the one actually receiving PC traffic right now.
+  // Applies only to Serial's selected device — see curBaud's own comment
+  // above for why SerialUSB2 doesn't get an equivalent auto-follow.
   uint32_t b = Serial.baud();
   if (b != 0 && b != curBaud)
   {
@@ -1196,7 +1278,7 @@ void RepeaterModeLoop(void)
     if (connected) sel->begin(curBaud);
   }
 
-  // PC -> selected device: only meaningful if it's actually connected. Both
+  // PC -> ActiveDevice: only meaningful if it's actually connected. Both
   // Serial and that device's own Ethernet data client can drive it;
   // whichever one actually sends bytes this pass becomes pcSide, and also
   // marks this port as "just heard from the host" for ADCUpdate()'s quiet
@@ -1227,13 +1309,42 @@ void RepeaterModeLoop(void)
     }
   }
 
+  // PC -> ActiveDevice2: identical to the ActiveDevice block above, via
+  // SerialUSB2/pcSide2 instead of Serial/pcSide. selIdx2 is only ever a
+  // valid index here when it actually differs from selIdx (see the
+  // defensive sentinel above), so this can never double-handle the same
+  // device as the block above.
+  if (connected2)
+  {
+    int n = SerialUSB2.available();
+    if (n > 0)
+    {
+      n = SerialUSB2.readBytes((char *)repeaterBuf, min(n, (int)sizeof(repeaterBuf)));
+      sel2->write(repeaterBuf, n);
+      devPort[selIdx2].lastHostToDeviceMs = millis();
+      pcSide2 = &SerialUSB2;
+    }
+
+    if (ethDataClient[selIdx2] && ethDataClient[selIdx2].connected())
+    {
+      int n2 = ethDataClient[selIdx2].available();
+      if (n2 > 0)
+      {
+        n2 = ethDataClient[selIdx2].read(repeaterBuf, min(n2, (int)sizeof(repeaterBuf)));
+        sel2->write(repeaterBuf, n2);
+        devPort[selIdx2].lastHostToDeviceMs = millis();
+        pcSide2 = &ethDataClient[selIdx2];
+      }
+    }
+  }
+
   // PC -> every OTHER device, over its own dedicated Ethernet data port —
-  // independent of SDEV, since Ethernet isn't endpoint-limited the way USB
-  // is: each device is always reachable on its own port, not just the one
-  // switchable path Serial/SDEV share.
+  // independent of SDEV/SDEV2, since Ethernet isn't endpoint-limited the
+  // way USB is: each device is always reachable on its own port, not just
+  // the two switchable paths Serial/SerialUSB2 provide.
   for (uint8_t i = 0; i < DEVPORT_COUNT; i++)
   {
-    if (i == selIdx) continue;   // handled above, arbitrated with Serial
+    if (i == selIdx || i == selIdx2) continue;   // handled above, arbitrated with Serial/SerialUSB2
     if (!(ethDataClient[i] && ethDataClient[i].connected())) continue;
     if (!(bool)(*userialPtr[i])) continue;   // nothing connected to write to
 
@@ -1246,18 +1357,20 @@ void RepeaterModeLoop(void)
     }
   }
 
-  // Device -> PC: the selected device's backlog goes to whoever last spoke
-  // to it (pcSide, arbitrated above) — flushed even if the device isn't
-  // connected right now, since a backlog captured before a disconnect is
-  // still worth delivering. Every other device flushes to its own dedicated
-  // Ethernet client only once that client is actually connected — if not,
-  // the backlog just stays buffered (see the ring-buffer/flush header
-  // comment above for why that's the right default rather than discarding
-  // it or forcing it onto Serial).
+  // Device -> PC: ActiveDevice's backlog goes to whoever last spoke to it
+  // (pcSide, arbitrated above); ActiveDevice2's goes to pcSide2 likewise —
+  // both flushed even if their device isn't connected right now, since a
+  // backlog captured before a disconnect is still worth delivering. Every
+  // other device flushes to its own dedicated Ethernet client only once
+  // that client is actually connected — if not, the backlog just stays
+  // buffered (see the ring-buffer/flush header comment above for why
+  // that's the right default rather than discarding it or forcing it onto
+  // a switchable USB port it was never meant for).
   devPortFlush(selIdx, pcSide);
+  if (selIdx2 < DEVPORT_COUNT) devPortFlush(selIdx2, pcSide2);
   for (uint8_t i = 0; i < DEVPORT_COUNT; i++)
   {
-    if (i == selIdx) continue;
+    if (i == selIdx || i == selIdx2) continue;
     if (ethDataClient[i] && ethDataClient[i].connected())
     {
       devPortFlush(i, &ethDataClient[i]);

@@ -16,9 +16,9 @@
 // SIGNATURE is written into EEPROM so we can detect un-initialised storage.
 // Change this value if you ever change the layout of the Data struct — doing
 // so forces a reset to defaults on the next boot rather than reading garbage.
-// Bumped from 0xAA55A5AB when RefCal/AdcFilterTauMs were added below for the
-// REF-channel ratiometric correction and the tunable AIN low-pass filter.
-#define SIGNATURE  0xAA55A5AC
+// Bumped from 0xAA55A5AC when ActiveDevice2 was added below for the second
+// switchable USB data port (SerialUSB2 / SDEV2).
+#define SIGNATURE  0xAA55A5AD
 
 // Number of downstream USB ports on the Hub Carrier board (one USB2514B
 // 4-port hub). ActiveDevice/AdcTargetDevice below are 1-based indices into
@@ -50,16 +50,26 @@ typedef struct
   uint8_t       Mode;           // Active SystemMode, persisted across reboots
 
   // ── Downstream device selection (Hub Carrier board, 4 ports) ─────────────
-  //  See USBrepeater.cpp Section 6. ActiveDevice is which downstream port the
-  //  single switchable Serial upstream path is bridged to, settable via
-  //  SDEV,<n> (each port also has its own always-reachable dedicated
-  //  Ethernet data port, independent of this selection — see EthDataPortBase
-  //  below). AdcTargetDevice is which port ADCThread/the
-  //  GAACE_Script demo sends to — independent of ActiveDevice on purpose:
-  //  switching which device the host is interactively looking at must not
-  //  interrupt a background ADC feed to a different one. Both are 1-based,
+  //  See USBrepeater.cpp Section 6. ActiveDevice is which downstream port
+  //  Serial (the first switchable USB upstream path) is bridged to,
+  //  settable via SDEV,<n>. ActiveDevice2 is the identical thing for
+  //  SerialUSB2 (the second switchable path, SDEV2,<n>) — each port also
+  //  has its own always-reachable dedicated Ethernet data port, independent
+  //  of either selection (see EthDataPortBase below). ActiveDevice and
+  //  ActiveDevice2 are kept mutually exclusive (enforced at SDEV/SDEV2
+  //  time, not just at the default below): if both switchable USB ports
+  //  could point at the same device, there'd be three writers (Serial,
+  //  SerialUSB2, that device's own Ethernet client) contending over one
+  //  ring buffer with only one "last speaker wins" slot — disallowing the
+  //  overlap keeps each device's arbitration to at most one switchable USB
+  //  port plus its own Ethernet client, the same 2-way case already solved.
+  //  AdcTargetDevice is which port ADCThread/the GAACE_Script demo sends
+  //  to — independent of both ActiveDevice and ActiveDevice2 on purpose:
+  //  switching either port's interactive focus must not interrupt a
+  //  background ADC feed to a different device. All three are 1-based,
   //  range [1, DEVPORT_COUNT].
   uint8_t       ActiveDevice;
+  uint8_t       ActiveDevice2;
   uint8_t       AdcTargetDevice;
 
   // ── Periodic ADC -> downstream-device command update ────────────────────

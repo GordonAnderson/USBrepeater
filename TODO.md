@@ -133,10 +133,10 @@ yet.**
 - [x] Confirmed no other use of pins 18/19/32/34/35/36 anywhere in
       firmware (`Wire`/`Serial8` are never initialized) — no conflict today.
 - [x] Builds clean, no new warnings.
-- [ ] `UsbHubBoot::Options.nonRem` is left at its default (`0`, all 4 ports
-      removable/hot-pluggable) — not overridden, since that seems correct
-      for 4 USB-A connectors meant for pluggable downstream devices. Still
-      needs confirming against actual intent, not just left unchallenged.
+- [x] **Confirmed (2026-10-27, per the user): `UsbHubBoot::Options.nonRem`
+      stays at its default** (`0`, all 4 ports removable/hot-pluggable) —
+      correct for 4 USB-A connectors meant for pluggable downstream
+      devices. No code change.
 - [ ] **Not yet tested on real hardware** — no hub board here yet. First
       real test is Phase 1 below, once boards arrive.
 
@@ -232,10 +232,12 @@ yet to test against.** `src/USBrepeater.cpp` Section 5:
         AdcScaleB=-10.96`
       - 0–10 V range (`AIN_RANGE_UNIPOLAR`): `AdcScaleM=0.002705,
         AdcScaleB=-0.496`
-      Neither build flag is currently set in `platformio.ini` — it's
-      unknown which range was actually populated on the boards that were
-      ordered; set the matching one once that's known (the default,
-      bipolar, applies until then).
+      **Confirmed (2026-10-27, per the user): the board design supports
+      either range, and the first board ordered is ±10V.**
+      `platformio.ini` now sets `-D AIN_RANGE_BIPOLAR` explicitly (rather
+      than relying on the identical default) so this stays correct if a
+      future board picks `UNIPOLAR` and the code's own default ever
+      changes.
 - [x] **REF channel (A1) ratiometric correction — implemented.** Added
       `RefCal` to `Data` (`Signature` bumped `0xAA55A5AB` -> `0xAA55A5AC`
       alongside the filter field below), `readRefCounts()` (same averaged-
@@ -455,6 +457,26 @@ clean, no new warnings.
   (recommended — modern, actively maintained, lwIP-based) or
   [NativeEthernet](https://github.com/vjmuzik/NativeEthernet) (classic
   Arduino `Ethernet` API).
+  **Licensing decision (2026-10-27, per the user): stay on QNEthernet
+  (AGPL-3.0-or-later) for now** — noted, not acted on. If this needs
+  revisiting (e.g. before a closed-source commercial release — the AGPL
+  network-use clause matters most once the firmware source isn't already
+  public), checked both alternatives' actual repos rather than going from
+  memory: `NativeEthernet` is MIT, built on `vjmuzik/FNET` (a fork of
+  `butok/FNET`) which is Apache-2.0 — neither carries AGPL's clause. API-
+  wise it bills itself as "a direct replacement for the normal Ethernet.h
+  library" (the modern, 2018+, Arduino Ethernet API — has `EthernetServer::
+  accept()` and `Ethernet.linkStatus()` with the same semantics this
+  firmware already relies on from QNEthernet's `accept()`/`linkState()`).
+  A real port, not a one-line swap, though: the lwIP symbol-collision
+  workaround (Section 1 of `src/USBrepeater.cpp`) is QNEthernet-specific
+  and would simply go away; `linkState()` -> `linkStatus() == LinkON`;
+  and `Ethernet.begin()` with no arguments (QNEthernet auto-uses Teensy's
+  built-in MAC) would need to become `Ethernet.begin(mac)` with an
+  explicitly-read MAC array, since the classic Ethernet-shield API predates
+  chips with a MAC burned in. Whether `Ethernet.loop()`'s equivalent is
+  needed on `EthernetThread` wasn't confirmed — would need checking against
+  NativeEthernet's actual source before attempting the swap.
 - `EthernetClient`/`EthernetServer` implement the Arduino `Stream` interface,
   same as `Serial`/`SerialUSB1` — each TCP connection can be handed to
   `cp.registerStream()` exactly like the control port is today, and to the
@@ -514,11 +536,87 @@ clean, no new warnings.
       `EthDataPortBase` (renamed from the single-device `EthDataPort`); no
       per-device baud field was needed (`curBaud` stays shared across all 4
       ports, same as before)
-- [ ] Whether the 2nd USB data-port headroom is worth using now or left for
-      later — still open; not needed yet since Ethernet now covers the
-      "more than one simultaneous upstream view" case per-device
+- [x] **Resolved (2026-10-27, per the user): the 2nd USB data-port headroom
+      is used now.** `USB_TRIPLE_SERIAL` (was `USB_DUAL_SERIAL`) gives
+      `SerialUSB2`, a second switchable passthrough port alongside `Serial`
+      — `SDEV2`/`GDEV2` select which downstream port (1-4) it's bridged to,
+      mirroring `SDEV`/`GDEV` exactly. New persisted `Data` field
+      `ActiveDevice2` (`Signature` bumped `0xAA55A5AC` -> `0xAA55A5AD`),
+      default `2` (distinct from `ActiveDevice`'s default `1`). New
+      `GLINK2` mirrors `GLINK` for the second port's connection state.
+      See "Resolved: second switchable USB data port" below for the full
+      design (the mutual-exclusivity constraint that makes this tractable,
+      and what was explicitly *not* built).
 - [ ] Confirm power budget / recommend a specific powered hub part in
       hardware docs once hardware is sourced
+
+## Resolved: second switchable USB data port
+
+**Implemented (2026-10-27), compile-verified only — no 4-port hub/4
+downstream devices here yet to test two simultaneous USB sessions against.**
+
+**The design problem and why it's tractable.** Before this, `pcSide`
+(Section 6's "last speaker wins" pointer) only ever had to arbitrate
+between `Serial` and one Ethernet client, for one selected device — a
+clean 2-way case. Adding a second independently-switchable USB port
+(`SerialUSB2`/`SDEV2`) risked turning that into 3-way arbitration (`Serial`,
+`SerialUSB2`, and that device's own Ethernet client all able to write to
+the *same* device at once, with only one ring buffer and one "last
+speaker" slot to flush it to) — and a stale per-device `pcSide` array was
+considered and rejected for the same reason the per-device-Ethernet-port
+work rejected it: a device that stops being selected by one port but was
+last written to via that port would otherwise keep flushing to it even
+after the port moved on to a different device.
+
+**Resolution (per the user): disallow the same device being selected by
+both switchable USB ports at once.** `data.ActiveDevice` and
+`data.ActiveDevice2` are kept mutually exclusive — `SDEV`/`SDEV2` NAK a
+value that would make them equal (`src/USBrepeater.cpp`, `cmdSetDev()`/
+`cmdSetDev2()`). This collapses the problem back to two independent
+copies of the already-solved 2-way case: `pcSide` arbitrates `Serial` vs.
+`ActiveDevice`'s own Ethernet client; `pcSide2` arbitrates `SerialUSB2` vs.
+`ActiveDevice2`'s own Ethernet client; every other device (selected by
+neither switchable port) just flushes to its own Ethernet client
+unconditionally, exactly as before. No per-device array, no staleness
+problem, no 3-way case to solve.
+
+**What changed:**
+- `platformio.ini`: `USB_TRIPLE_SERIAL` instead of `USB_DUAL_SERIAL` —
+  within the hardware's already-documented 3-CDC-port ceiling (control +
+  2 data; see "Host (PC) side — USB" above), so this uses the full
+  available budget, not an over-budget 4th port.
+- New persisted field `Data.ActiveDevice2` (`Signature` bumped
+  `0xAA55A5AC` -> `0xAA55A5AD`), default `2`.
+- New commands: `GDEV2`/`SDEV2` (mirrors `GDEV`/`SDEV`, with the mutual-
+  exclusivity check), `GLINK2` (mirrors `GLINK`).
+- `RepeaterModeLoop()` (Section 6) gained a second, structurally identical
+  host<->device block for `SerialUSB2`/`ActiveDevice2`/`pcSide2`, and the
+  existing "every other device, over its own Ethernet port" loop now skips
+  both `selIdx` and `selIdx2` instead of just `selIdx`.
+- `RepeaterModeSetup()`: added `SerialUSB2.begin(115200)` alongside
+  `Serial.begin(115200)`.
+
+**Deliberately not built:**
+- **No per-device baud rate.** `curBaud` stays the single value shared
+  across all 4 downstream ports (unchanged from before this round) — if
+  `Serial` and `SerialUSB2` are both genuinely in use against two devices
+  that need two different baud rates, `Serial.baud()`'s auto-follow (which
+  only ever watches `Serial`, never `SerialUSB2`) will still only track
+  one of them; `SBAUD` is the explicit escape hatch for the other, same as
+  it already is for Ethernet-only use. Noted as a known limitation in the
+  code (`curBaud`'s own comment, Section 6), not solved here — revisit if
+  this stops being an acceptable tradeoff.
+- **No second status LED.** `LED_BUILTIN` still only reflects
+  `ActiveDevice`'s (port 1's) connection state; Teensy 4.1 has one builtin
+  LED, and adding a second indicator would need an actual hardware pin
+  decision, out of scope for this round.
+- [ ] **Not yet tested on real hardware** — no 4-port hub/4 downstream
+      devices here yet. First real test, once hardware arrives: open
+      independent USB connections to `Serial` and `SerialUSB2` against two
+      *different* devices simultaneously (confirming `SDEV`/`SDEV2`'s
+      mutual-exclusivity rejection actually prevents pointing both at the
+      same one), and confirm each session only ever sees its own device's
+      traffic with no cross-talk.
 
 ## Future option (not committed): custom bytecode VM scripting layer
 

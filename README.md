@@ -27,18 +27,23 @@ disturbing it.
 
 ## USB port layout
 
-Built with `-D USB_DUAL_SERIAL`, so the Teensy enumerates as **two** USB CDC
-ports:
+Built with `-D USB_TRIPLE_SERIAL`, so the Teensy enumerates as **three** USB
+CDC ports — the hardware's full endpoint budget (see "Downstream ports"
+below for why there isn't room for a 4th):
 
 | Port | Purpose |
 | --- | --- |
-| `Serial` | Repeater byte pump: PC \<-\> downstream USB CDC device. Raw, transparent passthrough — nothing else writes to this port. |
+| `Serial` | Repeater byte pump #1: PC \<-\> downstream USB CDC device (`SDEV`/`GDEV` selects which one). Raw, transparent passthrough — nothing else writes to this port. |
 | `SerialUSB1` | Command/control port: the GAACE `commandProcessor` lives here (ASCII line protocol, ACK `0x06` / NAK `0x15` responses). |
+| `SerialUSB2` | Repeater byte pump #2: PC \<-\> a **different** downstream USB CDC device (`SDEV2`/`GDEV2`). Independent of `Serial` — a second simultaneous passthrough session, not a fallback. |
 
 They're independent. A PC application that only needs the repeater can use
 `Serial` exactly as if this were a single-port device; a separate tool
 (terminal, script, MIPS host) can use `SerialUSB1` to query status or change
-settings without ever touching the data stream.
+settings without ever touching the data stream. `SerialUSB2` is a second,
+equally "plain" passthrough port — a second PC application (or a second
+connection from the same one) can use it exactly like `Serial`, against
+whichever downstream device `SDEV2` currently points it at.
 
 ## Ethernet
 
@@ -117,9 +122,11 @@ rewritten.
 
 **Licensing**: QNEthernet is AGPL-3.0-or-later, unlike `GAACE_Core` (GPLv3)
 or `ArduinoThread` (Public Domain) — AGPL carries network-use
-source-disclosure obligations GPL doesn't. Worth a deliberate decision
-before shipping a product built on this, not just carrying the dependency
-forward by default.
+source-disclosure obligations GPL doesn't. **Decision (2026-10-27, per the
+user): keep QNEthernet as-is for now** — noted here rather than acted on;
+see TODO.md for the alternative considered (`NativeEthernet`, MIT, built
+on an Apache-2.0 TCP/IP stack) if this needs revisiting before a closed-
+source commercial release.
 
 The USB Manufacturer string (`GAA Custom Electronics, LLC`) and Product string
 (`USBrepeater`) are shared by both ports — see
@@ -151,26 +158,36 @@ bytes into its own buffer regardless of whether it's currently
 selected** — so a device that sends unsolicited chatter while not in focus
 is never silently lost.
 
-On the USB side, only one port at a time is bridged to `Serial`:
-`SDEV,<n>` / `GDEV` selects it (the hardware has only one switchable USB
-upstream path to spare). Switching delivers that port's buffered backlog on
-the very next tick, with no separate "flush" step — the firmware always
-flushes the selected port's backlog to whoever last spoke to it, so what
-built up while it wasn't selected goes out immediately once it is.
+On the USB side, two ports are each bridged to one device at a time:
+`SDEV,<n>`/`GDEV` for `Serial`, `SDEV2,<n>`/`GDEV2` for `SerialUSB2` — the
+hardware's 3-CDC-port ceiling (control + 2 data) means two switchable USB
+paths is the most available, not four. **`ActiveDevice` and
+`ActiveDevice2` are kept mutually exclusive** — `SDEV`/`SDEV2` reject
+(NAK) a value that would point both ports at the same device, so a given
+device is never contended by more than one switchable USB port at once.
+Switching either delivers that port's buffered backlog on the very next
+tick, with no separate "flush" step — the firmware always flushes a
+selected port's backlog to whoever last spoke to it, so what built up
+while it wasn't selected goes out immediately once it is.
 
-On the Ethernet side, every port is independent of `SDEV`: each of the 4
-downstream devices has its own dedicated, always-reachable TCP data port
-(see the Ethernet section above), so a client connected to device 3's port
-gets device 3's traffic whether or not `SDEV` currently points Serial at
-device 3. For whichever device *is* currently selected, its Ethernet port
-also competes with `Serial` for who gets its replies ("last speaker wins",
-`pcSide`); every other device's Ethernet port is its only upstream path, so
-there's no arbitration to do there.
+On the Ethernet side, every port is independent of `SDEV`/`SDEV2`: each of
+the 4 downstream devices has its own dedicated, always-reachable TCP data
+port (see the Ethernet section above), so a client connected to device 3's
+port gets device 3's traffic whether or not `SDEV`/`SDEV2` currently points
+either USB port at device 3. For whichever device *is* currently selected
+by `Serial` or `SerialUSB2`, its Ethernet port also competes with that one
+switchable USB port for who gets its replies ("last speaker wins",
+`pcSide`/`pcSide2`); every other device's Ethernet port is its only
+upstream path, so there's no arbitration to do there. Because
+`ActiveDevice`/`ActiveDevice2` can never collide, no device ever has to
+arbitrate between *both* switchable USB ports and Ethernet at once — at
+most one switchable port plus Ethernet, the same two-way case either way.
 
 Identifying what's plugged into which port is **the host's job, not
-firmware's**: switch `SDEV` through 1–4 and ask each one `GNAME`/`GVER`
-yourself over the ordinary passthrough path to build your own port-to-device
-table. Firmware never tries to identify a device itself.
+firmware's**: switch `SDEV`/`SDEV2` through 1–4 and ask each one
+`GNAME`/`GVER` yourself over the ordinary passthrough path to build your
+own port-to-device table. Firmware never tries to identify a device
+itself.
 
 `ADCThread` and the script demo (below) target a separate, independent
 selection — `SADCDEV,<n>` / `GADCDEV` — so switching which device the host
@@ -368,9 +385,11 @@ every registered command and its help string, `HELP,<cmd>` looks up one.
 | `RESTORE` | Restore settings from EEPROM |
 | `GMODE` | Active mode, index and name |
 | `SMODE,<index>` | Switch active mode (not persisted until `SAVE`) |
-| `GLINK` | Active device's USB connection state (`TRUE`/`FALSE`) |
+| `GLINK` | `ActiveDevice`'s USB connection state (`TRUE`/`FALSE`) |
+| `GLINK2` | `ActiveDevice2`'s USB connection state (`TRUE`/`FALSE`) |
 | `GBAUD` / `SBAUD,<baud>` | Baud rate to the downstream device; set explicitly for Ethernet-only use |
-| `GDEV` / `SDEV,<n>` | Get/set which downstream port (1-4) the upstream data path is bridged to |
+| `GDEV` / `SDEV,<n>` | Get/set which downstream port (1-4) `Serial` is bridged to; `SDEV` rejects a value equal to `ActiveDevice2` |
+| `GDEV2` / `SDEV2,<n>` | Get/set which downstream port (1-4) `SerialUSB2` is bridged to; `SDEV2` rejects a value equal to `ActiveDevice` |
 | `GADCDEV` / `SADCDEV,<n>` | Get/set which downstream port (1-4) `ADCThread`/the script demo targets |
 | `GDEVSTAT` | Per-port: `dev,connected,bytesWaiting,bytesDropped` |
 | `GETHDHCP` / `SETHDHCP,TRUE\|FALSE` | DHCP vs. static IP; reboot to apply |
@@ -422,9 +441,10 @@ manual vendoring required.
 ## Planned work
 
 Single-device Ethernet, hub bring-up, 4-device downstream support,
-per-device Ethernet data ports, digital I/O, and the AIN range/REF-
-correction/low-pass-filter work are all implemented (above) — see
-[TODO.md](TODO.md) for exactly what's real-hardware-verified versus
-compile-verified-only so far. Remaining open work there: real-hardware
-validation of the 4-port hub, the downstream ring buffers, the per-device
-Ethernet ports, DIO, and the REF correction/filter.
+per-device Ethernet data ports, the second switchable USB data port,
+digital I/O, and the AIN range/REF-correction/low-pass-filter work are all
+implemented (above) — see [TODO.md](TODO.md) for exactly what's
+real-hardware-verified versus compile-verified-only so far. Remaining open
+work there: real-hardware validation of the 4-port hub, the downstream
+ring buffers, both switchable USB ports together, the per-device Ethernet
+ports, DIO, and the REF correction/filter.
