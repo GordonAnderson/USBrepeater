@@ -332,6 +332,15 @@ single-`SCRIPTLOAD` vs. chunked automatically based on size, so this is
 usually invisible day to day. See that repo's `WORKFLOW.md` for the full
 walkthrough.
 
+### `cmd()` with float arguments
+
+Scripts can pass floats to any control-port command: `cmd("SETV", v)` with
+`v` a float sends `SETV,23.76` (ints are sent as integers). This comes from
+the `GAACE_Script` library, so it needs a build against its current `main`
+(`lib_deps` tracks the branch head; after an update, `pio run` re-fetches
+it). Scripts that use it need that firmware; int-only scripts are
+unchanged. Not yet run on hardware.
+
 ### Syscalls: one table, no declarations in scripts
 
 The script syscalls (`link_ready`, `read_adc`, `scale_send`, `dio_set_dir`,
