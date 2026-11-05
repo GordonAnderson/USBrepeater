@@ -312,6 +312,7 @@ static void cmdSetDev2(void);
 static void cmdGetAdcDev(void);
 static void cmdSetAdcDev(void);
 static void cmdGetDevStat(void);
+void        cmdGetDevPath(void);   // Section 6 (needs the USB driver objects)
 static void cmdGetDioDir(void);
 static void cmdSetDioDir(void);
 static void cmdGetDout(void);
@@ -393,6 +394,7 @@ Command cmds[] =
   {"GADCDEV",  CMDfunction, -1, (void *)cmdGetAdcDev,      NULL, "Get ADCThread/script target device, " DEVPORT_RANGE_STR},
   {"SADCDEV",  CMDfunction, -1, (void *)cmdSetAdcDev,      NULL, "Set ADCThread/script target device, " DEVPORT_RANGE_STR},
   {"GDEVSTAT", CMDfunction,  0, (void *)cmdGetDevStat,     NULL, "Per-port status: dev,connected,bytesWaiting,bytesDropped"},
+  {"GDEVPATH", CMDfunction,  0, (void *)cmdGetDevPath,     NULL, "Diagnostic: each slot's board connector, inner-hub port, VID/PID, USB addresses; then each hub"},
   {"GLINK2",   CMDfunction,  0, (void *)cmdGetLink2,       NULL, "ActiveDevice2's USB connection state"},
 
   // ── Ethernet (control port + one dedicated data port per device; Section 6c) ─
@@ -1226,33 +1228,150 @@ static void cmdScriptErase(void)
 //  with the downstream devices' baud rate.
 
 USBHost             myusb;
+
+// USBHost_t36 keeps each driver's Device_t (which records the hub address
+// and hub port a device was enumerated on) protected. These two thin
+// subclasses only expose it read-only, so devicePath() below can work out
+// which board connector a device is plugged into. No behavior change.
+class TrackedHub : public USBHub
+{
+public:
+  TrackedHub(USBHost &host) : USBHub(host) {}
+  const Device_t *dev() { return *(Device_t * volatile *)&device; }
+};
+
+class SlotSerial : public USBSerial_BigBuffer
+{
+public:
+  SlotSerial(USBHost &host, uint16_t minRxTx) : USBSerial_BigBuffer(host, minRxTx) {}
+  const Device_t *dev() { return *(Device_t * volatile *)&device; }
+};
+
 // One USBHub driver instance is needed per physical hub in the chain, not
 // just the board's own USB2514B (hub1): a downstream device with its own
 // internal hub (e.g. MIPS units built around an FE1.1s, VID 1A40) is
 // otherwise left unclaimed and nothing behind it ever enumerates. hub2-hub5
 // cover one nested hub per downstream port.
-USBHub              hub1(myusb);
-USBHub              hub2(myusb);
-USBHub              hub3(myusb);
-USBHub              hub4(myusb);
-USBHub              hub5(myusb);
+TrackedHub          hub1(myusb);
+TrackedHub          hub2(myusb);
+TrackedHub          hub3(myusb);
+TrackedHub          hub4(myusb);
+TrackedHub          hub5(myusb);
+TrackedHub         *hubPtr[] = { &hub1, &hub2, &hub3, &hub4, &hub5 };
+#define HUB_COUNT (sizeof(hubPtr) / sizeof(hubPtr[0]))
 // min_rxtx = 1, not the library default of 65: the default makes BigBuffer
 // claim only high-speed devices (>64-byte bulk endpoints), silently
 // rejecting every full-speed one -- SAMD/TinyUSB boards like the
 // IsoElectrometer, and most FTDI/CP210x/CH340 adapters.
-USBSerial_BigBuffer userial1(myusb, 1);
-USBSerial_BigBuffer userial2(myusb, 1);
-USBSerial_BigBuffer userial3(myusb, 1);
-USBSerial_BigBuffer userial4(myusb, 1);
-USBSerial_BigBuffer userial5(myusb, 1);
-USBSerial_BigBuffer userial6(myusb, 1);
+SlotSerial          userial1(myusb, 1);
+SlotSerial          userial2(myusb, 1);
+SlotSerial          userial3(myusb, 1);
+SlotSerial          userial4(myusb, 1);
+SlotSerial          userial5(myusb, 1);
+SlotSerial          userial6(myusb, 1);
 
 // Indexed 0..DEVPORT_COUNT-1; devPort[]/the command handlers above use
 // 1-based device numbers throughout (dev1based - 1 to index in here).
-USBSerial_BigBuffer *userialPtr[] = { &userial1, &userial2, &userial3,
-                                                   &userial4, &userial5, &userial6 };
+SlotSerial *userialPtr[] = { &userial1, &userial2, &userial3,
+                             &userial4, &userial5, &userial6 };
 static_assert(sizeof(userialPtr) / sizeof(userialPtr[0]) == DEVPORT_COUNT,
               "declare one userial per DEVPORT_COUNT slot");
+
+// -----------------------------------------------------------------------------
+// devicePath — which board connector (USB2514B downstream port, 1-4) a
+// device is on, and, if it sits behind its own internal hub (a MIPS with a
+// USB-RS485 temperature controller), which port of that inner hub.
+//
+// Every Device_t records the USB address of the hub it hangs off
+// (hub_address) and the port on that hub (hub_port). The board hub is the
+// one hanging off the Teensy's root port (hub_address 0), so: walk up
+// through the hubs until the parent is the board hub; the hub_port at
+// that point is the connector. Returns false if the device isn't behind
+// the board hub at all (no hub fitted / plugged straight into the root).
+// The connector numbers are the USB2514B's own port numbers: whether they
+// match the connector labels on the board is confirmed on hardware.
+// -----------------------------------------------------------------------------
+static const Device_t *hubDeviceByAddress(uint8_t addr)
+{
+  for (uint8_t i = 0; i < HUB_COUNT; i++)
+  {
+    const Device_t *d = hubPtr[i]->dev();
+    if (d != NULL && d->address == addr) return d;
+  }
+  return NULL;
+}
+
+bool devicePath(const Device_t *d, uint8_t *connector, uint8_t *innerPort)
+{
+  *connector = 0;
+  *innerPort = 0;
+  if (d == NULL) return false;
+
+  uint8_t inner = 0;
+  for (uint8_t depth = 0; depth < 4; depth++)
+  {
+    const Device_t *parent = hubDeviceByAddress(d->hub_address);
+    if (parent == NULL) return false;
+    if (parent->hub_address == 0)          // parent is the board hub
+    {
+      *connector = d->hub_port;
+      *innerPort = inner;
+      return true;
+    }
+    inner = d->hub_port;                   // port on an inner hub; keep climbing
+    d = parent;
+  }
+  return false;
+}
+
+// -----------------------------------------------------------------------------
+// GDEVPATH — diagnostic: for every serial driver slot, what's attached and
+// where (connector, inner-hub port, VID/PID, speed, USB address/hub
+// address/hub port), then every hub driver. Lets the connector mapping be
+// checked on real hardware before slots are tied to connectors.
+// -----------------------------------------------------------------------------
+static void printHex4(uint16_t v)
+{
+  char buf[5];
+  snprintf(buf, sizeof(buf), "%04X", v);
+  cp.print(buf);
+}
+
+void cmdGetDevPath(void)
+{
+  if (!cp.checkExpectedArgs(0)) return;
+
+  cp.sendACK(false);
+  cp.println("#slot,connected,connector,innerPort,vid,pid,speed,addr,hubAddr,hubPort");
+  for (uint8_t i = 0; i < DEVPORT_COUNT; i++)
+  {
+    const Device_t *d = userialPtr[i]->dev();
+    uint8_t conn = 0, inner = 0;
+    devicePath(d, &conn, &inner);
+    cp.print((int)(i + 1));         cp.print(",");
+    cp.print(d != NULL);            cp.print(",");
+    cp.print((int)conn);            cp.print(",");
+    cp.print((int)inner);           cp.print(",");
+    printHex4(d ? d->idVendor : 0); cp.print(",");
+    printHex4(d ? d->idProduct : 0); cp.print(",");
+    cp.print((int)(d ? d->speed : 0));       cp.print(",");
+    cp.print((int)(d ? d->address : 0));     cp.print(",");
+    cp.print((int)(d ? d->hub_address : 0)); cp.print(",");
+    cp.println((int)(d ? d->hub_port : 0));
+  }
+  cp.println("#hub,connected,vid,pid,addr,hubAddr,hubPort");
+  for (uint8_t i = 0; i < HUB_COUNT; i++)
+  {
+    const Device_t *d = hubPtr[i]->dev();
+    cp.print((int)(i + 1));         cp.print(",");
+    cp.print(d != NULL);            cp.print(",");
+    printHex4(d ? d->idVendor : 0); cp.print(",");
+    printHex4(d ? d->idProduct : 0); cp.print(",");
+    cp.print((int)(d ? d->address : 0));     cp.print(",");
+    cp.print((int)(d ? d->hub_address : 0)); cp.print(",");
+    cp.println((int)(d ? d->hub_port : 0));
+  }
+}
 
 // Shared across all DEVPORT_COUNT ports; set via SBAUD, or Serial.baud() auto-follow
 // (RepeaterModeLoop(), below). SerialUSB2 does NOT get its own auto-follow —

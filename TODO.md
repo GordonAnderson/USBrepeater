@@ -318,6 +318,21 @@ again if firmware-side identification is ever revisited.)
       adapter (silent, as expected); `SDEV,5`/`SDEV2,3` bridged USB
       correctly and `SDEV,7` was rejected. Not yet tested: slot 6, and
       concurrent load across many slots.
+- [x] **Connector detection probe (2026-11-05), hardware-tested.** First
+      step of the connector-based slots design (see "Planned: connector
+      slots, device names, per-MIPS arbiter" below). `TrackedHub`/
+      `SlotSerial` are thin subclasses that expose USBHost_t36's protected
+      `Device_t` read-only; `devicePath()` walks a device's `hub_address`
+      chain up to the board hub (the hub on the root port, `hub_address`
+      0) and reports the board-hub port as the connector, plus the
+      inner-hub port for a device behind its own hub. New diagnostic
+      `GDEVPATH` lists every slot and hub. Slot assignment is unchanged.
+      Verified with one MIPS (native USB, VID `2341`/PID `003E`) moved
+      through all 4 connectors: it stayed in slot 1 and `GDEVPATH`
+      reported connector 1, 2, 3, 4 matching the board labels (USB2514B
+      `0424`/`2514` at address 1, hub port = connector), so no
+      translation table is needed. Passthrough kept working. Not yet
+      tested: a MIPS with an internal hub (inner-port reporting).
 - [ ] `SDEV`'s reply-delivery-on-switch behavior (the core of the "nothing
       is lost" design) only really proves itself with a device that
       actually sends meaningful unsolicited chatter while not selected —
@@ -500,6 +515,66 @@ yet to test against.** `src/USBrepeater.cpp` Section 6d:
       stale V1/V2 plan without checking the real schematic first. Low
       urgency — this TODO.md section is the correction of record in the
       meantime.
+
+## Planned: connector slots, device names, per-MIPS arbiter
+
+Agreed in design discussion (2026-11-05). **Reverses** the earlier
+"firmware never identifies devices; the host maps slots itself" decision
+(see "The device-identification question is resolved" in Phase 2): slot
+numbers today are USB claim order, so which MIPS lands on slot 1 / data
+port 1 / TCP 5001 depends on boot timing, replug order and devices that
+expose two serial ports. That's unstable for hosts and unsafe for scripts
+that change instrument settings.
+
+Facts this design relies on (per the user):
+- The only known nested-hub case is a MIPS with an internal temperature
+  controller on a USB-to-RS-485 (FTDI) adapter behind the MIPS's own hub.
+- Every GAACE device answers `GNAME`, and names are unique per system
+  (collisions possible but assumed not to happen; no handling for them).
+- About 90% of use is two MIPS on the two USB data ports, which should be
+  transparent to the host software. With 4 MIPS, Ethernet (one TCP port
+  per system) is the clean path.
+
+**Part A — stable slots and names (build now):**
+1. [x] Connector detection (`devicePath()`, `GDEVPATH`), verified above.
+2. [ ] Slots by connector: the GAACE device on connector N is slot N, an
+       RS-485 adapter behind that connector's MIPS is slot N+4 (8 slots,
+       TCP 5001-5008; raise QNEthernet's `MEMP_NUM_TCP_PCB` to at least 9).
+       Any device can go in any connector; the connector decides its
+       number. `GDEVSTAT`/`GETHSTAT` grow to 8 entries (host-visible).
+3. [ ] Data ports follow the lowest occupied connectors: data port 1
+       takes the lowest-numbered connector with a device, data port 2 the
+       next. Deterministic from cabling alone; adding a device on a lower
+       connector shifts the assignment. A saved `SDEV`/`SDEV2` overrides.
+4. [ ] `GNAME` queried on attach (retry while the MIPS boots, reply
+       swallowed, slot held out of passthrough until answered or timed
+       out); no reply = not a GAACE device. New `GDEVLIST` (slot,
+       connector, name, VID/PID, main/extra).
+
+**Part B — scripts that talk to several MIPS (after Part A is proven):**
+- Per-MIPS arbiter: one command in progress per MIPS; host passthrough
+  and script commands queue (one entry per requester, about 7). Script
+  replies end at the first newline (GAACE replies are one line:
+  ACK, ACK+value or NAK `?`, then a newline). Host replies end at the
+  newline plus a short silence, to cover multi-line replies.
+- VM "waiting" state: a script pauses at a device call and resumes when
+  the reply arrives, so the main loop and other devices never stall.
+- Language: `device("NAME")` returns a handle that stands for the name,
+  not a slot (survives replug), `ready(dev)`, `dcmd(dev, "CMD", args)` /
+  `dcmdf(...)`. Changes the syscall table hash, so saved scripts must be
+  recompiled and reloaded once.
+- Move the ADC target (`SADCDEV`/`SADCCMD`) to names.
+- Scripts run once a second up to about 10 Hz; measure real MIPS reply
+  times early.
+
+Open questions:
+- [ ] Does the MIPS host app send non-command data (binary, firmware
+      uploads) through the passthrough? If so, a raw mode that bypasses
+      the arbiter is needed.
+- [ ] Host-side features (`SDEV` by name, name-to-TCP-port lookup) are
+      to be decided. Don't switch a data port while a host app has it
+      open.
+- [ ] Unsolicited device output and no-reply timeouts under the arbiter.
 
 ## Settled design: 4 downstream devices via hub + Ethernet
 

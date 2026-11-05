@@ -510,6 +510,7 @@ every registered command and its help string, `HELP,<cmd>` looks up one.
 | `GDEV2` / `SDEV2,<n>` | Get/set which downstream slot (1-6) `SerialUSB2` is bridged to; `SDEV2` rejects a value equal to `ActiveDevice` |
 | `GADCDEV` / `SADCDEV,<n>` | Get/set which downstream slot (1-6) `ADCThread`/the script demo targets |
 | `GDEVSTAT` | One row per slot (1-6): `dev,connected,bytesWaiting,bytesDropped` |
+| `GDEVPATH` | Diagnostic: one row per slot (`slot,connected,connector,innerPort,vid,pid,speed,addr,hubAddr,hubPort`), then one per hub driver. `connector` is the board connector (1-4, matches the labels); `innerPort` is the port on a device's own internal hub, 0 if none |
 | `GETHDHCP` / `SETHDHCP,TRUE\|FALSE` | DHCP vs. static IP; reboot to apply |
 | `GETHIP` / `SETHIP,<a.b.c.d>` | Static IP address; reboot to apply |
 | `GETHMASK` / `SETHMASK,<a.b.c.d>` | Static subnet mask; reboot to apply |
