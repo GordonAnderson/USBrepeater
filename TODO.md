@@ -137,8 +137,8 @@ yet.**
       stays at its default** (`0`, all 4 ports removable/hot-pluggable) —
       correct for 4 USB-A connectors meant for pluggable downstream
       devices. No code change.
-- [ ] **Not yet tested on real hardware** — no hub board here yet. First
-      real test is Phase 1 below, once boards arrive.
+- [x] **Hardware-tested (2026-11-05)**: the first Hub Carrier board arrived
+      and the Teensy is mounted on it.
 
 ### Phase 1 — Validate the hub itself before going to 4 devices
 
@@ -148,10 +148,14 @@ of the 4 ports and run **today's existing single-`userial` firmware**
 unchanged. This isolates "does the hub attach and pass traffic at all"
 from "does 4-device multiplexing work" — don't debug both at once.
 
-- [ ] Pass criterion: `GLINK` reports `TRUE`, and `GVER` through the
-      repeater passthrough reaches the downstream device and gets a reply —
-      literally the same test already done end-to-end on 2026-10-06, just
-      with the hub now in the path instead of a direct connection.
+- [x] **Hardware-tested (2026-11-05)**: a real GAACE/MIPS command-processor
+      device on downstream port 1. Pass criterion met exactly as specified:
+      `GLINK` -> `TRUE`, `GDEVSTAT` -> `1,TRUE,0,0`, and `GVER` sent into
+      the bridged `Serial` passthrough port got relayed through the
+      USB2514B hub to the real device and its actual reply
+      (`Version 1.269,Oct 30,2026`) came back correctly — same test as
+      2026-10-06, now with the real hub in the path instead of a direct
+      connection.
 
 ### Phase 2 — Multi-device support (4× `USBSerial_BigBuffer`)
 
@@ -196,12 +200,19 @@ again if firmware-side identification is ever revisited.)
   that port's ring buffer at all, so it can never leak out later even if
   that port becomes selected afterward.
 
-- [ ] **Not yet tested on real hardware** — no 4-port hub/4 downstream
-      devices here yet. First real test, once hardware arrives: the docx's
-      own bring-up pass criterion is a good target — all four enumerate
-      after power-up and after hot-plugging each individually, `GDEVSTAT`
-      shows sane `bytesWaiting`/`bytesDropped` for a port left unselected
-      while its device talks, and `ADCThread` keeps running throughout.
+- [x] **Hardware-tested (2026-11-05), partially** — one real device on
+      port 1 (no devices on 2-4 yet). Confirmed on real hardware: `SDEV`
+      switching across all 4 ports (including to an empty port and back),
+      `GDEVSTAT` correctly distinguishing the connected port from the
+      three empty ones, both switchable USB paths (`SDEV`/`Serial` and
+      `SDEV2`/`SerialUSB2`) independently bridging real command/response
+      traffic to the same real device, and the `ActiveDevice`/
+      `ActiveDevice2` mutual-exclusivity check correctly rejecting a
+      conflicting assignment (`SDEV2,1` NAKed while `SDEV` already held
+      port 1; `SDEV,2` NAKed while `SDEV2` already held port 2). Not yet
+      tested: all 4 ports with real devices simultaneously, hot-plugging
+      each individually, `bytesWaiting`/`bytesDropped` under actual load,
+      and `ADCThread` continuing to run throughout a multi-device session.
 - [ ] `SDEV`'s reply-delivery-on-switch behavior (the core of the "nothing
       is lost" design) only really proves itself with a device that
       actually sends meaningful unsolicited chatter while not selected —
