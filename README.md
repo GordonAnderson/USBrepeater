@@ -357,6 +357,26 @@ the `GAACE_Script` library, so it needs a build against its current `main`
 it). Scripts that use it need that firmware; int-only scripts are
 unchanged. Not yet run on hardware.
 
+### `cmd()` with bool (`TRUE`/`FALSE`) commands
+
+Scripts can read and set bool commands (2026-11-05):
+
+```
+cmd("SADCEN", true);        // sends SADCEN,1
+cmd("SDIODIR", false);      // sends SDIODIR,0
+on = cmd("GADCEN");         // TRUE -> 1, FALSE -> 0
+```
+
+`true`/`false` are just the numbers `1`/`0`. The repeater's bool
+commands (`SADCEN`, `SETHDHCP`, `SDIODIR`, `SDOUT`, and `STENA`) accept
+`1`/`0` as well as `TRUE`/`FALSE`, from a script or from a person typing
+them. (`STENA` also needs a thread name, which a script can't pass, so
+it's still control-port only.) Replies are still `TRUE`/`FALSE`. A `FALSE` reply and a NAK both
+read as `0` in a script. Needs current `GAACE_Core` and `GAACE_Script`
+`main`; a script using `true`/`false` must be compiled with the current
+`gsc.py`. No bytecode or syscall-hash change, so saved scripts still
+restore.
+
 ### Syscalls: one table, no declarations in scripts
 
 The script syscalls (`link_ready`, `read_adc`, `scale_send`, `dio_set_dir`,

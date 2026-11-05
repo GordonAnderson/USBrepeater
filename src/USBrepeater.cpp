@@ -966,8 +966,10 @@ static bool parseBoolArg(bool *out)
   if (!cp.getValue(&tok)) return false;
 
   bool ok = true;
-  if      (strcasecmp(tok, "TRUE")  == 0) *out = true;
-  else if (strcasecmp(tok, "FALSE") == 0) *out = false;
+  // "1"/"0" accepted too, matching GAACE_Core's CMDbool, so a script's
+  // cmd("SDIODIR", 1) works (cmd() can only send numbers).
+  if      (strcasecmp(tok, "TRUE")  == 0 || strcmp(tok, "1") == 0) *out = true;
+  else if (strcasecmp(tok, "FALSE") == 0 || strcmp(tok, "0") == 0) *out = false;
   else ok = false;
 
   cp.ca->free(tok);

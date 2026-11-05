@@ -1064,10 +1064,36 @@ a new constraint.
             `cmd("SADCINT", ...)` wrote through the command processor and
             `cmd("GADCINT")` read it back, and the result drove DIO via the
             syscalls. Run cadence measured at exactly the 1000 ms interval,
-            plus one immediate run when armed. Limitation: `cmd()` can only
-            pass numbers, so commands that take `TRUE`/`FALSE` (`SDIODIR`,
-            `SDOUT`, `SADCEN`) can't be driven from a script through `cmd()`;
-            DIO has syscalls for this, the others don't.
+            plus one immediate run when armed. Limitation found: `cmd()` can
+            only pass numbers, so commands that take `TRUE`/`FALSE`
+            (`SDIODIR`, `SDOUT`, `SADCEN`) couldn't be driven from a script,
+            and reading one (`cmd("GADCEN")`) always returned 0.
+      - [x] **Fixed (2026-11-05), compile-verified only: `cmd()` with
+            bool commands.** Three parts, no bytecode or syscall-hash
+            change (saved scripts still restore):
+            - GAACE_Script's `cmd()` bridge maps a `TRUE`/`FALSE` reply
+              to 1/0 (for `cmdf()` too).
+            - GAACE_Core's `CMDbool` and `STENA`, and this project's
+              `parseBoolArg()` (`SDIODIR`/`SDOUT`), accept `1`/`0` as well
+              as `TRUE`/`FALSE`. Exactly `1`/`0`; anything else still NAKs.
+              Replies are unchanged.
+            - `gsc.py` has `true`/`false` literals (1/0), so a script reads
+              `cmd("SADCEN", true)`.
+
+            GAACE_Core is shared by about 20 other products that track
+            `main` unpinned, so they pick up the `1`/`0` change on their
+            next library update. It only adds accepted input; the risk
+            note is in GAACE_Core's README ("Behavior changes"). Products
+            with their own `TRUE`/`FALSE` parsers (the MIPS firmware,
+            FETpulser, MFT, DMSDMS) don't get it. The `stm32` branch
+            (MIPS_STM32) doesn't have it yet. Tests: `gsc.py` 73 and
+            native VM 30 pass; the new on-device tests (GAACE_Core bool
+            `1`/`0`, GAACE_Script `test_cmd_bool_get_and_set`) compile but
+            weren't run (they need the QT Py M0).
+            - [ ] **Hardware test**: from a script, `cmd("SADCEN", true)`
+                  then `cmd("GADCEN")` should return 1; then the same for
+                  `SDIODIR`/`SDOUT` against `GDIODIR`/`GDOUT`, and rerun
+                  the existing `cmd()`/`cmdf()` test for regressions.
 - [x] **Resolved (2026-10-28): syscall table + persisted-script safety.**
       The six script syscalls are now one `scriptSyscalls[]` table in
       `setup()` (`GAACEScript::SyscallDesc`: name, function, argc, returns
