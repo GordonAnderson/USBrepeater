@@ -1665,11 +1665,20 @@ static bool finalizeScriptSlot(uint8_t slot, uint16_t totalLen)
   return true;
 }
 
-// saveScriptSlotToFlash — write a loaded slot's exact current buffer
-// (header + code + pool) to its file. Fails (false, no file written/
-// touched) if the slot isn't loaded or the filesystem isn't mounted; a
-// slot mid-SCRIPTAPPEND (loaded==false) must never be persisted as if it
-// were a complete, runnable script.
+// saveScriptSlotToFlash — rebuild the [codeLen][code][pool] wire-format
+// payload from the VM's own authoritative code/pool pointers (vm.code,
+// vm.pool — not s.code[] directly) and write it to the slot's file.
+// s.code[] only actually starts with that 2-byte header for a slot loaded
+// via SCRIPTLOAD/SCRIPTAPPEND+SCRIPTCOMMIT; a slot preloaded by a project
+// via a direct vmInit() call (e.g. this file's compiled-in ADC demo,
+// Section 8) has vm.code pointing at s.code+0 with no header at all, so
+// reading s.code[0..totalLen) verbatim silently saved garbage for that
+// case -- caught by hardware testing (SCRIPTSAVE,0/SCRIPTRESTORE,0 round-
+// trip on the booted demo), fixed by writing the header/code/pool pieces
+// separately instead of assuming the in-RAM buffer's layout.
+// Fails (false, no file written/touched) if the slot isn't loaded or the
+// filesystem isn't mounted; a slot mid-SCRIPTAPPEND (loaded==false) must
+// never be persisted as if it were a complete, runnable script.
 bool saveScriptSlotToFlash(uint8_t slot)
 {
   if (!scriptFSReady || slot >= SCRIPT_SLOTS) return false;
@@ -1677,7 +1686,9 @@ bool saveScriptSlotToFlash(uint8_t slot)
   ScriptSlot &s = scripts.slots[slot];
   if (!s.loaded) return false;
 
-  uint16_t totalLen = (uint16_t)(2 + s.vm.codeLen + s.vm.poolLen);
+  uint16_t codeLen = s.vm.codeLen;
+  uint16_t poolLen  = s.vm.poolLen;
+  uint16_t totalLen = (uint16_t)(2 + codeLen + poolLen);
   if (totalLen > SCRIPT_MAX_CODE_LEN) return false;   // defensive; should be unreachable
 
   char path[20];
@@ -1687,7 +1698,10 @@ bool saveScriptSlotToFlash(uint8_t slot)
   File f = scriptFS.open(path, FILE_WRITE_BEGIN);
   if (!f) return false;
 
-  size_t written = f.write(s.code, totalLen);
+  uint8_t header[2] = {(uint8_t)codeLen, (uint8_t)(codeLen >> 8)};
+  size_t written = f.write(header, sizeof(header));
+  written += f.write(s.vm.code, codeLen);
+  if (poolLen > 0) written += f.write(s.vm.pool, poolLen);
   f.close();
   if (written != totalLen) return false;
 

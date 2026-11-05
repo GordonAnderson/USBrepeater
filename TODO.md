@@ -862,15 +862,28 @@ a new constraint.
       Implemented entirely in USBrepeater, not `GAACE_Script` itself — see
       that repo's own `TODO.md`/`WORKFLOW.md` for why (keeping the library
       hardware-agnostic).
-      - [ ] **Not yet tested on real hardware** — no actual power-cycle
-            test run in this environment yet (unlike the rest of the
-            Hub Carrier work, this specifically doesn't need that
-            hardware — `LittleFS_Program` is on-chip flash on the bare
-            Teensy 4.1 already in hand). First real test: `SCRIPTSAVE` a
-            script into a slot, power-cycle (not just re-run `pio run -t
-            upload`, which doesn't prove persistence the way an actual
-            power loss does), and confirm `GSCRIPTST`/`GTENA` show it
-            loaded and running without any commands sent after boot.
+      - [x] **Hardware-tested (2026-11-05)** on the real Teensy 4.1,
+            control port over USB (no downstream device needed for this
+            feature). Found and fixed a real bug in the process:
+            `saveScriptSlotToFlash()` assumed every loaded slot's in-RAM
+            `code[]` buffer already started with the `[codeLen:u16]`
+            wire-format header — true for a `SCRIPTLOAD`/`SCRIPTAPPEND`-
+            loaded script, but *not* for a slot preloaded directly via
+            `vmInit()` (this file's compiled-in ADC demo in slot 0,
+            Section 8) — so saving the demo wrote 2 bytes of its own
+            bytecode misread as a bogus length header, and
+            `SCRIPTRESTORE`/boot-time restore then rejected it as corrupt.
+            Fixed by rebuilding the header/code/pool payload from the
+            VM's own authoritative `vm.code`/`vm.codeLen`/`vm.pool`/
+            `vm.poolLen` on every save, instead of trusting `code[]`'s
+            layout. Verified end to end: `SCRIPTSAVE,0` /
+            `SCRIPTRESTORE,0` round-trip ACKs; a script loaded via
+            `gsc.py --upload` into slot 1 and saved there also survived a
+            full reflash-triggered reboot, re-restoring with
+            `loaded=TRUE` and `lastStatus=VM_HALTED` (ran to completion
+            unattended, enabled by default per the restore design) with
+            no commands sent after boot; slots never saved (2, 3) stayed
+            unloaded as expected.
 - [x] **Resolved (2026-10-28): syscall table + persisted-script safety.**
       The six script syscalls are now one `scriptSyscalls[]` table in
       `setup()` (`GAACEScript::SyscallDesc`: name, function, argc, returns
@@ -886,13 +899,16 @@ a new constraint.
       the wrong function; `SCRIPTRESTORE` NAKs `ERR_BADARG` for that case
       (vs. `ERR_NOSDCARD` for "nothing saved"). Files saved before this
       existed have no `.sig` and restore unchecked, as before.
-      - [ ] **Not yet tested on real hardware** (compile-verified against the
-            local GAACE_Script, Teensy 4.1). To test: flash, `GSYSCALLS`
-            (expect 6 syscalls), `gsc.py --upload` a script that calls one,
-            `SCRIPTSAVE`, then change the table order and reflash —
-            `SCRIPTRESTORE` should NAK and the slot should stay unloaded.
-      - [ ] **Needs the GAACE_Script commit with `registerSyscalls()`**
-            pushed before this builds from GitHub (`lib_deps`).
+      - [x] **Hardware-tested (2026-11-05)**, partially. Pulled the
+            GAACE_Script commit adding `registerSyscalls()`/`GSYSCALLS`
+            (`a9b56d1`); on real Teensy 4.1, `GSYSCALLS` reports 6
+            syscalls with hash `6501A214`, `gsc.py --upload` reads that
+            table and loads a script against it (no per-script syscall
+            declarations needed), and `SCRIPTSAVE`/`SCRIPTRESTORE` round-
+            trip a `.sig`-hashed slot correctly across a reboot. Not yet
+            tested: actually reordering the syscall table and reflashing
+            to confirm `SCRIPTRESTORE` NAKs a now-stale saved script
+            (`SCRIPT_RESTORE_STALE`) instead of silently misrunning it.
 - [ ] A general "device just rebooted" notification — raised during design
       discussion as a real gap (a host has no way to know a script's state
       was lost to an unexpected reset), but it's a GAACE_Core-level concern

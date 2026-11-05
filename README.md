@@ -403,10 +403,16 @@ its core), and `LittleFS_Program` is Teensy-only. `ScriptSlot::code[]` and
 `VM::codeLen`/`VM::poolLen` being public fields was enough to build this
 with zero changes to the library.
 
-Compile-verified only — no persistent hardware state to actually test a
-power-cycle against yet in this environment, though `LittleFS_Program`
-itself needs no Hub Carrier hardware (it's on-chip flash on the bare
-Teensy 4.1).
+Hardware-tested (2026-11-05) on the bare Teensy 4.1 over the control port:
+`SCRIPTSAVE`/`SCRIPTRESTORE` round-trip correctly, and a script survives a
+real reflash-triggered reboot, re-restoring with `loaded=TRUE` and running
+unattended with no commands sent after boot. This testing caught and fixed
+a real bug — `saveScriptSlotToFlash()` had assumed a loaded slot's `code[]`
+buffer always starts with the `[codeLen]` wire-format header, which isn't
+true for a slot preloaded directly via `vmInit()` (the compiled-in ADC
+demo); it now rebuilds the saved payload from the VM's own
+`code`/`codeLen`/`pool`/`poolLen` instead of trusting that layout. See
+TODO.md for the full writeup.
 
 ### Digital I/O (DIO, SMA)
 
