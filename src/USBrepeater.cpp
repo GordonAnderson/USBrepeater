@@ -29,7 +29,7 @@
 //  way: each of the 4 ports also has its own dedicated, always-reachable
 //  TCP data port (EthDataPortBase+0..3, Section 6c), independent of SDEV.
 //  The host is responsible for mapping port number to device identity: it
-//  switches SDEV through 1-4 and asks each one GNAME/GVER itself over the
+//  switches SDEV through 1-DEVPORT_COUNT and asks each one GNAME/GVER itself over the
 //  ordinary passthrough path; firmware never tries to identify what's
 //  plugged in. ADCThread/the script demo (below) target a second,
 //  independent selection (data.AdcTargetDevice, SADCDEV/GADCDEV) so
@@ -322,7 +322,7 @@ static void cmdGetDin(void);
 
 static int portLimits[] = {1, 65535};  // range check for ?ETHCTRLPORT / ?ETHDATAPORT
 
-// Per-port accessors — implemented in Section 6, where userial1..userial4
+// Per-port accessors — implemented in Section 6, where userial1..userial6
 // and their ring buffers actually live. Keeps these command handlers (and
 // GLINK/SBAUD above) from needing extern access to the raw per-port arrays.
 // dev1based is in [1, DEVPORT_COUNT]; callers here always pass a value
@@ -382,12 +382,12 @@ Command cmds[] =
   //  why. SADCDEV is a completely independent selection for ADCThread/the
   //  script demo, so background monitoring of one device isn't interrupted
   //  by switching either port's interactive focus.
-  {"GDEV",     CMDfunction, -1, (void *)cmdGetDev,         NULL, "Get Serial's active downstream device, 1-4"},
-  {"SDEV",     CMDfunction, -1, (void *)cmdSetDev,         NULL, "Set Serial's active downstream device, 1-4 (must differ from ActiveDevice2)"},
-  {"GDEV2",    CMDfunction, -1, (void *)cmdGetDev2,        NULL, "Get SerialUSB2's active downstream device, 1-4"},
-  {"SDEV2",    CMDfunction, -1, (void *)cmdSetDev2,        NULL, "Set SerialUSB2's active downstream device, 1-4 (must differ from ActiveDevice)"},
-  {"GADCDEV",  CMDfunction, -1, (void *)cmdGetAdcDev,      NULL, "Get ADCThread/script target device, 1-4"},
-  {"SADCDEV",  CMDfunction, -1, (void *)cmdSetAdcDev,      NULL, "Set ADCThread/script target device, 1-4"},
+  {"GDEV",     CMDfunction, -1, (void *)cmdGetDev,         NULL, "Get Serial's active downstream device, " DEVPORT_RANGE_STR},
+  {"SDEV",     CMDfunction, -1, (void *)cmdSetDev,         NULL, "Set Serial's active downstream device, " DEVPORT_RANGE_STR " (must differ from ActiveDevice2)"},
+  {"GDEV2",    CMDfunction, -1, (void *)cmdGetDev2,        NULL, "Get SerialUSB2's active downstream device, " DEVPORT_RANGE_STR},
+  {"SDEV2",    CMDfunction, -1, (void *)cmdSetDev2,        NULL, "Set SerialUSB2's active downstream device, " DEVPORT_RANGE_STR " (must differ from ActiveDevice)"},
+  {"GADCDEV",  CMDfunction, -1, (void *)cmdGetAdcDev,      NULL, "Get ADCThread/script target device, " DEVPORT_RANGE_STR},
+  {"SADCDEV",  CMDfunction, -1, (void *)cmdSetAdcDev,      NULL, "Set ADCThread/script target device, " DEVPORT_RANGE_STR},
   {"GDEVSTAT", CMDfunction,  0, (void *)cmdGetDevStat,     NULL, "Per-port status: dev,connected,bytesWaiting,bytesDropped"},
   {"GLINK2",   CMDfunction,  0, (void *)cmdGetLink2,       NULL, "ActiveDevice2's USB connection state"},
 
@@ -408,7 +408,7 @@ Command cmds[] =
   {"GETHGW",       CMDfunction, -1, (void *)cmdGetEthGw,           NULL, "Static gateway a.b.c.d; reboot to apply"},
   {"SETHGW",       CMDfunction, -1, (void *)cmdSetEthGw,           NULL, "Set static gateway a.b.c.d; reboot to apply"},
   {"?ETHCTRLPORT", CMDint,      -1, (void *)&data.EthCtrlPort,     portLimits, "TCP port for the network control port; reboot to apply"},
-  {"?ETHDATAPORT", CMDint,      -1, (void *)&data.EthDataPortBase, portLimits, "TCP base port for per-device passthrough: device N uses base+(N-1), N=1-4; reboot to apply"},
+  {"?ETHDATAPORT", CMDint,      -1, (void *)&data.EthDataPortBase, portLimits, "TCP base port for per-device passthrough: device N uses base+(N-1), N=" DEVPORT_RANGE_STR "; reboot to apply"},
   {"GETHSTAT",     CMDfunction,  0, (void *)cmdGetEthStat,         NULL, "Live status: link,mode,ip,ctrlConnected,dataConnected1,dataConnected2,dataConnected3,dataConnected4"},
 
   // ── Periodic ADC -> downstream-device command update ───────────────────────
@@ -522,7 +522,7 @@ static void cmdGetLink2(void)
 
 // -----------------------------------------------------------------------------
 // GDEV / SDEV,<n> and GDEV2 / SDEV2,<n> — get/set which downstream port
-// (1-4) Serial / SerialUSB2 (the two switchable USB upstream paths) are
+// (1-DEVPORT_COUNT) Serial / SerialUSB2 (the two switchable USB upstream paths) are
 // each bridged to. Does not affect Ethernet: each port has its own
 // dedicated, always-reachable data port there (Section 6c), independent of
 // either selection. The newly-selected port's ring buffer (Section 6)
@@ -581,7 +581,7 @@ static void cmdSetDev2(void)
 }
 
 // -----------------------------------------------------------------------------
-// GADCDEV / SADCDEV,<n> — get/set which downstream port (1-4) ADCThread and
+// GADCDEV / SADCDEV,<n> — get/set which downstream port (1-DEVPORT_COUNT) ADCThread and
 // the GAACE_Script demo send to. Deliberately independent of GDEV/SDEV: see
 // the command table comment above.
 // -----------------------------------------------------------------------------
@@ -735,7 +735,7 @@ static void cmdSetEthGw(void)
 
 // -----------------------------------------------------------------------------
 // GETHSTAT — live network status: link,mode,ip,ctrlConnected, then one
-// dataConnected flag per downstream device (1-4, each its own dedicated
+// dataConnected flag per downstream device (1-DEVPORT_COUNT, each its own dedicated
 // Ethernet data port — Section 6c). Always reflects current runtime state
 // (unlike the config getters above, which read back the stored, possibly-
 // not-yet-applied, EthIP/EthMask/EthGw).
@@ -1087,7 +1087,7 @@ static void cmdScriptRestore(void)
 }
 
 // =============================================================================
-//  SECTION 6 — REPEATER MODE (4 downstream ports, Hub Carrier board)
+//  SECTION 6 — REPEATER MODE (DEVPORT_COUNT device slots, 4-connector Hub Carrier board)
 // =============================================================================
 //
 //  PC <-> Teensy device port (micro-USB, SerialUSB1 shares the connector) <->
@@ -1108,19 +1108,19 @@ static void cmdScriptRestore(void)
 //  --------
 //  All 4 downstream ports stay connected/auto-reconnecting continuously,
 //  independent of which one(s) the host is looking at
-//  (devPortUpdateConnection() below runs on all 4 every tick). Each port has
+//  (devPortUpdateConnection() below runs on all DEVPORT_COUNT every tick). Each port has
 //  its own ring buffer (devPort[i].rxbuf) that captures incoming bytes
 //  continuously too — so a device that chatters unsolicited while not
 //  selected by anything is never silently lost. Only ONE port at a time can
 //  be bridged to Serial, and only one (a different one) to SerialUSB2 — the
 //  hardware's 3-CDC-port ceiling means two switchable USB paths is the most
-//  available (see TODO.md). data.ActiveDevice/ActiveDevice2 (1-4, SDEV/GDEV,
+//  available (see TODO.md). data.ActiveDevice/ActiveDevice2 (1-DEVPORT_COUNT, SDEV/GDEV,
 //  SDEV2/GDEV2) select them. Ethernet isn't endpoint-limited the same way —
 //  every port also has its own dedicated, always-reachable Ethernet data
 //  port (Section 6c), independent of either USB selection.
 //
 //  The host is responsible for mapping port number to device identity/
-//  function — it does this itself, by switching SDEV/SDEV2 through 1-4 and
+//  function — it does this itself, by switching SDEV/SDEV2 through 1-DEVPORT_COUNT and
 //  asking each one GNAME/GVER over the ordinary passthrough path. Firmware
 //  doesn't try to identify what's plugged into a port; that would require
 //  injecting and parsing a command on every connect, which is real
@@ -1129,7 +1129,7 @@ static void cmdScriptRestore(void)
 //
 //  RING BUFFER / FLUSH MODEL
 //  -------------------------
-//  Every tick: drain available bytes from ALL 4 ports into their own ring
+//  Every tick: drain available bytes from ALL DEVPORT_COUNT ports into their own ring
 //  buffers (devPortDrainIncoming()), unconditionally. Every port is then
 //  also flushed every tick (devPortFlush()) — a port selected by Serial or
 //  SerialUSB2 flushes to whoever last spoke to it over that shared USB/
@@ -1165,16 +1165,25 @@ USBHub              hub2(myusb);
 USBHub              hub3(myusb);
 USBHub              hub4(myusb);
 USBHub              hub5(myusb);
-USBSerial_BigBuffer userial1(myusb);
-USBSerial_BigBuffer userial2(myusb);
-USBSerial_BigBuffer userial3(myusb);
-USBSerial_BigBuffer userial4(myusb);
+// min_rxtx = 1, not the library default of 65: the default makes BigBuffer
+// claim only high-speed devices (>64-byte bulk endpoints), silently
+// rejecting every full-speed one -- SAMD/TinyUSB boards like the
+// IsoElectrometer, and most FTDI/CP210x/CH340 adapters.
+USBSerial_BigBuffer userial1(myusb, 1);
+USBSerial_BigBuffer userial2(myusb, 1);
+USBSerial_BigBuffer userial3(myusb, 1);
+USBSerial_BigBuffer userial4(myusb, 1);
+USBSerial_BigBuffer userial5(myusb, 1);
+USBSerial_BigBuffer userial6(myusb, 1);
 
 // Indexed 0..DEVPORT_COUNT-1; devPort[]/the command handlers above use
 // 1-based device numbers throughout (dev1based - 1 to index in here).
-USBSerial_BigBuffer *userialPtr[DEVPORT_COUNT] = { &userial1, &userial2, &userial3, &userial4 };
+USBSerial_BigBuffer *userialPtr[] = { &userial1, &userial2, &userial3,
+                                                   &userial4, &userial5, &userial6 };
+static_assert(sizeof(userialPtr) / sizeof(userialPtr[0]) == DEVPORT_COUNT,
+              "declare one userial per DEVPORT_COUNT slot");
 
-// Shared across all 4 ports; set via SBAUD, or Serial.baud() auto-follow
+// Shared across all DEVPORT_COUNT ports; set via SBAUD, or Serial.baud() auto-follow
 // (RepeaterModeLoop(), below). SerialUSB2 does NOT get its own auto-follow —
 // a known limitation, not an oversight: curBaud is one value for the whole
 // system, so if Serial and SerialUSB2 are both in use against two different
@@ -1278,7 +1287,7 @@ static void devPortPush(uint8_t idx, uint8_t b)
 }
 
 // Drain whatever's available from userialPtr[idx] into devPort[idx]'s ring
-// buffer. Runs for all 4 ports every tick, regardless of selection.
+// buffer. Runs for all DEVPORT_COUNT ports every tick, regardless of selection.
 static void devPortDrainIncoming(uint8_t idx)
 {
   int n = userialPtr[idx]->available();
@@ -1303,7 +1312,7 @@ static void devPortFlush(uint8_t idx, Stream *out)
   }
 }
 
-// Attach/detach + auto-reconnect for one port. Runs on all 4 every tick,
+// Attach/detach + auto-reconnect for one port. Runs on all DEVPORT_COUNT every tick,
 // independent of selection — a port reconnecting must not depend on whether
 // it's the one currently bridged to the upstream.
 static void devPortUpdateConnection(uint8_t idx)
@@ -1334,7 +1343,7 @@ void RepeaterModeLoop(void)
 {
   myusb.Task();
 
-  // Connection management + incoming capture: all 4 ports, every tick,
+  // Connection management + incoming capture: all DEVPORT_COUNT ports, every tick,
   // unconditionally. This is what makes "nothing is lost" true regardless
   // of what's selected.
   for (uint8_t i = 0; i < DEVPORT_COUNT; i++)

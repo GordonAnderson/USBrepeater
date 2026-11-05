@@ -20,11 +20,21 @@
 // switchable USB data port (SerialUSB2 / SDEV2).
 #define SIGNATURE  0xAA55A5AD
 
-// Number of downstream USB ports on the Hub Carrier board (one USB2514B
-// 4-port hub). ActiveDevice/AdcTargetDevice below are 1-based indices into
-// this range. See src/USBrepeater.cpp Section 6 for the per-port state this
-// drives (userial1..userial4, one ring buffer each).
-#define DEVPORT_COUNT 4
+// Number of downstream serial-device slots ("DevPorts"). Deliberately more
+// than the board's 4 physical USB-A connectors: a downstream instrument can
+// expose more than one USB serial device behind its own internal hub (e.g. a
+// MIPS unit's controller plus its FTDI RS-485 adapter), and slots are
+// assigned in USB claim order, not by connector. ActiveDevice/ActiveDevice2/
+// AdcTargetDevice below are 1-based indices into this range. Each slot also
+// gets a TCP data port (EthDataPortBase + slot - 1); QNEthernet's default
+// limit of 8 TCP connections covers 1 control + 6 data, so going past 6
+// needs its lwIP limits raised too. See src/USBrepeater.cpp Section 6 for
+// the per-slot state this drives (userial1..userial6, one ring buffer each).
+#define DEVPORT_COUNT 6
+
+#define DEVPORT_XSTR(x) DEVPORT_STR(x)
+#define DEVPORT_STR(x)  #x
+#define DEVPORT_RANGE_STR "1-" DEVPORT_XSTR(DEVPORT_COUNT)   // for help strings
 
 // ── Operating modes ───────────────────────────────────────────────────────
 //  Add new modes by appending to this enum (before NUM_MODES) and adding a

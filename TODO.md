@@ -284,8 +284,40 @@ again if firmware-side identification is ever revisited.)
       (v1.269, v1.262, v1.263). The nested-hub unit exposes a single CDC
       device behind its hub, so it uses one `DevPort` like the others;
       a device exposing several CDC devices would use more than one, so
-      4 such devices could exceed `DEVPORT_COUNT`. Still to retest: the
-      isolated electrometer with this fix.
+      4 such devices could exceed `DEVPORT_COUNT` (see below).
+
+      **Fixed (2026-11-05): full-speed serial devices were silently
+      rejected — a second software bug.** The nested-hub fix didn't help
+      the IsoElectrometer. Its trace showed it enumerating fine (VID
+      `239A`/PID `801E`, a full-speed SAMD board, standard IAD CDC-ACM), but
+      the serial driver rejected its 64-byte bulk endpoints.
+      `USBSerial_BigBuffer`'s constructor defaults to `min_rxtx = 65`, so by
+      design it only claims high-speed (512-byte) devices and leaves
+      full-speed ones to the plain `USBSerial` class, which this firmware
+      never instantiated. That excluded the electrometer and most
+      FTDI/CP210x/CH340 USB-serial adapters. Fix: `userialN(myusb, 1)`.
+
+      **Changed (2026-11-05): `DEVPORT_COUNT` 4 -> 6.** With the full-speed
+      fix, the 3rd MIPS unit turned out to expose *two* serial devices
+      behind its internal hub: an FTDI FT232R "USB-RS485 Cable" (VID
+      `0403`/PID `6001`) and its controller, "MIPS, native USB" (VID
+      `2341`/PID `003E`). With 4 instruments that made 5 serial devices for 4
+      slots, and whichever arrived last went unclaimed. Decision (per the
+      user): option A, raise the slot count to 6 rather than filter out
+      non-CDC adapters. Slots are decoupled from the 4 physical connectors;
+      `userial5/6` added, TCP data ports now 5001-5006, `GDEVSTAT`/`GETHSTAT`
+      report 6 slots (a host-visible format change), help strings come
+      from `DEVPORT_RANGE_STR`. The `Data` struct is unaffected (no
+      signature bump). Ethernet budget: QNEthernet's default
+      `MEMP_NUM_TCP_PCB` of 8 covers 1 control + 6 data connections, so 6
+      is the ceiling without raising its lwIP limits. RAM cost about 14 KB
+      (174 KB free). **Hardware-tested**: all 4 instruments connected at
+      once, 5 slots populated, every command-capable device reachable
+      over its own TCP port (slot 1 MIPS v1.269, slot 2 MIPS v1.262, slot
+      3 IsoElectrometer v1.2, slot 5 MIPS v1.263); slot 4 is the RS-485
+      adapter (silent, as expected); `SDEV,5`/`SDEV2,3` bridged USB
+      correctly and `SDEV,7` was rejected. Not yet tested: slot 6, and
+      concurrent load across many slots.
 - [ ] `SDEV`'s reply-delivery-on-switch behavior (the core of the "nothing
       is lost" design) only really proves itself with a device that
       actually sends meaningful unsolicited chatter while not selected —

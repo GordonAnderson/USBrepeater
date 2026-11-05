@@ -7,7 +7,7 @@ and [ArduinoThread](https://github.com/GordonAnderson/ArduinoThread), following
 the same layout as [GordonAnderson/Template](https://github.com/GordonAnderson/Template).
 
 At its core it transparently relays a USB CDC connection from a PC through the
-Teensy's USB host port to one of up to 4 downstream USB CDC devices, exactly
+Teensy's USB host port to one of up to 6 downstream USB serial devices (on 4 physical connectors), exactly
 like a plain USB-to-USB serial repeater with a switch on the downstream side.
 On top of that it adds a GAACE command processor, a mode framework, a
 cooperative thread scheduler, persistent settings, Ethernet, and a periodic
@@ -54,7 +54,7 @@ one dedicated passthrough port per downstream device:
 | Port | Purpose |
 | --- | --- |
 | `EthCtrlPort` (default 5000) | Control port: every `SerialUSB1` command works verbatim over this TCP connection — same commandProcessor, same ASCII protocol. |
-| `EthDataPortBase` (default 5001) | Device 1's dedicated passthrough port. Devices 2-4 get `EthDataPortBase`+1/+2/+3 (5002-5004 by default) — always reachable regardless of which device `SDEV` currently has Serial pointed at, since Ethernet isn't endpoint-limited the way USB is. |
+| `EthDataPortBase` (default 5001) | Device 1's dedicated passthrough port. Devices 2-6 get `EthDataPortBase`+1 through +5 (5002-5006 by default) — always reachable regardless of which device `SDEV` currently has Serial pointed at, since Ethernet isn't endpoint-limited the way USB is. |
 
 All 5 are single-session — a new connection on a given port takes over from
 whatever was previously connected on that same port, same policy every
@@ -151,9 +151,25 @@ Adding a mode: append to the `SystemMode` enum, write a
 
 ### Downstream ports
 
-4 downstream USB-A ports (via the Hub Carrier's USB2514B), each with its own
-`USBSerial_BigBuffer` and ring buffer. All 4 stay connected and
-auto-reconnecting continuously, and each one **keeps capturing incoming
+4 physical downstream USB-A connectors (via the Hub Carrier's USB2514B),
+feeding **6 serial-device slots** (`DEVPORT_COUNT`, numbered 1-6), each
+with its own `USBSerial_BigBuffer` and ring buffer. There are more slots
+than connectors because one instrument can present several USB serial
+devices behind its own internal hub — a MIPS unit's controller plus its
+FTDI RS-485 adapter, for example. Nested hubs are supported (one extra
+`USBHub` driver per connector), and both high-speed (512-byte) and
+full-speed (64-byte, e.g. SAMD boards, FTDI/CP210x/CH340 adapters) serial
+devices are claimed.
+
+**Slot numbers follow USB claim order, not the connector.** A device takes
+the first free slot when it enumerates, so moving a device between
+connectors doesn't change its slot, and the slots can come out in a
+different order after a reboot or replug. Host software should identify a
+slot's device by asking it (`GNAME`/`GVER` over that slot's passthrough
+path), not assume a fixed mapping.
+
+All slots stay connected and auto-reconnecting continuously, and each one
+**keeps capturing incoming
 bytes into its own buffer regardless of whether it's currently
 selected** — so a device that sends unsolicited chatter while not in focus
 is never silently lost.
@@ -171,7 +187,7 @@ selected port's backlog to whoever last spoke to it, so what built up
 while it wasn't selected goes out immediately once it is.
 
 On the Ethernet side, every port is independent of `SDEV`/`SDEV2`: each of
-the 4 downstream devices has its own dedicated, always-reachable TCP data
+the 6 slots has its own dedicated, always-reachable TCP data
 port (see the Ethernet section above), so a client connected to device 3's
 port gets device 3's traffic whether or not `SDEV`/`SDEV2` currently points
 either USB port at device 3. For whichever device *is* currently selected
@@ -470,17 +486,17 @@ every registered command and its help string, `HELP,<cmd>` looks up one.
 | `GLINK` | `ActiveDevice`'s USB connection state (`TRUE`/`FALSE`) |
 | `GLINK2` | `ActiveDevice2`'s USB connection state (`TRUE`/`FALSE`) |
 | `GBAUD` / `SBAUD,<baud>` | Baud rate to the downstream device; set explicitly for Ethernet-only use |
-| `GDEV` / `SDEV,<n>` | Get/set which downstream port (1-4) `Serial` is bridged to; `SDEV` rejects a value equal to `ActiveDevice2` |
-| `GDEV2` / `SDEV2,<n>` | Get/set which downstream port (1-4) `SerialUSB2` is bridged to; `SDEV2` rejects a value equal to `ActiveDevice` |
-| `GADCDEV` / `SADCDEV,<n>` | Get/set which downstream port (1-4) `ADCThread`/the script demo targets |
-| `GDEVSTAT` | Per-port: `dev,connected,bytesWaiting,bytesDropped` |
+| `GDEV` / `SDEV,<n>` | Get/set which downstream slot (1-6) `Serial` is bridged to; `SDEV` rejects a value equal to `ActiveDevice2` |
+| `GDEV2` / `SDEV2,<n>` | Get/set which downstream slot (1-6) `SerialUSB2` is bridged to; `SDEV2` rejects a value equal to `ActiveDevice` |
+| `GADCDEV` / `SADCDEV,<n>` | Get/set which downstream slot (1-6) `ADCThread`/the script demo targets |
+| `GDEVSTAT` | One row per slot (1-6): `dev,connected,bytesWaiting,bytesDropped` |
 | `GETHDHCP` / `SETHDHCP,TRUE\|FALSE` | DHCP vs. static IP; reboot to apply |
 | `GETHIP` / `SETHIP,<a.b.c.d>` | Static IP address; reboot to apply |
 | `GETHMASK` / `SETHMASK,<a.b.c.d>` | Static subnet mask; reboot to apply |
 | `GETHGW` / `SETHGW,<a.b.c.d>` | Static gateway; reboot to apply |
 | `GETHCTRLPORT` / `SETHCTRLPORT,<port>` | TCP port for the network control port; reboot to apply |
 | `GETHDATAPORT` / `SETHDATAPORT,<port>` | TCP port for network passthrough; reboot to apply |
-| `GETHSTAT` | Live: `link,mode,ip,ctrlConnected,dataConnected` |
+| `GETHSTAT` | Live: `link,mode,ip,ctrlConnected,` then one `dataConnected` flag per slot (1-6) |
 | `GADCEN` / `SADCEN,TRUE\|FALSE` | ADC-update master enable |
 | `GADCPIN` / `SADCPIN,<pin>` | ADC input pin |
 | `GADCINT` / `SADCINT,<mS>` | ADC update interval |
@@ -532,10 +548,11 @@ correction/low-pass-filter work are all implemented (above) — see
 [TODO.md](TODO.md) for exactly what's real-hardware-verified versus
 compile-verified-only so far. As of 2026-11-05, the first Hub Carrier
 board exists and most of this is now real-hardware-verified: hub bring-up,
-2 of 4 downstream ports (both switchable USB paths and both Ethernet data
-ports, with "last speaker wins" confirmed across USB/Ethernet on the same
-device), script persistence across a real reboot, and DIO
-(control-port and script-syscall paths both). Remaining open work:
-ports 3/4 (need a 3rd/4th downstream device), simultaneous multi-port TCP
+all 4 connectors with 4 real instruments at once (5 serial devices,
+including one behind a nested hub and one full-speed), both switchable
+USB paths and the per-slot Ethernet data ports, with "last speaker wins"
+confirmed across USB/Ethernet on the same device, script persistence
+across a real reboot, and DIO (control-port and script-syscall paths
+both). Remaining open work: slot 6 (untested), simultaneous multi-port TCP
 load, and the AIN REF-correction/filter work (needs a known calibration
 signal, not yet applied).
