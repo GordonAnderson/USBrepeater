@@ -318,6 +318,7 @@ static void cmdGetDout(void);
 static void cmdSetDout(void);
 static void cmdScriptSave(void);
 static void cmdScriptRestore(void);
+static void cmdScriptErase(void);
 static void cmdGetDin(void);
 
 static int portLimits[] = {1, 65535};  // range check for ?ETHCTRLPORT / ?ETHDATAPORT
@@ -352,6 +353,7 @@ enum ScriptRestoreResult : uint8_t
 };
 bool                saveScriptSlotToFlash(uint8_t slot);
 ScriptRestoreResult restoreScriptSlotFromFlash(uint8_t slot);
+bool                eraseScriptSlotFromFlash(uint8_t slot);
 
 Command cmds[] =
 {
@@ -459,6 +461,7 @@ Command cmds[] =
   //  compiled-in ADC demo for slot 0 if slot 0 has a saved file.
   {"SCRIPTSAVE",    CMDfunction, -1, (void *)cmdScriptSave,    NULL, "SCRIPTSAVE,<slot> -- save a loaded script's buffer to flash"},
   {"SCRIPTRESTORE", CMDfunction, -1, (void *)cmdScriptRestore, NULL, "SCRIPTRESTORE,<slot> -- reload a slot's buffer from flash"},
+  {"SCRIPTERASE",   CMDfunction, -1, (void *)cmdScriptErase,   NULL, "SCRIPTERASE,<slot> -- delete a slot's saved copy from flash (RAM copy untouched)"},
 
   {NULL}  // Sentinel — must remain as the last entry
 };
@@ -1081,6 +1084,28 @@ static void cmdScriptRestore(void)
   if (result != SCRIPT_RESTORE_OK)
   {
     cp.sendNAK(ERR_NOSDCARD);   // no saved file for this slot (or it failed to parse)
+    return;
+  }
+  cp.sendACK();
+}
+
+// SCRIPTERASE,<slot> — delete a slot's saved copy so it is no longer
+// restored (and auto-enabled) at boot. Only the flash copy: whatever is
+// loaded in RAM keeps running until disabled or overwritten. ACKs when there
+// was nothing saved too, so it's safe to call unconditionally.
+static void cmdScriptErase(void)
+{
+  if (!cp.checkExpectedArgs(1)) return;
+
+  int slot;   // see cmdScriptSave()'s comment above for why this isn't cp.getValue(&slot, 0, ...)
+  if (!cp.getValue(&slot) || slot < 0 || slot >= GAACE_SCRIPT_SLOTS)
+  {
+    cp.sendNAK(ERR_BADARG);
+    return;
+  }
+  if (!eraseScriptSlotFromFlash((uint8_t)slot))
+  {
+    cp.sendNAK(ERR_NOSDCARD);   // filesystem not mounted, or a file couldn't be removed
     return;
   }
   cp.sendACK();
@@ -1795,6 +1820,22 @@ ScriptRestoreResult restoreScriptSlotFromFlash(uint8_t slot)
   if (!finalizeScriptSlot(slot, (uint16_t)fileSize)) return SCRIPT_RESTORE_NONE;
   s.syscallHash = savedHash;
   return SCRIPT_RESTORE_OK;
+}
+
+// eraseScriptSlotFromFlash — remove a slot's .bin and .sig. True if neither
+// exists afterwards (including "nothing was saved"); false only if the
+// filesystem isn't mounted or a removal failed.
+bool eraseScriptSlotFromFlash(uint8_t slot)
+{
+  if (!scriptFSReady || slot >= SCRIPT_SLOTS) return false;
+
+  char path[20];
+  char sigPath[20];
+  scriptSlotPath(slot, path, sizeof(path));
+  scriptSigPath(slot, sigPath, sizeof(sigPath));
+  if (scriptFS.exists(path))    scriptFS.remove(path);
+  if (scriptFS.exists(sigPath)) scriptFS.remove(sigPath);
+  return !scriptFS.exists(path) && !scriptFS.exists(sigPath);
 }
 
 // =============================================================================

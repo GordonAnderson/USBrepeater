@@ -518,6 +518,7 @@ every registered command and its help string, `HELP,<cmd>` looks up one.
 | `GSCRIPTST,<slot>` | `loaded(0\|1),lastStatus` for one script slot |
 | `SCRIPTSAVE,<slot>` | Save a loaded slot's buffer to on-chip flash (survives reboot/power loss) |
 | `SCRIPTRESTORE,<slot>` | Reload a slot's buffer from flash now (also attempted automatically at boot); refused if it was compiled against a different syscall table than this firmware has |
+| `SCRIPTERASE,<slot>` | Delete a slot's saved copy so it is no longer restored (and auto-enabled) at boot; the copy loaded in RAM keeps running until disabled. ACKs if nothing was saved |
 | `GCMDS` | List all commands and help strings |
 | `HELP,<cmd>` | Help for one command |
 | `TLIST` / `?TENA` / `?TINT` / `TTRIG` / `TDELAY` / `TSTOPALL` / `TSTARTALL` / `TREM` | Thread introspection/control (see GAACE_Core's `threadCommands`) — also how the ADC demo's `Script0` is started/stopped/re-timed: `?TENA,Script0,...` / `?TINT,Script0,...` |

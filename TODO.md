@@ -1009,6 +1009,34 @@ a new constraint.
             unattended, enabled by default per the restore design) with
             no commands sent after boot; slots never saved (2, 3) stayed
             unloaded as expected.
+      - [x] **Real power-loss test (2026-11-05)** — the original
+            motivating use case. A script that sets DIO to output-high once
+            (guarded by a `var` flag) was saved to slot 1 and the board's
+            power fully removed (USB and the Hub Carrier supply). After
+            power returned, with no commands sent, DIO read output-high
+            (power-up default is input/low) and the slot showed restored,
+            enabled, `VM_HALTED`. Scripts can configure the board on their
+            own at power-up.
+      - [x] **Added (2026-11-05): `SCRIPTERASE,<slot>`.** There was no
+            way to remove a saved script — only overwrite it — so a test or
+            unwanted script would come back and auto-enable on every boot
+            (found when the slot 0 demo, saved during the persistence test,
+            was still auto-running and sending `SETVAL` to a real MIPS).
+            Deletes the slot's `.bin` and `.sig`; the RAM copy keeps
+            running until disabled. Hardware-tested: erase ACKs (also with
+            nothing saved), `SCRIPTRESTORE` then NAKs, a bad slot NAKs, and
+            an erased slot 0 falls back to the compiled-in demo (disabled)
+            at boot.
+      - [x] **`cmd()`/`cmdf()` on hardware (2026-11-05).** A script
+            calling the repeater's own commands ran correctly:
+            `cmdf("GADC")` returned the averaged counts as a float,
+            `cmd("SADCINT", ...)` wrote through the command processor and
+            `cmd("GADCINT")` read it back, and the result drove DIO via the
+            syscalls. Run cadence measured at exactly the 1000 ms interval,
+            plus one immediate run when armed. Limitation: `cmd()` can only
+            pass numbers, so commands that take `TRUE`/`FALSE` (`SDIODIR`,
+            `SDOUT`, `SADCEN`) can't be driven from a script through `cmd()`;
+            DIO has syscalls for this, the others don't.
 - [x] **Resolved (2026-10-28): syscall table + persisted-script safety.**
       The six script syscalls are now one `scriptSyscalls[]` table in
       `setup()` (`GAACEScript::SyscallDesc`: name, function, argc, returns
