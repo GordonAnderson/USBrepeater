@@ -530,7 +530,12 @@ per-device Ethernet data ports, the second switchable USB data port,
 digital I/O, script persistence across reboot, and the AIN range/REF-
 correction/low-pass-filter work are all implemented (above) — see
 [TODO.md](TODO.md) for exactly what's real-hardware-verified versus
-compile-verified-only so far. Remaining open work there: real-hardware
-validation of the 4-port hub, the downstream ring buffers, both
-switchable USB ports together, the per-device Ethernet
-ports, DIO, and the REF correction/filter.
+compile-verified-only so far. As of 2026-11-05, the first Hub Carrier
+board exists and most of this is now real-hardware-verified: hub bring-up,
+2 of 4 downstream ports (both switchable USB paths and both Ethernet data
+ports, with "last speaker wins" confirmed across USB/Ethernet on the same
+device), script persistence across a real reboot, and DIO
+(control-port and script-syscall paths both). Remaining open work:
+ports 3/4 (need a 3rd/4th downstream device), simultaneous multi-port TCP
+load, and the AIN REF-correction/filter work (needs a known calibration
+signal, not yet applied).

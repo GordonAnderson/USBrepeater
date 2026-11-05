@@ -451,14 +451,23 @@ it's connected (same "stays buffered until read" policy as everything else,
 not forced onto `Serial` or discarded). `GETHSTAT` extended to report one
 `dataConnected` flag per device instead of one overall. Build: `pio run`
 clean, no new warnings.
-- [ ] **Not yet tested on real hardware** — no 4-port hub/4 downstream
-      devices or a second machine with real routes to 4 extra TCP ports
-      here yet. First real test, once hardware arrives: open a TCP
-      connection to each of the 4 data ports concurrently, with `SDEV`
-      pointed at just one of the 4 devices, and confirm every connection
-      only ever sees its own device's traffic regardless of which one
-      `SDEV` currently selects — the actual point of giving each device its
-      own port instead of sharing one.
+- [x] **Hardware-tested (2026-11-05), partially** — real Hub Carrier
+      board, 2 real downstream devices (ports 1/2), DHCP lease acquired
+      (`GETHSTAT` -> `LINKUP,DHCP,192.168.68.59,...`), same machine
+      reachable over the LAN. Confirmed: TCP control port (5000) gives
+      identical responses to the USB control port; TCP data ports 5001/
+      5002 each reach their own device with correct, distinct `GVER`
+      replies; **data-port reachability confirmed independent of `SDEV`**
+      — pointed `Serial` at device 3 (empty) and TCP port 5001 still
+      reached device 1 correctly, exactly the "no switching needed"
+      design point. Also re-confirmed "last speaker wins" reply routing,
+      generalized to the per-device-port design: alternating
+      USB -> Ethernet -> USB requests to the *same* device each got their
+      reply back on the transport that sent that request, no leakage
+      either direction. Still not yet tested: ports 3/4's TCP data ports
+      (need a 3rd/4th device), concurrent *simultaneous* TCP connections
+      to multiple data ports at once (today's test was sequential, one
+      connection at a time), and sustained traffic/load.
 
 ### Device (downstream) side
 
