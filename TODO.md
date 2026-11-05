@@ -209,10 +209,39 @@ again if firmware-side identification is ever revisited.)
       traffic to the same real device, and the `ActiveDevice`/
       `ActiveDevice2` mutual-exclusivity check correctly rejecting a
       conflicting assignment (`SDEV2,1` NAKed while `SDEV` already held
-      port 1; `SDEV,2` NAKed while `SDEV2` already held port 2). Not yet
-      tested: all 4 ports with real devices simultaneously, hot-plugging
-      each individually, `bytesWaiting`/`bytesDropped` under actual load,
-      and `ADCThread` continuing to run throughout a multi-device session.
+      port 1; `SDEV,2` NAKed while `SDEV2` already held port 2). Also
+      confirmed a real hot-unplug/replug cycle on real hardware: fully
+      unplugging the one device correctly dropped `GDEVSTAT`/`GLINK` to
+      `FALSE`, and replugging it (into either physical connector) had it
+      re-enumerate, `GVER` passthrough work again, with `ADCUpdate` and the
+      restored scripts (`Script0`/`Script1`) still ticking throughout —
+      the whole-board state is unaffected by one port's USB device
+      disconnecting.
+
+      **Important finding, not a bug: `DevPort` 1-4 is not tied to which
+      physical USB-A connector a device is in.** Confirmed by reading
+      `USBHost_t36`'s own source (`enumeration.cpp`'s `claim_drivers()`):
+      an attached device is handed to whichever `USBSerial_BigBuffer`
+      instance (`userial1..userial4`) is first in an internal
+      `available_drivers` list — ordered purely by construction/claim
+      order, never consulting `Device_t::hub_port` (which the serial
+      driver's own `claim()` never reads either). With one device
+      connected, it will essentially always land on `userial1`
+      (`DevPort 1`) no matter which of the 4 physical ports it's actually
+      plugged into — confirmed directly: moving the single device from
+      port 1 to port 2 left `GDEVSTAT`/`GDEV` reporting port 1 unchanged,
+      because nothing else was occupying `userial1` to force it onto
+      `userial2`. **This means single-device port-shuffling cannot test
+      `DevPort` 2/3/4's code paths at all** — reaching them requires
+      *multiple simultaneously-connected* devices (so earlier `userial*`
+      slots are already claimed), not moving one device between
+      connectors. Still not yet tested: all 4 ports with real devices
+      simultaneously, `bytesWaiting`/`bytesDropped` under actual load, and
+      whether/how a device's physical port can be recovered at all if a
+      future feature ever needs it (today's architecture deliberately
+      doesn't try — see the `hub_port`-is-protected note above, now backed
+      by this confirmation that nothing downstream of that even attempts
+      to use it).
 - [ ] `SDEV`'s reply-delivery-on-switch behavior (the core of the "nothing
       is lost" design) only really proves itself with a device that
       actually sends meaningful unsolicited chatter while not selected —
