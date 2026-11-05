@@ -235,13 +235,30 @@ again if firmware-side identification is ever revisited.)
       `DevPort` 2/3/4's code paths at all** — reaching them requires
       *multiple simultaneously-connected* devices (so earlier `userial*`
       slots are already claimed), not moving one device between
-      connectors. Still not yet tested: all 4 ports with real devices
-      simultaneously, `bytesWaiting`/`bytesDropped` under actual load, and
-      whether/how a device's physical port can be recovered at all if a
-      future feature ever needs it (today's architecture deliberately
-      doesn't try — see the `hub_port`-is-protected note above, now backed
-      by this confirmation that nothing downstream of that even attempts
-      to use it).
+      connectors. Still not yet tested: whether/how a device's physical
+      port can be recovered at all if a future feature ever needs it
+      (today's architecture deliberately doesn't try — see the
+      `hub_port`-is-protected note above, now backed by this confirmation
+      that nothing downstream of that even attempts to use it).
+
+      **Hardware-tested (2026-11-05), second device added — exercises
+      `DevPort 2` for the first time.** With a second real MIPS device
+      plugged into a different physical port, `userial1` was already
+      claimed by the first device, so it correctly landed on `userial2`
+      (`DevPort 2`): `GDEVSTAT` showed both `1,TRUE` and `2,TRUE`
+      simultaneously (`3`/`4` still `FALSE`), and `Serial`/`SerialUSB2`
+      bridged two *different* real devices at once with correct, distinct
+      `GVER` replies (`Version 1.269,Oct 30,2026` vs.
+      `Version 1.262,Feb 7,2026`). Then swapped which switchable port
+      pointed at which device (`SDEV`/`SDEV2`, routed through a spare port
+      to dodge the mutual-exclusivity check) and confirmed the replies
+      swapped correctly too — no port/device cross-wiring. `ADCUpdate` and
+      the restored scripts kept ticking throughout, `bytesDropped` stayed
+      `0` on both. Still not yet tested: ports 3/4 (need a 3rd/4th
+      device), `bytesWaiting`/`bytesDropped` under actual sustained load,
+      and hot-unplugging one of two simultaneously-connected devices
+      specifically (today's hot-replug test, above, only ever had one
+      device in play at a time).
 - [ ] `SDEV`'s reply-delivery-on-switch behavior (the core of the "nothing
       is lost" design) only really proves itself with a device that
       actually sends meaningful unsolicited chatter while not selected —
