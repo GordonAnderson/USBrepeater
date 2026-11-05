@@ -368,12 +368,43 @@ yet to test against.** `src/USBrepeater.cpp` Section 5:
       factory default) disables the correction entirely — until `CALREF`
       is run, the channel is wired but unused, exactly as before this
       change.
-- [ ] **Not yet tested on real hardware** — no AIN/REF signal here yet to
-      apply known voltages to. First real test, once hardware arrives: the
-      on-hardware calibration pass above (fit `SADCM`/`SADCB` against known
-      voltages), then `CALREF` with the REF input in its known-good state,
-      then confirm `GADC`'s reported value tracks a deliberately drifted
-      3.3V rail correctly with the correction enabled vs. not.
+- [x] **First power-supply test (2026-11-05): the AIN path works and is
+      linear, but its gain and offset don't match the design.** A bench
+      supply on AIN, stepped 0-4 V in 1 V steps (default scaling, filter
+      and REF correction off):
+
+      | Supply | Counts |
+      |---|---|
+      | 0 V | 2742.7 |
+      | 1 V | 2999.7 |
+      | 2 V | 3256.5 |
+      | 3 V | 3514.6 |
+      | 4 V | 3770.2 |
+      | 5 V | 4028.4 |
+
+      That's 256-258 counts per volt (very linear) with 0 V at 2743 counts,
+      so the ADC saturates at about +5.3 V. The schematic's front end
+      (J1 -> R4 49.9k into a node with R5 15.4k to +3.3 V and R6 21.1k to
+      GND, buffered by U3A, an OPA2376 follower, then R9 10k / C1 1 nF into
+      A0) should give about 188 counts/V with 0 V near 2009 counts, a
+      ±10 V range. **Open: the user is checking the board against the
+      build** (part values/population on R4/R5/R6). Safety: U3 runs from
+      +3.3 V, so A0 can't exceed 3.3 V; inputs past ~5.3 V just saturate.
+      If the hardware is right as built, a two-point fit from this data is
+      `SADCM,0.003891` / `SADCB,-10.672`. Noise was about ±0.3 counts.
+      Still to do: calibration once the hardware is confirmed,
+      `CALREF`/REF-correction testing, and the filter on a noisy signal.
+- [x] **ADC-driven script tracking a real input (2026-11-05).** With the
+      ADC demo armed and `SADCCMD,SRFADRV,1` targeting a MIPS, the MIPS's
+      RF drive followed every supply step within one script run (3.71,
+      5.08, 6.45, 7.83, 9.20, then back down to 7.84) and never resent
+      during a 12 s steady hold (noise well under the 20-count threshold).
+      The log stopped after 26 s only because the MIPS host application
+      opened the same USB passthrough port mid-test; the board was fine.
+- [ ] **`GADCM`/`GADCB` show only 2 decimal places** (`CMDfloat`
+      formatting), so `GADCM` reads `0.01` for a slope of 0.003891 — a set
+      calibration can't be read back or verified. Fix before calibrating:
+      print these with enough significant digits (e.g. 6).
 
 ### Phase 3a — AIN low-pass filter (tunable without reflashing)
 
