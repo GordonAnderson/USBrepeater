@@ -500,7 +500,7 @@ every registered command and its help string, `HELP,<cmd>` looks up one.
 | `GADCEN` / `SADCEN,TRUE\|FALSE` | ADC-update master enable |
 | `GADCPIN` / `SADCPIN,<pin>` | ADC input pin |
 | `GADCINT` / `SADCINT,<mS>` | ADC update interval |
-| `GADCCMD` / `SADCCMD,<name>` | Command name sent to the downstream device |
+| `GADCCMD` / `SADCCMD,<name>[,<fixed args>...]` | Command prefix sent to the downstream device as `<prefix>,<value>`; extra arguments are joined with commas, e.g. `SADCCMD,SRFADRV,1` sends `SRFADRV,1,<value>` (19 characters max) |
 | `GADCM` / `SADCM,<m>` | ADC scale slope |
 | `GADCB` / `SADCB,<b>` | ADC scale offset |
 | `GADCFILTER` / `SADCFILTER,<mS>` | AIN low-pass filter time constant, mS (`0`=disabled); tunable live, no reflash |

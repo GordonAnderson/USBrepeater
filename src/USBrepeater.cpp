@@ -319,6 +319,8 @@ static void cmdSetDout(void);
 static void cmdScriptSave(void);
 static void cmdScriptRestore(void);
 static void cmdScriptErase(void);
+static void cmdGetAdcCmd(void);
+static void cmdSetAdcCmd(void);
 static void cmdGetDin(void);
 
 static int portLimits[] = {1, 65535};  // range check for ?ETHCTRLPORT / ?ETHDATAPORT
@@ -422,7 +424,8 @@ Command cmds[] =
   {"?ADCPIN",  CMDbyte,     -1, (void *)&data.AdcPin,      NULL, "ADC input pin (e.g. 14 for A0)"},
   {"GADCINT",  CMDfunction, -1, (void *)cmdGetAdcInterval, NULL, "Get ADC update interval, mS"},
   {"SADCINT",  CMDfunction, -1, (void *)cmdSetAdcInterval, NULL, "Set ADC update interval, mS"},
-  {"?ADCCMD",  CMDstr,      -1, (void *)&data.AdcCmdName,  NULL, "Command name sent to the downstream device"},
+  {"GADCCMD",  CMDfunction,  0, (void *)cmdGetAdcCmd,      NULL, "Get the command prefix sent to the downstream device"},
+  {"SADCCMD",  CMDfunction, -1, (void *)cmdSetAdcCmd,      NULL, "Set the command prefix, name[,fixed args...]; e.g. SADCCMD,SRFADRV,1 sends SRFADRV,1,<value>"},
   {"?ADCM",    CMDfloat,    -1, (void *)&data.AdcScaleM,   NULL, "ADC scale slope: value = M * counts + B"},
   {"?ADCB",    CMDfloat,    -1, (void *)&data.AdcScaleB,   NULL, "ADC scale offset: value = M * counts + B"},
   {"?ADCFILTER", CMDfloat,  -1, (void *)&data.AdcFilterTauMs, NULL, "AIN low-pass time constant, mS (0 = disabled); tunable live, no reflash"},
@@ -1086,6 +1089,47 @@ static void cmdScriptRestore(void)
     cp.sendNAK(ERR_NOSDCARD);   // no saved file for this slot (or it failed to parse)
     return;
   }
+  cp.sendACK();
+}
+
+// GADCCMD / SADCCMD,<name>[,<fixed arg>...] — the prefix ADCUpdate() and the
+// scale_send() syscall put before ",<value>". Extra arguments are joined back
+// with commas, so a channel-indexed downstream command works:
+// SADCCMD,SRFADRV,1 -> "SRFADRV,1,<value>". (A plain CMDstr accepts exactly
+// one token, which made such commands impossible to configure.)
+static void cmdGetAdcCmd(void)
+{
+  cp.sendACK(false);
+  cp.println(data.AdcCmdName);
+}
+
+static void cmdSetAdcCmd(void)
+{
+  int numArgs = cp.getNumArgs();
+  if (numArgs < 1) { cp.sendNAK(ERR_BADARG); return; }
+
+  char   buf[sizeof(data.AdcCmdName)];
+  size_t used = 0;
+  bool   ok   = true;
+  for (int i = 0; i < numArgs && ok; i++)
+  {
+    char *tok;
+    if (!cp.getValue(&tok)) { ok = false; break; }
+    size_t len = strlen(tok);
+    size_t sep = (i > 0) ? 1 : 0;
+    if (len == 0 || used + sep + len >= sizeof(buf)) ok = false;
+    else
+    {
+      if (sep) buf[used++] = ',';
+      memcpy(buf + used, tok, len);
+      used += len;
+    }
+    cp.ca->free(tok);
+  }
+  if (!ok) { cp.sendNAK(ERR_BADARG); return; }
+
+  buf[used] = '\0';
+  strcpy(data.AdcCmdName, buf);
   cp.sendACK();
 }
 

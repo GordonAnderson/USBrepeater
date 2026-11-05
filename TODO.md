@@ -1070,11 +1070,20 @@ a new constraint.
       `library.json` for now; existing GAACE libraries aren't consistent
       (`GAACE_Core` is GPLv3, `ArduinoThread` is Public Domain), so this
       needs an actual decision, not just carrying the placeholder forward
-- [ ] Real-hardware validation against an actual downstream device — on
-      2026-10-05, slot 0 was confirmed loaded and alive on real Teensy 4.1
-      hardware (`GSCRIPTST,0` -> `TRUE,0`), which is further than the
-      dry-run-only verification this item originally described. Still not
-      tested with the script actually enabled and sending to a real
-      downstream device — none was connected during that session — so the
-      threshold/persistence logic itself remains dry-run-verified only, not
-      hardware-verified.
+- [x] **Real-hardware validation against an actual downstream device
+      (2026-11-05).** Target: a MIPS unit (disabled system, so safe) via
+      `SRFADRV,1,<0-100>`, the command the user chose. Needed one fix first:
+      `?ADCCMD` was a plain `CMDstr`, which takes exactly one token, so a
+      channel-indexed prefix like `SRFADRV,1` couldn't be set at all.
+      Replaced with `GADCCMD`/`SADCCMD` functions that join extra arguments
+      with commas (`SADCCMD,SRFADRV,1`), still limited to the 19-character
+      `AdcCmdName` (an over-long prefix is NAKed and leaves the old one).
+      Then verified, reading the MIPS back through the passthrough with
+      `GRFADRV,1`: the ADC demo script (slot 0) sent the scaled reading
+      (MIPS went 0.00 -> 3.97, matching `GADC`'s 3.97), the MIPS's reply
+      was swallowed (`bytesWaiting` 0), and with a steady input it did not
+      resend over 3 runs, confirming its >20-count change threshold. The
+      unconditional `ADCUpdate` thread (`SADCEN,TRUE`) also delivered 3.97.
+      The value isn't clamped: with the ±10 V input range a negative or
+      out-of-range reading is sent as-is, so the downstream device must
+      reject it, or a script should clamp before sending.
