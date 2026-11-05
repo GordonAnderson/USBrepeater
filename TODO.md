@@ -254,11 +254,38 @@ again if firmware-side identification is ever revisited.)
       to dodge the mutual-exclusivity check) and confirmed the replies
       swapped correctly too — no port/device cross-wiring. `ADCUpdate` and
       the restored scripts kept ticking throughout, `bytesDropped` stayed
-      `0` on both. Still not yet tested: ports 3/4 (need a 3rd/4th
-      device), `bytesWaiting`/`bytesDropped` under actual sustained load,
-      and hot-unplugging one of two simultaneously-connected devices
+      `0` on both. Still not yet tested: a 4th device,
+      `bytesWaiting`/`bytesDropped` under actual sustained load, and
+      hot-unplugging one of two simultaneously-connected devices
       specifically (today's hot-replug test, above, only ever had one
       device in play at a time).
+
+      **Fixed (2026-11-05): devices with their own internal USB hub never
+      enumerated — a software bug, not the board.** A 3rd MIPS unit (and
+      the isolated electrometer, likely the same cause) was never detected
+      on connectors 3/4, which first looked like a board assembly fault.
+      Diagnosed with a one-off build routing `USBHost_t36`'s own
+      enumeration trace to `SerialUSB2`
+      (`PLATFORMIO_BUILD_FLAGS="-D USBHOST_PRINT_DEBUG
+      -D USBHDBGSerial=SerialUSB2" pio run -t upload`, no repo change):
+      the USB2514B correctly saw the connection on its port 3 and the
+      device enumerated at 480 Mbit/s, so the connector was fine, but it
+      identified as VID `1A40`/PID `0101`, a class-9 "USB 2.0 Hub"
+      (Terminus FE1.1s). That MIPS unit has its own internal hub. The
+      firmware had exactly one `USBHub` driver (`hub1`), already claimed
+      by the board's own hub, so the nested hub was only offered to the
+      free `USBSerial` instances, which correctly rejected it, and nothing
+      behind it ever enumerated. A Mac handles nested hubs on its own,
+      which is why these devices worked when plugged straight in. Fix:
+      `hub2`-`hub5` added (one nested hub per downstream port), costing
+      about 4 KB RAM. Verified on hardware: all 3 MIPS units connected at
+      once (`GDEVSTAT` 1-3 `TRUE`), each reachable over USB and over its
+      own Ethernet data port (5001-5003) with distinct `GVER` replies
+      (v1.269, v1.262, v1.263). The nested-hub unit exposes a single CDC
+      device behind its hub, so it uses one `DevPort` like the others;
+      a device exposing several CDC devices would use more than one, so
+      4 such devices could exceed `DEVPORT_COUNT`. Still to retest: the
+      isolated electrometer with this fix.
 - [ ] `SDEV`'s reply-delivery-on-switch behavior (the core of the "nothing
       is lost" design) only really proves itself with a device that
       actually sends meaningful unsolicited chatter while not selected —

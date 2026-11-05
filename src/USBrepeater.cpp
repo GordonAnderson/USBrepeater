@@ -1155,7 +1155,16 @@ static void cmdScriptRestore(void)
 //  with the downstream devices' baud rate.
 
 USBHost             myusb;
+// One USBHub driver instance is needed per physical hub in the chain, not
+// just the board's own USB2514B (hub1): a downstream device with its own
+// internal hub (e.g. MIPS units built around an FE1.1s, VID 1A40) is
+// otherwise left unclaimed and nothing behind it ever enumerates. hub2-hub5
+// cover one nested hub per downstream port.
 USBHub              hub1(myusb);
+USBHub              hub2(myusb);
+USBHub              hub3(myusb);
+USBHub              hub4(myusb);
+USBHub              hub5(myusb);
 USBSerial_BigBuffer userial1(myusb);
 USBSerial_BigBuffer userial2(myusb);
 USBSerial_BigBuffer userial3(myusb);
