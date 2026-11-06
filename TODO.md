@@ -672,6 +672,18 @@ Facts this design relies on (per the user):
      detected, 21 recoveries (about 3 per stalled unplug, one per hub
      request, so about 0.3 s of extra delay). `GDEVPATH`'s hub rows now
      end with a `stallRecoveries` count.
+   - **Fixed (2026-11-06): commands to instruments went out 3.5 ms late.**
+     USBHost_t36 holds a partial USB packet for `DEFAULT_WRITE_TIMEOUT`
+     (3500 us) after the last byte, and a command line is always a partial
+     packet. The user's 900-point QUAD scan took 9.6 s through the Gateway
+     vs 3.7 s direct. Now `writeTimeOut(100)` on every instrument driver
+     (`setup()`). Measured through USB data port 1 to the QUAD: median
+     round trip 0.7 ms (`GNAME`/`GVER`, back to back). Every 100 ms two
+     commands take 15-19 ms instead; the control port never does and no
+     other requester was active (`GARBSTAT` exchanges matched the test's
+     own count), so this looks like the QUAD's own periodic work, which a
+     direct connection would see too. Not yet checked: the scan time
+     with the fix.
    - [ ] **The watchdog reads USBHub's private `sending_control_transfer`**
      (USBHost_t36.h is included with `#define private public`), so it is
      tied to this library version's member names: re-check it if the

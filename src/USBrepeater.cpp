@@ -2423,6 +2423,14 @@ void RepeaterModeSetup(void)
   // attach() is what lets the now-running host stack actually see it.
   UsbHubBoot::run();
   myusb.begin();                      // enables host port VBUS
+  // Send each line to the instrument right away. USBHost_t36 holds a
+  // partial USB packet until DEFAULT_WRITE_TIMEOUT (3500 us) after the last
+  // byte, hoping to fill it, so every command (always a partial packet) went
+  // out 3.5 ms late: a 900-point QUAD scan took 9.6 s through the Gateway
+  // vs 3.7 s direct (2026-11-06). The arbiter writes a whole line in one
+  // call, so 100 us (the library's own flush() value) still sends it as one
+  // packet. Persists across reconnects (a driver member, set once).
+  for (SlotSerial *d : drvPtr) d->writeTimeOut(100);
   UsbHubBoot::attach();
 }
 
