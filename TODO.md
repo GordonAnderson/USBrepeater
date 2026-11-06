@@ -5,13 +5,11 @@ files keep the working name USBrepeater; "USBrepeater" below means this
 firmware or the product. `GVER` and the factory-default `GNAME` now say
 `GAACEgateway`; a board with a saved name keeps it until `SNAME` + `SAVE`.
 
-**Hardware change (2026-11-05): the REF reference on `A1` is now 1.25 V**
-(was the 2.5 V ISL21070CIH325Z). No firmware change needed: the REF
-correction is ratiometric (`RefCal`/`REF_now`), so the reference voltage
-never appears in the math, and 1.25 V reads about 1550 counts at 12 bits,
-well within range. `RefCal` has to be captured (`CALREF`) on a board with
-the 1.25 V reference; nothing was captured on the 2.5 V design (factory
-default 0 = off). Comments and README updated.
+**REF reference on `A1`: 2.5 V (ISL21070CIH325Z), confirmed 2026-11-06.**
+A change to 1.25 V was noted on 2026-11-05, but that was a part-number
+mix-up; the board has, and will keep, the 2.5 V reference (reads 3110
+counts). The REF correction is ratiometric (`RefCal`/`REF_now`), so the
+firmware doesn't depend on the voltage either way.
 
 Design notes and open decisions for planned USBrepeater features. The
 architecture below (4-device hub + Ethernet) is a **settled design as of
@@ -452,11 +450,8 @@ yet to test against.** `src/USBrepeater.cpp` Section 5:
       -11.17 V to +10.93 V before the ADC clips. Then `CALREF` (RefCal =
       3110.06 counts), `SAVE`, and a reboot: all three values came back,
       and an unsaved change was discarded as expected.
-- [ ] **REF reads 3110 counts, about 2.51 V, not the expected ~1550
-      (1.25 V).** Either this board still has the 2.5 V reference, or
-      there's gain/a divider on the REF path. The correction is
-      ratiometric, so it works either way; this only matters for
-      confirming the hardware matches the 1.25 V change.
+- [x] **REF reads 3110 counts, about 2.51 V** — as expected for the 2.5 V
+      reference this board has (the 1.25 V note was a part-number mix-up).
 
 ### Phase 3a — AIN low-pass filter (tunable without reflashing)
 

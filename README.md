@@ -337,14 +337,12 @@ called on demand at any time, not just on `ADCThread`'s own schedule — the
 filter's real-world time constant stays correct regardless of which
 caller triggers a given read.
 
-**REF-channel ratiometric correction** — the board's 1.25 V precision
-reference (on `A1`; changed from 2.5 V in the original design) lets
-firmware cancel AIN gain drift against the Teensy's 3.3 V rail. The
-correction is a ratio of two readings of the same reference
-(`RefCal`/`REF_now`), so the firmware doesn't depend on the reference
-voltage; the 1.25 V reference reads about 1550 counts. `RefCal` must be
-captured on a board with the reference it actually has: a value captured
-against a 2.5 V reference is wrong for a 1.25 V board. Run `CALREF` once, with the REF input in its
+**REF-channel ratiometric correction** — the board's 2.5 V precision
+reference (ISL21070CIH325Z, on `A1`) lets firmware cancel AIN gain drift
+against the Teensy's 3.3 V rail. The correction is a ratio of two readings
+of the same reference (`RefCal`/`REF_now`), so the firmware doesn't depend
+on the reference voltage; the 2.5 V reference reads about 3110 counts.
+`RefCal` must be captured on the board it's used on. Run `CALREF` once, with the REF input in its
 known-good state, to capture the current reading into `RefCal` (`SAVE` to
 persist); from then on, `scaleAdcValue()` multiplies by
 `RefCal`/`REF_now` on every read. `GREFCAL` reads back the captured value;

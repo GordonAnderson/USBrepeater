@@ -98,8 +98,7 @@ typedef struct
 
   // ── REF-channel ratiometric correction ──────────────────────────────────
   //  See USBrepeater.cpp Section 5 (readRefCounts()/scaleAdcValue()). The
-  //  1.25V precision reference on A1 (2.5V in the original design) lets
-  //  firmware cancel AIN gain drift
+  //  2.5V precision reference on A1 lets firmware cancel AIN gain drift
   //  against the Teensy's 3.3V rail (both the ADC reference and the AIN
   //  summing network's offset reference): value_corrected = (RefCal /
   //  REF_now) * (AdcScaleM*counts + AdcScaleB). RefCal <= 0 disables the
