@@ -539,12 +539,18 @@ yet to test against.** `src/USBrepeater.cpp` Section 6d:
       Meter on the SMA: 0 V with output disabled, 5 V output high, 0 V
       output low. External source with direction input: 5 V reads `TRUE`
       and 0 V reads `FALSE` (3 reads each).
-- [ ] **Script-side DIO check still open.** A script already set DIO
-      output-high at power-up (power-loss test, Phase 5), but the full
-      sequence via `dio_set_dir()`/`dio_write()`/`dio_read()`, checked
-      against `GDIODIR`/`GDOUT`/`GDIN` on the control port, hasn't been
-      run. Disconnect any external source first: the script drives the
-      line.
+- [x] **Script-side DIO test on real hardware (2026-11-06).** Three
+      scripts in slot 1 (RAM only), each checked against the control port
+      and a meter on the SMA:
+
+      | Script | `r = dio_read()` | `GDIODIR` / `GDOUT` / `GDIN` | Meter |
+      |---|---|---|---|
+      | `dio_set_dir(true); dio_write(true);` | 1 | TRUE / TRUE / TRUE | 5 V |
+      | `dio_write(false);` | 0 | TRUE / FALSE / FALSE | 0 V |
+      | `dio_write(true); dio_set_dir(false);` | 0 | FALSE / TRUE / FALSE | 0 V |
+
+      Scripts and the control port share one state, and turning the
+      output off releases the line even with the level set high.
 
 ### Phase 5 — Documentation follow-up
 
