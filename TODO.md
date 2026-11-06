@@ -531,13 +531,20 @@ yet to test against.** `src/USBrepeater.cpp` Section 6d:
       edge triggers an ADC sample/send" as a future idea) doesn't need a
       board respin. Kept the V1 command/syscall handlers simple (static
       levels only); did not build the PWM/capture path now.
-- [ ] **Not yet tested on real hardware** — no DIO connector/line here yet
-      to test against. First real test, once hardware arrives: toggle
-      direction and level via `SDIODIR`/`SDOUT`, confirm `GDIN` reads back
-      correctly in both directions, then repeat the same sequence from a
-      script via `dio_set_dir()`/`dio_write()`/`dio_read()` and confirm
-      `GDIODIR`/`GDOUT` on the control port agree with whatever the script
-      just set (the actual point of sharing one function per operation).
+- [x] **Control-port test on real hardware (2026-11-06).** Line open,
+      loopback through `GDIN`: with direction input, `SDOUT,TRUE` leaves
+      the line low; `SDIODIR,TRUE` drives it high; `SDOUT` FALSE/TRUE and
+      `1`/`0` follow on `GDIN` and `GDOUT`; `SDOUT,maybe` NAKs;
+      `SDIODIR,FALSE` releases the line (stays low with `SDOUT,TRUE`).
+      Meter on the SMA: 0 V with output disabled, 5 V output high, 0 V
+      output low. External source with direction input: 5 V reads `TRUE`
+      and 0 V reads `FALSE` (3 reads each).
+- [ ] **Script-side DIO check still open.** A script already set DIO
+      output-high at power-up (power-loss test, Phase 5), but the full
+      sequence via `dio_set_dir()`/`dio_write()`/`dio_read()`, checked
+      against `GDIODIR`/`GDOUT`/`GDIN` on the control port, hasn't been
+      run. Disconnect any external source first: the script drives the
+      line.
 
 ### Phase 5 — Documentation follow-up
 
