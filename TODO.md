@@ -736,9 +736,23 @@ Open questions:
       the arbiter is needed. **Answered (2026-11-05, per the user): no,
       ASCII text only.** No raw mode for now; host traffic can be handled
       line by line. Revisit if a host ever needs binary transfers.
-- [ ] Host-side features (`SDEV` by name, name-to-TCP-port lookup) are
+- [x] Host-side features (`SDEV` by name, name-to-TCP-port lookup) are
       to be decided. Don't switch a data port while a host app has it
-      open.
+      open. **Done (2026-11-05, per the user):** `SDEV,<name>` /
+      `SDEV2,<name>` pin a data port to an instrument by `GNAME`
+      (overrides the number; `SDEV,<n>` or `SDEV,0` clears it), and
+      `GDEVPORT,<name>` returns its TCP data port. Names saved in
+      `ExtData` (`DevName`/`Dev2Name`; `EXT_SIGNATURE` bumped to
+      `0x5A5AE002`, since the record grew the same day it was added).
+      `SDEV`/`SDEV2` refuse a setting that collides now (same name, same
+      pinned slot, or a name in the other port's pinned slot); a later
+      collision leaves data port 2 idle. Hardware-tested: swapped both data
+      ports by name (each answered the right `GNAME`), all three collision
+      cases NAKed, an absent name left data port 1 idle without touching
+      data port 2, `GDEVPORT,QUAD` -> 5001 and TCP 5001 answered `QUAD`;
+      restored to automatic afterwards. Not yet tested: a named data port
+      following its instrument through a replug (same `slotByName()` path
+      the ADC target and scripts already use).
 - [ ] Unsolicited device output and no-reply timeouts under the arbiter.
 
 ## Settled design: 4 downstream devices via hub + Ethernet

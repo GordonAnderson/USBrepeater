@@ -174,7 +174,7 @@ using namespace qindesign::network;
 
 // Active runtime data. Loaded from EEPROM on boot; written back by SAVE.
 Data data;
-ExtData ext = { "", EXT_SIGNATURE };   // see ExtData in USBrepeater.h
+ExtData ext = { "", "", "", EXT_SIGNATURE };   // see ExtData in USBrepeater.h
 
 // Default (factory) values written whenever EEPROM is un-initialised or its
 // signature is invalid (first boot, or a blank chip).
@@ -307,6 +307,7 @@ static void cmdGetEthGw(void);
 static void cmdSetEthGw(void);
 static void cmdGetEthStat(void);
 static void cmdGetDev(void);
+static void cmdGetDevPort(void);
 static void cmdSetDev(void);
 static void cmdGetDev2(void);
 static void cmdSetDev2(void);
@@ -338,6 +339,7 @@ static int portLimits[] = {1, 65535};  // range check for ?ETHCTRLPORT / ?ETHDAT
 // already range-checked by cp.getValue() or a persisted Data field.
 bool     isDeviceConnected(uint8_t dev1based);
 uint8_t  effectiveDev(uint8_t which);   // data port 1 or 2 -> slot it's bridged to now (1-based, 0 = none)
+int8_t   slotByName(const char *name);   // GNAME -> slot (0-based), -1 if not connected
 uint16_t deviceBytesWaiting(uint8_t dev1based);
 uint32_t deviceBytesDropped(uint8_t dev1based);
 void     reinitDeviceBaud(uint8_t dev1based, uint32_t baud);
@@ -393,10 +395,11 @@ Command cmds[] =
   //  why. SADCDEV is a completely independent selection for ADCThread/the
   //  script demo, so background monitoring of one device isn't interrupted
   //  by switching either port's interactive focus.
-  {"GDEV",     CMDfunction, -1, (void *)cmdGetDev,         NULL, "Get Serial's active downstream device, " DEVPORT_RANGE_STR},
-  {"SDEV",     CMDfunction, -1, (void *)cmdSetDev,         NULL, "Set Serial's active downstream device, " DEVPORT_RANGE_STR " (must differ from ActiveDevice2)"},
-  {"GDEV2",    CMDfunction, -1, (void *)cmdGetDev2,        NULL, "Get SerialUSB2's active downstream device, " DEVPORT_RANGE_STR},
-  {"SDEV2",    CMDfunction, -1, (void *)cmdSetDev2,        NULL, "Set SerialUSB2's active downstream device, " DEVPORT_RANGE_STR " (must differ from ActiveDevice)"},
+  {"GDEV",     CMDfunction, -1, (void *)cmdGetDev,         NULL, "Get data port 1's device: <0=auto|slot|name>,<effective slot>"},
+  {"SDEV",     CMDfunction, -1, (void *)cmdSetDev,         NULL, "Set data port 1's device: 0=automatic, slot " DEVPORT_RANGE_STR ", or an instrument name (its GNAME)"},
+  {"GDEV2",    CMDfunction, -1, (void *)cmdGetDev2,        NULL, "Get data port 2's device: <0=auto|slot|name>,<effective slot>"},
+  {"SDEV2",    CMDfunction, -1, (void *)cmdSetDev2,        NULL, "Set data port 2's device: 0=automatic, slot " DEVPORT_RANGE_STR ", or an instrument name (its GNAME)"},
+  {"GDEVPORT", CMDfunction,  1, (void *)cmdGetDevPort,     NULL, "TCP data port of the instrument whose GNAME is <name>, NAK if not connected"},
   {"GADCDEV",  CMDfunction, -1, (void *)cmdGetAdcDev,      NULL, "Get ADCThread/script target: <slot " DEVPORT_RANGE_STR " or name>,<effective slot>"},
   {"SADCDEV",  CMDfunction, -1, (void *)cmdSetAdcDev,      NULL, "Set ADCThread/script target: slot " DEVPORT_RANGE_STR ", or an instrument name (its GNAME)"},
   {"GDEVSTAT", CMDfunction,  0, (void *)cmdGetDevStat,     NULL, "Per-port status: dev,connected,bytesWaiting,bytesDropped"},
@@ -561,10 +564,12 @@ static void cmdGetLink2(void)
 // A non-zero value pins the port to that slot. GDEV/GDEV2 reply
 // "<setting>,<effective slot>" (effective 0 = nothing to talk to).
 // -----------------------------------------------------------------------------
-static void printDevSelection(uint8_t setting, uint8_t which)
+static void printDevSelection(uint8_t which)
 {
+  const char *name = (which == 2) ? ext.Dev2Name : ext.DevName;
   cp.sendACK(false);
-  cp.print((int)setting);
+  if (name[0] != '\0') cp.print(name);
+  else                 cp.print((int)((which == 2) ? data.ActiveDevice2 : data.ActiveDevice));
   cp.print(",");
   cp.println((int)effectiveDev(which));
 }
@@ -572,43 +577,82 @@ static void printDevSelection(uint8_t setting, uint8_t which)
 static void cmdGetDev(void)
 {
   if (!cp.checkExpectedArgs(0)) return;
-  printDevSelection(data.ActiveDevice, 1);
-}
-
-static void cmdSetDev(void)
-{
-  if (!cp.checkExpectedArgs(1)) return;
-
-  int n;
-  if (!cp.getValue(&n, 0, DEVPORT_COUNT) || (n != 0 && n == (int)data.ActiveDevice2))
-  {
-    cp.sendNAK(ERR_BADARG);
-    return;
-  }
-
-  data.ActiveDevice = (uint8_t)n;
-  cp.sendACK();
+  printDevSelection(1);
 }
 
 static void cmdGetDev2(void)
 {
   if (!cp.checkExpectedArgs(0)) return;
-  printDevSelection(data.ActiveDevice2, 2);
+  printDevSelection(2);
 }
 
-static void cmdSetDev2(void)
+// SDEV,<0-8|name> / SDEV2,<0-8|name>. Refused if the two data ports would
+// end up on the same device right now: the same name, the same pinned
+// slot, or a name whose instrument currently sits in the other port's
+// pinned slot (and vice versa).
+static void setDevSelection(uint8_t which)
 {
   if (!cp.checkExpectedArgs(1)) return;
 
-  int n;
-  if (!cp.getValue(&n, 0, DEVPORT_COUNT) || (n != 0 && n == (int)data.ActiveDevice))
+  char *tok;
+  if (!cp.getValue(&tok)) { cp.sendNAK(ERR_BADARG); return; }
+
+  bool numeric = (tok[0] != '\0');
+  for (const char *c = tok; *c; c++) if (*c < '0' || *c > '9') { numeric = false; break; }
+
+  uint8_t &num      = (which == 2) ? data.ActiveDevice2 : data.ActiveDevice;
+  char    *name     = (which == 2) ? ext.Dev2Name : ext.DevName;
+  uint8_t  otherNum = (which == 2) ? data.ActiveDevice : data.ActiveDevice2;
+  char    *otherName = (which == 2) ? ext.DevName : ext.Dev2Name;
+
+  bool ok = true;
+  uint8_t newNum = num;
+  char    newName[EXT_NAME_LEN];
+  strcpy(newName, name);
+  if (numeric)
   {
-    cp.sendNAK(ERR_BADARG);
-    return;
+    int n = atoi(tok);
+    if (n < 0 || n > DEVPORT_COUNT) ok = false;
+    else { newNum = (uint8_t)n; newName[0] = '\0'; }
+  }
+  else if (strlen(tok) < EXT_NAME_LEN) strcpy(newName, tok);
+  else ok = false;
+  cp.ca->free(tok);
+
+  if (ok)
+  {
+    // Where each port would point right now (pinned or named; automatic
+    // never collides, it skips the other port).
+    auto fixedSlot = [](uint8_t n, const char *nm) -> int {
+      if (nm[0] != '\0') return slotByName(nm);       // -1 if not connected
+      return (n >= 1) ? (int)n - 1 : -1;               // -1 = automatic
+    };
+    if (newName[0] != '\0' && otherName[0] != '\0' && strcasecmp(newName, otherName) == 0) ok = false;
+    int mine = fixedSlot(newNum, newName), theirs = fixedSlot(otherNum, otherName);
+    if (mine >= 0 && mine == theirs) ok = false;
   }
 
-  data.ActiveDevice2 = (uint8_t)n;
+  if (!ok) { cp.sendNAK(ERR_BADARG); return; }
+  num = newNum;
+  strcpy(name, newName);
   cp.sendACK();
+}
+
+static void cmdSetDev(void)  { setDevSelection(1); }
+static void cmdSetDev2(void) { setDevSelection(2); }
+
+// GDEVPORT,<name> — the TCP data port of the instrument whose GNAME is
+// <name> (EthDataPortBase + slot - 1), NAK if none is connected.
+static void cmdGetDevPort(void)
+{
+  if (!cp.checkExpectedArgs(1)) return;
+  char *tok;
+  if (!cp.getValue(&tok)) { cp.sendNAK(ERR_BADARG); return; }
+  int8_t s = slotByName(tok);
+  cp.ca->free(tok);
+  if (s < 0) { cp.sendNAK(ERR_BADARG); return; }
+  cp.sendACK(false);
+  cp.println(data.EthDataPortBase + s);
 }
 
 // -----------------------------------------------------------------------------
@@ -625,7 +669,6 @@ static void cmdSetDev2(void)
 // e.g. "QUAD,1" or "3,3" (effective 0 = the named instrument isn't
 // connected). The name is saved by SAVE, in the ExtData record.
 // -----------------------------------------------------------------------------
-int8_t slotByName(const char *name);   // Section 6
 
 // The slot (0-based) ADCThread / the script demo send to right now, or
 // DEVPORT_COUNT if a named target isn't connected.
@@ -1493,19 +1536,40 @@ static void updateSlotMap(void)
 // -----------------------------------------------------------------------------
 static void resolveDataPorts(uint8_t *sel1, uint8_t *sel2)   // 0-based; DEVPORT_COUNT = none
 {
+  // A name (SDEV,<name>) wins over the number; a number 1-8 pins a slot;
+  // 0 with no name is automatic. A named instrument that isn't connected
+  // leaves its data port with nothing to bridge.
+  bool named1 = ext.DevName[0]  != '\0';
+  bool named2 = ext.Dev2Name[0] != '\0';
   uint8_t a = data.ActiveDevice, b = data.ActiveDevice2;
-  *sel1 = (a >= 1 && a <= DEVPORT_COUNT) ? (uint8_t)(a - 1) : DEVPORT_COUNT;
-  *sel2 = (b >= 1 && b <= DEVPORT_COUNT) ? (uint8_t)(b - 1) : DEVPORT_COUNT;
 
-  if (a == 0)
+  if (named1)
+  {
+    int8_t s = slotByName(ext.DevName);
+    *sel1 = (s >= 0) ? (uint8_t)s : DEVPORT_COUNT;
+  }
+  else *sel1 = (a >= 1 && a <= DEVPORT_COUNT) ? (uint8_t)(a - 1) : DEVPORT_COUNT;
+
+  if (named2)
+  {
+    int8_t s = slotByName(ext.Dev2Name);
+    *sel2 = (s >= 0) ? (uint8_t)s : DEVPORT_COUNT;
+  }
+  else *sel2 = (b >= 1 && b <= DEVPORT_COUNT) ? (uint8_t)(b - 1) : DEVPORT_COUNT;
+
+  if (!named1 && a == 0)
     for (uint8_t s = 0; s < DEVPORT_COUNT; s++)
       if (slotConnected(s) && s != *sel2) { *sel1 = s; break; }
 
-  if (b == 0)
+  if (!named2 && b == 0)
     for (uint8_t s = 0; s < DEVPORT_COUNT; s++)
       if (slotConnected(s) && s != *sel1) { *sel2 = s; break; }
 
-  if (*sel2 == *sel1) *sel2 = DEVPORT_COUNT;   // defensive: SDEV/SDEV2 keep pinned values distinct
+  // Both ports can't bridge one device. SDEV/SDEV2 refuse a setting that
+  // collides when it's made; if a name and a pinned slot only collide
+  // later (the named instrument moved into the other port's slot), data
+  // port 1 keeps it and data port 2 goes idle.
+  if (*sel2 == *sel1) *sel2 = DEVPORT_COUNT;
 }
 
 uint8_t effectiveDev(uint8_t which)
@@ -3056,6 +3120,8 @@ static void loadExtSettings(void)
   if (te.Signature == EXT_SIGNATURE)
   {
     te.AdcTargetName[EXT_NAME_LEN - 1] = '\0';
+    te.DevName[EXT_NAME_LEN - 1]       = '\0';
+    te.Dev2Name[EXT_NAME_LEN - 1]      = '\0';
     ext = te;
   }
 }

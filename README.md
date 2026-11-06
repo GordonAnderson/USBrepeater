@@ -196,14 +196,27 @@ instruments in any two connectors, the two data ports reach them with no
 setup, transparent to the host software. Adding a device on a lower
 connector later shifts the assignment (a device added on connector 1 takes
 data port 1). `SDEV,<n>`/`SDEV2,<n>` with n = 1-8 pins a port to that
-slot instead; the other port, if automatic, skips it. `GDEV`/`GDEV2`
-reply `<setting>,<effective slot>`, e.g. `0,4` = automatic, currently slot
-4 (effective 0 = nothing connected to bridge). Don't switch a data port
-while a host app has it open: the app would suddenly be talking to a
-different instrument. **`ActiveDevice` and `ActiveDevice2` are kept
-mutually exclusive** — `SDEV`/`SDEV2` reject (NAK) a value that would pin
-both ports to the same slot, so a given device is never contended by more
-than one switchable USB port at once.
+slot instead; the other port, if automatic, skips it.
+
+**Or by name:** `SDEV,QUAD` / `SDEV2,IsoElectrometer` (an instrument's
+`GNAME`, case-insensitive) pins a data port to that instrument wherever
+it's plugged in, for setups where a given COM port must always reach a
+given system. While it's unplugged that data port has nothing to bridge.
+`SDEV,0` (automatic) or `SDEV,<n>` clears the name. `SAVE` keeps it.
+
+`GDEV`/`GDEV2` reply `<setting>,<effective slot>`: `0,4` = automatic,
+currently slot 4; `QUAD,1` = named, QUAD is in slot 1; effective 0 =
+nothing to bridge. Don't switch a data port while a host app has it open:
+the app would suddenly be talking to a different instrument. **The two
+data ports never bridge the same device** — `SDEV`/`SDEV2` refuse (NAK) a
+setting that would collide right now: the same name on both, the same
+pinned slot, or a name whose instrument is in the other port's pinned
+slot. If a name and a pinned slot only collide later (the instrument was
+moved), data port 1 keeps it and data port 2 goes idle.
+
+Over Ethernet, `GDEVPORT,<name>` returns an instrument's TCP data port
+(e.g. `GDEVPORT,QUAD` -> `5001`), so host software can find a system by
+name without knowing slots.
 Switching either delivers that port's buffered backlog on the very next
 tick, with no separate "flush" step — the firmware always flushes a
 selected port's backlog to whoever last spoke to it, so what built up
@@ -572,14 +585,15 @@ every registered command and its help string, `HELP,<cmd>` looks up one.
 | `GLINK` | `ActiveDevice`'s USB connection state (`TRUE`/`FALSE`) |
 | `GLINK2` | `ActiveDevice2`'s USB connection state (`TRUE`/`FALSE`) |
 | `GBAUD` / `SBAUD,<baud>` | Baud rate to the downstream device; set explicitly for Ethernet-only use |
-| `GDEV` / `SDEV,<n>` | Get/set which slot `Serial` is bridged to: 0 = automatic (lowest occupied slot, the default), 1-8 = pinned. `GDEV` replies `<setting>,<effective slot>`. `SDEV` rejects a pinned value equal to `ActiveDevice2` |
-| `GDEV2` / `SDEV2,<n>` | Same for `SerialUSB2`: 0 = automatic (next occupied slot after data port 1's), 1-8 = pinned. `SDEV2` rejects a pinned value equal to `ActiveDevice` |
+| `GDEV` / `SDEV,<n\|name>` | Get/set what data port 1 (`Serial`) is bridged to: 0 = automatic (lowest occupied slot, the default), 1-8 = a pinned slot, or an instrument name (its `GNAME`; follows it between connectors). `GDEV` replies `<setting>,<effective slot>`. `SDEV` refuses a setting that would put both data ports on the same device |
+| `GDEV2` / `SDEV2,<n\|name>` | Same for data port 2 (`SerialUSB2`); automatic = the next occupied slot after data port 1's |
 | `GADCDEV` / `SADCDEV,<n\|name>` | Get/set what `ADCThread`/the script demo targets: a slot (1-8) or an instrument name (its `GNAME`; follows it between connectors). `GADCDEV` replies `<setting>,<effective slot>`, e.g. `QUAD,1` (effective 0 = not connected). Setting a slot clears the name |
 | `GDEVSTAT` | One row per slot (1-8): `dev,connected,bytesWaiting,bytesDropped` |
 | `GARBSTAT` | Per-slot arbiter: `slot,busy,owner,exchanges,timeouts`. `owner` is who has the open exchange (`USB1`, `USB2`, `ETH`, `INT` = the repeater's ADC sends, `SCRIPT` = a script's `dcmd()`, or `-`); `exchanges`/`timeouts` count since boot. A rising `timeouts` means the device isn't answering some commands within 1 s |
 | `GDEVPATH` | Diagnostic: one row per slot (`slot,connected,connector,innerPort,vid,pid,speed,addr,hubAddr,hubPort`), then one per hub driver. `connector` is the board connector (1-4, matches the labels); `innerPort` is the port on a device's own internal hub, 0 if none. Also lists any attached device left without a slot, as slot 0 |
 | `GDEVLIST` | One row per occupied slot: `slot,connector,role,vid,pid,state,name`. `role` `MAIN` (slot 1-4) or `EXTRA` (5-8); `state` `NAMED`/`PENDING`/`NONAME`/`NOTQUERIED`; `name` from the device's `GNAME`, asked on attach |
 | `GDEVSLOT,<name>` | Slot (1-8) of the device whose `GNAME` is `<name>` (case-insensitive); NAK if none |
+| `GDEVPORT,<name>` | TCP data port of the device whose `GNAME` is `<name>` (`EthDataPortBase` + slot - 1); NAK if none |
 | `DEVIDENT,<slot>` | Ask that slot's device its `GNAME` again (also forces a query on a slot 5-8) |
 | `GETHDHCP` / `SETHDHCP,TRUE\|FALSE` | DHCP vs. static IP; reboot to apply |
 | `GETHIP` / `SETHIP,<a.b.c.d>` | Static IP address; reboot to apply |

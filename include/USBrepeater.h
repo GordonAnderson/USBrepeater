@@ -164,7 +164,7 @@ typedef struct
 //  defaults below, which reproduce the behavior from before it existed.
 //  Append new fields before Signature and bump EXT_SIGNATURE only if a
 //  field's meaning changes.
-#define EXT_SIGNATURE  0x5A5AE001
+#define EXT_SIGNATURE  0x5A5AE002   // 0x...E001: AdcTargetName only (2026-11-05, superseded same day)
 #define EXT_NAME_LEN   24
 
 typedef struct
@@ -173,6 +173,13 @@ typedef struct
   // Empty = use AdcTargetDevice (a slot number), the original behavior.
   // Set with SADCDEV,<name>; SADCDEV,<n> clears it. See Section 6a.
   char          AdcTargetName[EXT_NAME_LEN];
+
+  // Data port 1 / data port 2 by instrument name (SDEV,<name> /
+  // SDEV2,<name>). Empty = use ActiveDevice / ActiveDevice2 (0 = automatic,
+  // 1-8 = a slot). SDEV,<n> / SDEV2,<n> clear the name. See Section 6,
+  // resolveDataPorts().
+  char          DevName[EXT_NAME_LEN];
+  char          Dev2Name[EXT_NAME_LEN];
 
   unsigned int  Signature;      // Must equal EXT_SIGNATURE
 } ExtData;
