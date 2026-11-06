@@ -479,12 +479,30 @@ a given read. Deliberately *not* applied to the REF channel
 noisy signal to track quickly, so plain averaging is the right amount of
 smoothing there; only `readAdcCounts()` (AIN) runs through the filter.
 
-- [ ] **Not yet tested on real hardware** — no noisy AIN signal here yet
-      to filter. First real test, once hardware arrives: feed a known-noisy
-      source into AIN, compare `GADC`'s reported counts with the filter
-      disabled vs. a few different `SADCFILTER` time constants, and confirm
-      the response settles over roughly the expected number of time
-      constants after a step change.
+- [x] **Tested on real hardware (2026-11-06).** 1 Hz sine, 2.07 Vpp on
+      a 1.97 V offset, into AIN; `GADC` polled at about 186 reads/s (each
+      read is about 5.3 ms, mostly the ADC averaging). One continuous
+      capture on a shared clock, switching `SADCFILTER` between 6 s
+      segments with filter-off segments between them as the phase
+      reference, and a sine fitted to each:
+
+      | Tau | Amplitude ratio (expected) | Lag (expected) |
+      |---|---|---|
+      | 0 | 1.000 | 0° (reference) |
+      | 50 ms | 0.950 (0.954) | 17.3° (17.4°) |
+      | 200 ms | 0.618 (0.623) | 50.9° (51.5°) |
+      | 1000 ms | 0.159 (0.157) | 79.6° (81.0°) |
+
+      A first-order low-pass with the configured time constant. DC level
+      unchanged. Step response not measured separately (it follows from
+      the same first-order filter).
+- [ ] **The filter only updates when the ADC is read** (`GADC`, the ADC
+      thread, or a script's `read_adc()`). With the ADC thread alone at
+      its default 1000 ms interval, the filter sees one sample per second,
+      so it can't remove noise faster than that (it aliases instead).
+      For filtering to help in that setup, read faster than the noise
+      (a shorter `SADCINT`), or sample the ADC on its own fast timer and
+      filter there. Not changed yet.
 
 ### Phase 4 — Digital I/O (DIO, SMA)
 
