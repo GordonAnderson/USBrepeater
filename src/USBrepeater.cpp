@@ -70,7 +70,14 @@
 
 #include <Arduino.h>
 #include <EEPROM.h>
+// USBHost_t36 is included with its private members opened up, for one
+// reason: hubWatchdog() (Section 6) has to read USBHub's private
+// sending_control_transfer flag to spot a stalled hub request. Access
+// specifiers don't change object layout, so this is safe, but it ties the
+// watchdog to this library version's member names. See TODO.md.
+#define private public
 #include <USBHost_t36.h>
+#undef private
 #include <stdio.h>   // snprintf() — used by ADCUpdate() (Section 6a)
 #include <string.h>  // memcpy() — used by setup() to preload a default script
 #include <math.h>    // lroundf() — used by sys_read_adc() (Section 6b)
@@ -1390,6 +1397,49 @@ class TrackedHub : public USBHub
 public:
   TrackedHub(USBHost &host) : USBHub(host) {}
   const Device_t *dev() { return *(Device_t * volatile *)&device; }
+
+  // ── Stalled-hub watchdog (see hubWatchdog() below) ──────────────────────
+  //  USBHub sends one control request at a time and waits for it to finish
+  //  (sending_control_transfer). Seen on hardware (2026-11-06): when a MIPS
+  //  is unplugged, its FTDI temperature-controller adapter (full speed,
+  //  reached by split transactions through the MIPS's own hub) can leave
+  //  the USB controller stuck retrying a split transaction to a device that
+  //  is gone. USBHost_t36 queues with unlimited retries, so the controller
+  //  never reaches hub1's queued "what changed on this port?" request: the
+  //  unplug is never seen, and later plugs/unplugs on every connector go
+  //  unseen too until a reboot. About 1 unplug in 3 with the MIPS alone.
+  //  stalled() spots it: a request is queued and active on this hub's
+  //  control queue, but the controller's working copy (overlay) of that
+  //  queue is idle, i.e. the controller isn't getting to it.
+  //  restartAt() then stops the controller's async schedule and restarts it
+  //  at this queue: the hub request runs, the hub reports the disconnect,
+  //  and the library removes the gone devices (and their stuck transfers).
+  //  Tested 2026-11-06: every stall cleared this way; refreshing the overlay
+  //  or ringing the async-advance doorbell did not clear it on their own.
+  //  Call both with the USB host interrupt disabled.
+  bool stalled()
+  {
+    if (!device || !sending_control_transfer) return false;
+    Pipe_t *cpipe = device->control_pipe;
+    if (!cpipe || (cpipe->qh.token & 0xC0)) return false;   // executing, or halted
+    uint32_t nxt = cpipe->qh.next;
+    if (nxt & 1) return false;
+    const Transfer_t *t = (const Transfer_t *)(nxt & ~0x1Fu);
+    return (t->qtd.token & 0xC0) == 0x80;                      // queued, active, not started
+  }
+  void restartAt()
+  {
+    USBHS_USBCMD &= ~USBHS_USBCMD_ASE;
+    elapsedMicros w;
+    while ((USBHS_USBSTS & USBHS_USBSTS_AS) && w < 2000) ;     // stops within a microframe
+    USBHS_ASYNCLISTADDR = (uint32_t)&device->control_pipe->qh;
+    USBHS_USBCMD |= USBHS_USBCMD_ASE;
+    w = 0;
+    while (!(USBHS_USBSTS & USBHS_USBSTS_AS) && w < 2000) ;
+    recoveries++;
+  }
+  uint32_t stalledSinceMs = 0;
+  uint32_t recoveries     = 0;
 };
 
 class SlotSerial : public USBSerial_BigBuffer
@@ -1410,6 +1460,24 @@ TrackedHub          hub3(myusb);
 TrackedHub          hub4(myusb);
 TrackedHub          hub5(myusb);
 TrackedHub         *hubPtr[] = { &hub1, &hub2, &hub3, &hub4, &hub5 };
+
+// hubWatchdog — see TrackedHub::stalled(). A hub request is normally
+// picked up by the controller within a microframe (125 us), so one that has
+// been queued but not started for HUB_STALL_MS means the controller is stuck
+// elsewhere. Called every loop(); cheap when nothing is stalled.
+#define HUB_STALL_MS 100
+static void hubWatchdog(void)
+{
+  uint32_t now = millis();
+  for (TrackedHub *h : hubPtr)
+  {
+    NVIC_DISABLE_IRQ(IRQ_USBHS);
+    if (!h->stalled())                                   h->stalledSinceMs = 0;
+    else if (h->stalledSinceMs == 0)                     h->stalledSinceMs = now ? now : 1;
+    else if (now - h->stalledSinceMs >= HUB_STALL_MS)  { h->restartAt(); h->stalledSinceMs = 0; }
+    NVIC_ENABLE_IRQ(IRQ_USBHS);
+  }
+}
 #define HUB_COUNT (sizeof(hubPtr) / sizeof(hubPtr[0]))
 // min_rxtx = 1, not the library default of 65: the default makes BigBuffer
 // claim only high-speed devices (>64-byte bulk endpoints), silently
@@ -1669,7 +1737,7 @@ void cmdGetDevPath(void)
   {
     if ((bool)(*drvPtr[i]) && !driverAssigned(drvPtr[i])) printDevPathRow(0, drvPtr[i]->dev());
   }
-  cp.println("#hub,connected,vid,pid,addr,hubAddr,hubPort");
+  cp.println("#hub,connected,vid,pid,addr,hubAddr,hubPort,stallRecoveries");
   for (uint8_t i = 0; i < HUB_COUNT; i++)
   {
     const Device_t *d = hubPtr[i]->dev();
@@ -1679,7 +1747,8 @@ void cmdGetDevPath(void)
     printHex4(d ? d->idProduct : 0); cp.print(",");
     cp.print((int)(d ? d->address : 0));     cp.print(",");
     cp.print((int)(d ? d->hub_address : 0)); cp.print(",");
-    cp.println((int)(d ? d->hub_port : 0));
+    cp.print((int)(d ? d->hub_port : 0)); cp.print(",");
+    cp.println(hubPtr[i]->recoveries);
   }
 }
 
@@ -3348,4 +3417,5 @@ void loop()
   control.run();
   modeTable[currentMode].loop();
   scripts.poll();   // resume any script whose dcmd()/dcmdf() reply has arrived (Section 6e)
+  hubWatchdog();    // un-stick a hub request the USB controller isn't getting to (Section 6)
 }

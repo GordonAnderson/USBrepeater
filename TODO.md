@@ -648,8 +648,37 @@ Facts this design relies on (per the user):
    - Power cycle with both plugged in (connectors 1/2): same layout after
      boot (fresh USB addresses 2/3): slots 1/2, `GDEV`/`GDEV2` `0,1`/`0,2`,
      data ports 1/2 and TCP 5001/5002 answered `QUAD`/`IsoElectrometer`.
-   - Not yet tested: the slot N+4 rule (needs the MIPS with the internal
-     hub/RS-485 temperature controller).
+   - **Slot N+4 rule tested (2026-11-06)** with the MIPS that has the
+     internal hub (`1A40:0101`) and the RS-485 temperature-controller
+     adapter (FTDI `0403:6001`): on connector 3 the MIPS was slot 3 and the
+     adapter slot 7; on connector 1, slots 1 and 5. The adapter shows
+     `NOTQUERIED` (no `GNAME` onto the RS-485 bus). Talking to the
+     temperature controller through its data port is not yet tested.
+   - **Found and worked around (2026-11-06): unplugging that MIPS could
+     freeze USB detection.** With the MIPS alone, about 2 unplugs in 3
+     went unseen, and after that no plug or unplug on any connector was
+     seen until a reboot (the Teensy LED stayed on). Diagnosed with
+     temporary instrumentation: the USB controller got stuck retrying a
+     split transaction to the adapter (full speed, behind the MIPS's own
+     hub) after it vanished. USBHost_t36 queues with unlimited retries, so
+     the controller never reached hub1's queued "what changed on this
+     port?" request. Not seen with a second instrument (the Astraea)
+     plugged in, or with the library's debug output on (timing).
+     Fix: `hubWatchdog()` (Section 6, `TrackedHub::stalled()`/
+     `restartAt()`): a hub request queued and active but not started for
+     100 ms restarts the controller's async schedule at that hub's queue.
+     Refreshing the queue's overlay or ringing the async-advance doorbell
+     did not clear it on their own. Tested: 9 of 9 plug/unplug cycles
+     detected, 21 recoveries (about 3 per stalled unplug, one per hub
+     request, so about 0.3 s of extra delay). `GDEVPATH`'s hub rows now
+     end with a `stallRecoveries` count.
+   - [ ] **The watchdog reads USBHub's private `sending_control_transfer`**
+     (USBHost_t36.h is included with `#define private public`), so it is
+     tied to this library version's member names: re-check it if the
+     Teensy platform's USBHost_t36 is updated. Worth reporting upstream
+     (PJRC): bulk/interrupt qTDs are queued with CErr = 0 (unlimited
+     retries), so one vanished full-speed device behind a hub's TT can
+     starve the whole async schedule.
 4. [x] `GNAME` queried on attach (retry while the MIPS boots, reply
        swallowed, slot held out of passthrough until answered or timed
        out); no reply = not a GAACE device. New `GDEVLIST` (slot,

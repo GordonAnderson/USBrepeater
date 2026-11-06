@@ -190,6 +190,13 @@ connector's slots taken is left unassigned and shown as slot 0 in
 `GDEVPATH`. `GDEVPATH` shows each slot's connector, inner-hub port and
 VID/PID.
 
+**Unplugging a MIPS with a temperature-controller adapter.** The USB
+controller can get stuck retrying a transfer to the adapter after it's
+unplugged, which would hide that unplug (and any later plug or unplug)
+until a reboot. A watchdog spots this and restarts the controller's
+schedule, so the unplug is seen about 0.3 s late instead of never.
+`GDEVPATH`'s hub rows count these recoveries (`stallRecoveries`).
+
 All slots stay connected and auto-reconnecting continuously, and each one
 **keeps capturing incoming
 bytes into its own buffer regardless of whether it's currently
@@ -604,7 +611,7 @@ every registered command and its help string, `HELP,<cmd>` looks up one.
 | `GADCDEV` / `SADCDEV,<n\|name>` | Get/set what `ADCThread`/the script demo targets: a slot (1-8) or an instrument name (its `GNAME`; follows it between connectors). `GADCDEV` replies `<setting>,<effective slot>`, e.g. `QUAD,1` (effective 0 = not connected). Setting a slot clears the name |
 | `GDEVSTAT` | One row per slot (1-8): `dev,connected,bytesWaiting,bytesDropped` |
 | `GARBSTAT` | Per-slot arbiter: `slot,busy,owner,exchanges,timeouts`. `owner` is who has the open exchange (`USB1`, `USB2`, `ETH`, `INT` = the repeater's ADC sends, `SCRIPT` = a script's `dcmd()`, or `-`); `exchanges`/`timeouts` count since boot. A rising `timeouts` means the device isn't answering some commands within 1 s |
-| `GDEVPATH` | Diagnostic: one row per slot (`slot,connected,connector,innerPort,vid,pid,speed,addr,hubAddr,hubPort`), then one per hub driver. `connector` is the board connector (1-4, matches the labels); `innerPort` is the port on a device's own internal hub, 0 if none. Also lists any attached device left without a slot, as slot 0 |
+| `GDEVPATH` | Diagnostic: one row per slot (`slot,connected,connector,innerPort,vid,pid,speed,addr,hubAddr,hubPort`), then one per hub driver (`hub,connected,vid,pid,addr,hubAddr,hubPort,stallRecoveries`). `connector` is the board connector (1-4, matches the labels); `innerPort` is the port on a device's own internal hub, 0 if none. Also lists any attached device left without a slot, as slot 0 |
 | `GDEVLIST` | One row per occupied slot: `slot,connector,role,vid,pid,state,name`. `role` `MAIN` (slot 1-4) or `EXTRA` (5-8); `state` `NAMED`/`PENDING`/`NONAME`/`NOTQUERIED`; `name` from the device's `GNAME`, asked on attach |
 | `GDEVSLOT,<name>` | Slot (1-8) of the device whose `GNAME` is `<name>` (case-insensitive); NAK if none |
 | `GDEVPORT,<name>` | TCP data port of the device whose `GNAME` is `<name>` (`EthDataPortBase` + slot - 1); NAK if none |
