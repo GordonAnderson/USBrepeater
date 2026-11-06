@@ -682,8 +682,8 @@ Facts this design relies on (per the user):
      commands take 15-19 ms instead; the control port never does and no
      other requester was active (`GARBSTAT` exchanges matched the test's
      own count), so this looks like the QUAD's own periodic work, which a
-     direct connection would see too. Not yet checked: the scan time
-     with the fix.
+     direct connection would see too. **Scan with the fix: 4.0 s** (was
+     9.6 s; 3.7 s direct), measured by the user.
    - [ ] **The watchdog reads USBHub's private `sending_control_transfer`**
      (USBHost_t36.h is included with `#define private public`), so it is
      tied to this library version's member names: re-check it if the
