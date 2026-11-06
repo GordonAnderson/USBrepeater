@@ -1594,7 +1594,7 @@ struct DevIdent
   IdentState state      = IDENT_EMPTY;
   uint8_t    tries      = 0;
   bool       awaiting   = false;   // a GNAME is outstanding
-  bool       eatLF      = false;   // reply ended on '\r': drop the '\n' that follows it
+  uint8_t    eatChar    = 0;       // reply settled on one line-ending char: drop the other if it's next
   uint32_t   nextMs     = 0;       // when to send the next GNAME
   uint32_t   deadlineMs = 0;       // when the outstanding one times out
   uint8_t    lineLen    = 0;
@@ -1616,7 +1616,7 @@ static void identStart(uint8_t idx, bool force)
   id.name[0]  = '\0';
   id.tries    = 0;
   id.awaiting = false;
-  id.eatLF    = false;
+  id.eatChar  = 0;
   id.lineLen  = 0;
   if (!force && idx >= 4) { id.state = IDENT_SKIPPED; return; }
   id.state  = IDENT_PENDING;
@@ -1667,9 +1667,11 @@ static void identFeed(uint8_t idx, uint8_t b)
   id.lineLen = 0;
   if (!id.awaiting) return;   // e.g. a boot banner before the first query
 
-  // GAACE replies end "\r\n". If this '\r' settles the reply, the '\n' still
-  // to come must not leak through to the host as a stray blank line.
-  id.eatLF = (b == '\r');
+  // The reply settles on its first line-ending character, but there's
+  // usually a second one still to come: GAACE_Core ends replies "\r\n",
+  // while the MIPS firmware ends a bare ACK or a NAK "\n\r". That second
+  // character must not leak through to a host as a stray byte.
+  id.eatChar = (b == '\r') ? '\n' : '\r';
 
   if ((uint8_t)id.line[0] == 0x06)
   {
@@ -1805,14 +1807,16 @@ void cmdDevIdent(void)
 #define ARB_QUIET_MS     20     // after a reply's newline, quiet this long = exchange over
 #define ARB_TIMEOUT_MS   1000   // no complete reply this long after sending = give up
 #define ARB_PARTIAL_MS   50     // a partial line idle this long is forwarded as-is
+#define SCRIPT_REQS      8      // script dcmd()/dcmdf() requests in flight at once
 
 enum : uint8_t
 {
   SRC_USB1  = 0,                          // Serial (data port 1)
   SRC_USB2  = 1,                          // SerialUSB2 (data port 2)
   SRC_ETH0  = 2,                          // + slot: that slot's TCP data client
-  SRC_INT0  = SRC_ETH0 + DEVPORT_COUNT,   // + slot: the repeater itself (ADC, scripts)
-  SRC_COUNT = SRC_INT0 + DEVPORT_COUNT,
+  SRC_INT0  = SRC_ETH0 + DEVPORT_COUNT,   // + slot: the repeater itself (ADC, scale_send)
+  SRC_REQ0  = SRC_INT0 + DEVPORT_COUNT,   // + k: script request k (dcmd()/dcmdf(), Section 6e)
+  SRC_COUNT = SRC_REQ0 + SCRIPT_REQS,
   SRC_NONE  = 0xFF
 };
 
@@ -1830,6 +1834,7 @@ struct Arb
   uint8_t  lastOwner = SRC_NONE;   // last non-internal owner: gets unsolicited output
   uint8_t  rr        = 0;          // round-robin start among the slot's requesters
   bool     sawNL     = false;      // the open exchange's reply newline has arrived
+  uint8_t  eatNext   = 0;          // drop this byte if it's the next one (a settled script reply's "\n\r" tail)
   uint32_t sentMs    = 0;
   uint32_t lastRxMs  = 0;
   uint32_t exchanges = 0;          // since boot
@@ -1840,7 +1845,17 @@ LineSrc lineSrc[SRC_COUNT];
 Arb     arb[DEVPORT_COUNT];
 uint8_t srcTarget[SRC_COUNT];      // slot each source addresses this pass (DEVPORT_COUNT = none)
 
-static inline bool isIntSrc(uint8_t src) { return src >= SRC_INT0 && src < SRC_COUNT; }
+static inline bool isIntSrc(uint8_t src) { return src >= SRC_INT0 && src < SRC_REQ0; }
+static inline bool isReqSrc(uint8_t src) { return src >= SRC_REQ0 && src < SRC_COUNT; }
+// The repeater's own requesters (ADC/scale_send and script requests): their
+// replies never go to a host, and they never become a slot's lastOwner.
+static inline bool isOwnSrc(uint8_t src) { return src >= SRC_INT0 && src < SRC_COUNT; }
+
+// Script request hooks, defined in Section 6e.
+static void reqCaptureByte(uint8_t src, uint8_t b);
+static void reqFinish(uint8_t src, bool timedOut);
+static void reqSent(uint8_t src);
+static void reqUpdate(void);
 
 // The stream a requester talks over, or NULL (internal, or a TCP client
 // that isn't connected).
@@ -1940,18 +1955,26 @@ static void devPortDrainIncoming(uint8_t idx)
     // host-bound traffic; once settled, the rest of the chunk flows normally.
     DevIdent &id = devIdent[idx];
     if (id.state == IDENT_PENDING) { identFeed(idx, repeaterBuf[i]); continue; }
-    if (id.eatLF)
+    if (id.eatChar)
     {
-      id.eatLF = false;
-      if (repeaterBuf[i] == '\n') continue;   // tail of the settled GNAME reply
+      uint8_t e = id.eatChar;
+      id.eatChar = 0;
+      if (repeaterBuf[i] == e) continue;   // tail of the settled GNAME reply
     }
 
     // Track the open exchange's reply for the arbiter (end = newline + quiet).
     Arb &a = arb[idx];
+    if (a.eatNext)
+    {
+      uint8_t e = a.eatNext;
+      a.eatNext = 0;
+      if (repeaterBuf[i] == e) continue;
+    }
     if (a.owner != SRC_NONE)
     {
       a.lastRxMs = millis();
       if (repeaterBuf[i] == '\n') a.sawNL = true;
+      if (isReqSrc(a.owner)) { reqCaptureByte(a.owner, repeaterBuf[i]); continue; }  // a script's reply
       if (isIntSrc(a.owner)) continue;   // reply to the repeater's own command: not for any host
     }
     devPortPush(idx, repeaterBuf[i]);
@@ -2054,7 +2077,7 @@ static void arbSend(uint8_t idx, uint8_t src)
 
   if (blank)
   {
-    if (!isIntSrc(src)) a.lastOwner = src;   // nothing to wait for
+    if (!isOwnSrc(src)) a.lastOwner = src;   // nothing to wait for
   }
   else
   {
@@ -2063,6 +2086,7 @@ static void arbSend(uint8_t idx, uint8_t src)
     a.lastRxMs = a.sentMs;
     a.sawNL    = false;
     a.exchanges++;
+    if (isReqSrc(src)) reqSent(src);
   }
   L.len   = 0;
   L.ready = false;
@@ -2091,46 +2115,54 @@ static Stream *arbOutput(uint8_t idx, bool *discard)
 static void arbService(uint8_t idx)
 {
   Arb &a = arb[idx];
-  if (!slotConnected(idx)) { a.owner = SRC_NONE; return; }
+  if (!slotConnected(idx))
+  {
+    if (isReqSrc(a.owner)) reqFinish(a.owner, true);   // device gone mid-request
+    a.owner = SRC_NONE;
+    return;
+  }
   uint32_t now = millis();
 
-  const uint8_t cand[4] = { SRC_USB1, SRC_USB2, (uint8_t)(SRC_ETH0 + idx), (uint8_t)(SRC_INT0 + idx) };
   auto waiting = [&](uint8_t src) { return srcTarget[src] == idx && lineSrc[src].ready; };
 
   if (a.owner != SRC_NONE)
   {
     uint8_t owner = a.owner;
     bool othersWaiting = false;
-    for (uint8_t k = 0; k < 4; k++)
-      if (cand[k] != owner && waiting(cand[k])) othersWaiting = true;
+    for (uint8_t src = 0; src < SRC_COUNT; src++)
+      if (src != owner && waiting(src)) { othersWaiting = true; break; }
 
-    bool done = false, fast = false;
+    bool done = false, fast = false, timedOut = false;
     if (a.sawNL)
     {
-      if ((now - a.lastRxMs) >= ARB_QUIET_MS) done = true;
+      // A script's request is a single-line command: its reply is complete
+      // at the first newline, so the script isn't held for the quiet gap.
+      if (isReqSrc(owner)) done = true;
+      else if ((now - a.lastRxMs) >= ARB_QUIET_MS) done = true;
       else if (waiting(owner) && !othersWaiting) { done = true; fast = true; }
     }
-    if (!done && (now - a.sentMs) >= ARB_TIMEOUT_MS) { done = true; a.timeouts++; }
+    if (!done && (now - a.sentMs) >= ARB_TIMEOUT_MS) { done = true; timedOut = true; a.timeouts++; }
     if (!done) return;
 
-    if (!isIntSrc(owner)) a.lastOwner = owner;
+    if (!isOwnSrc(owner)) a.lastOwner = owner;
+    if (isReqSrc(owner)) reqFinish(owner, timedOut);
     a.owner = SRC_NONE;
     if (fast) { arbSend(idx, owner); return; }   // same requester, nobody else waiting
   }
 
   if (!slotReady(idx)) return;   // GNAME being asked: hold everything
-  for (uint8_t k = 0; k < 4 && a.owner == SRC_NONE; k++)
+  for (uint8_t k = 0; k < SRC_COUNT && a.owner == SRC_NONE; k++)
   {
-    uint8_t pick = (uint8_t)((a.rr + k) % 4);
-    if (!waiting(cand[pick])) continue;
-    arbSend(idx, cand[pick]);
-    a.rr = (uint8_t)((pick + 1) % 4);
+    uint8_t src = (uint8_t)((a.rr + k) % SRC_COUNT);
+    if (!waiting(src)) continue;
+    arbSend(idx, src);
+    a.rr = (uint8_t)((src + 1) % SRC_COUNT);
     // a blank line opens no exchange: keep going so the next one is served too
   }
 }
 
 // GARBSTAT — per slot: slot,busy,owner,exchanges,timeouts. owner is who has
-// the open exchange (USB1, USB2, ETH, INT or -); exchanges/timeouts are
+// the open exchange (USB1, USB2, ETH, INT, SCRIPT or -); exchanges/timeouts are
 // since-boot counters. A rising timeouts count means the device isn't
 // answering some commands within ARB_TIMEOUT_MS.
 static const char *srcName(uint8_t src)
@@ -2139,7 +2171,8 @@ static const char *srcName(uint8_t src)
   if (src == SRC_USB1) return "USB1";
   if (src == SRC_USB2) return "USB2";
   if (src < SRC_INT0)  return "ETH";
-  return "INT";
+  if (src < SRC_REQ0)  return "INT";
+  return "SCRIPT";
 }
 
 void cmdGetArbStat(void)
@@ -2200,6 +2233,7 @@ void RepeaterModeLoop(void)
     srcTarget[SRC_ETH0 + i] = i;
     srcTarget[SRC_INT0 + i] = i;
   }
+  reqUpdate();   // script requests: set their targets, fail ones whose device is gone
 
   bool connected = slotReady(selIdx);
   digitalWriteFast(LED_BUILTIN, connected ? HIGH : LOW);   // reflects data port 1's device only
@@ -2231,6 +2265,219 @@ void RepeaterModeLoop(void)
     arbService(i);
   }
 }
+
+// =============================================================================
+//  SECTION 6e — SCRIPT DEVICE BRIDGE (device() / ready() / dcmd() / dcmdf())
+// =============================================================================
+//
+//  Lets a GAACE_Script script talk to any connected instrument by name:
+//
+//    q = device("QUAD");                    // handle for the instrument named QUAD
+//    if (ready(q)) {
+//      v = dcmdf(q, "GRFADRV", 1);          // read a value back
+//      dcmd(q, "SRFADRV", 2, v * 0.5);      // set one
+//    }
+//
+//  A handle stands for the *name*, not a slot: every use looks the slot up
+//  again (slotByName(), Section 6, from each device's GNAME on attach), so a
+//  handle keeps working when the instrument is unplugged and plugged into
+//  another connector, and ready() is 0 while it's absent.
+//
+//  dcmd()/dcmdf() build "NAME,args\n" exactly as cmd() does (ints as
+//  integers, floats as decimals), and hand it to the device's arbiter as a
+//  script request (SRC_REQ0 + k): it waits its turn behind any host command
+//  and is answered at the reply's first newline. The script pauses
+//  meanwhile (GAACE_Script's waiting syscalls) and nothing else on the
+//  repeater waits; ScriptRuntime::poll() resumes it with the result. Result
+//  rules match cmd(): ACK -> number, TRUE/FALSE -> 1/0, otherwise (NAK, no
+//  reply within ARB_TIMEOUT_MS, device absent or gone) 0. Up to SCRIPT_REQS
+//  requests can be in flight across all script slots; past that a call
+//  returns 0 straight away. Scripts should use single-line commands: the
+//  tail of a multi-line reply would reach the device's next requester.
+// -----------------------------------------------------------------------------
+#define SCRIPT_DEV_NAMES   16      // distinct device() names across all scripts
+#define REQ_REPLY_MAX      48
+#define REQ_ABANDON_MS     5000    // a finished request nobody collected is freed after this
+
+enum ReqState : uint8_t { REQ_FREE = 0, REQ_QUEUED, REQ_SENT, REQ_DONE };
+
+struct ScriptReq
+{
+  ReqState state     = REQ_FREE;
+  uint8_t  slot      = 0;
+  uint8_t  gen       = 1;          // bumps on every reuse: stale tokens are recognised
+  bool     wantFloat = false;
+  uint8_t  replyLen  = 0;
+  bool     sawCR     = false;      // the reply's '\r' came before its '\n'
+  int32_t  result    = 0;
+  uint32_t doneMs    = 0;
+  char     reply[REQ_REPLY_MAX];
+};
+
+static ScriptReq scriptReq[SCRIPT_REQS];
+static char      scriptDevName[SCRIPT_DEV_NAMES][DEV_NAME_LEN];
+
+static inline ScriptReq &reqOf(uint8_t src) { return scriptReq[src - SRC_REQ0]; }
+
+// The slot (0-based) a handle's instrument is in right now, or -1.
+static int8_t handleSlot(int32_t h)
+{
+  if (h < 1 || h > SCRIPT_DEV_NAMES || scriptDevName[h - 1][0] == '\0') return -1;
+  return slotByName(scriptDevName[h - 1]);
+}
+
+// Same reply rules as GAACE_Script's cmd() bridge: after the ACK, TRUE/FALSE
+// -> 1/0, else a number; anything else -> 0. Floats come back as bits.
+static int32_t parseReply(const char *r, bool wantFloat)
+{
+  if ((uint8_t)r[0] != 0x06) return 0;
+  const char *v = r + 1;
+  while (*v == ' ') v++;
+  float f;
+  if      (strncasecmp(v, "TRUE", 4) == 0 && !isalnum((unsigned char)v[4]))  f = 1.0f;
+  else if (strncasecmp(v, "FALSE", 5) == 0 && !isalnum((unsigned char)v[5])) f = 0.0f;
+  else if (!wantFloat) return (int32_t)atoi(v);
+  else f = (float)atof(v);
+  if (!wantFloat) return (int32_t)f;
+  int32_t bits;
+  memcpy(&bits, &f, sizeof(bits));
+  return bits;
+}
+
+static void reqCaptureByte(uint8_t src, uint8_t b)
+{
+  ScriptReq &q = reqOf(src);
+  if (b == '\r') { q.sawCR = true; return; }
+  if (b == '\n') return;
+  if (q.replyLen < REQ_REPLY_MAX - 1) q.reply[q.replyLen++] = (char)b;
+}
+
+static void reqSent(uint8_t src)
+{
+  ScriptReq &q = reqOf(src);
+  q.state    = REQ_SENT;
+  q.replyLen = 0;
+  q.sawCR    = false;
+}
+
+static void reqFinish(uint8_t src, bool timedOut)
+{
+  ScriptReq &q = reqOf(src);
+  if (q.state == REQ_FREE || q.state == REQ_DONE) return;
+  q.reply[q.replyLen] = '\0';
+  q.result = timedOut ? 0 : parseReply(q.reply, q.wantFloat);
+  // The request ends at the reply's '\n'. The MIPS firmware ends a bare ACK
+  // or NAK "\n\r", so a '\r' may still be on its way: drop it, or it would
+  // reach the device's next requester (a host) as a stray byte.
+  if (!timedOut && !q.sawCR && q.slot < DEVPORT_COUNT) arb[q.slot].eatNext = '\r';
+  q.state  = REQ_DONE;
+  q.doneMs = millis();
+}
+
+// Every loop pass: point each live request at its slot, fail requests whose
+// device has gone, and free finished ones nobody collected (a script that
+// was reloaded or disabled for good while waiting).
+static void reqUpdate(void)
+{
+  uint32_t now = millis();
+  for (uint8_t k = 0; k < SCRIPT_REQS; k++)
+  {
+    ScriptReq &q = scriptReq[k];
+    uint8_t src = (uint8_t)(SRC_REQ0 + k);
+    bool live = (q.state == REQ_QUEUED || q.state == REQ_SENT);
+    srcTarget[src] = live ? q.slot : DEVPORT_COUNT;
+    if (q.state == REQ_QUEUED && !slotConnected(q.slot))
+    {
+      lineSrc[src].ready = false;
+      lineSrc[src].len   = 0;
+      reqFinish(src, true);
+    }
+    if (q.state == REQ_DONE && (now - q.doneMs) >= REQ_ABANDON_MS)
+    {
+      q.state = REQ_FREE;
+      q.gen++;
+    }
+  }
+}
+
+static int32_t devLookup(const char *name)
+{
+  if (name == NULL || name[0] == '\0') return 0;
+  for (uint8_t i = 0; i < SCRIPT_DEV_NAMES; i++)
+    if (strcasecmp(scriptDevName[i], name) == 0) return i + 1;
+  for (uint8_t i = 0; i < SCRIPT_DEV_NAMES; i++)
+    if (scriptDevName[i][0] == '\0')
+    {
+      strncpy(scriptDevName[i], name, DEV_NAME_LEN - 1);
+      scriptDevName[i][DEV_NAME_LEN - 1] = '\0';
+      return i + 1;
+    }
+  return 0;   // name table full
+}
+
+static int32_t devReady(int32_t handle)
+{
+  int8_t s = handleSlot(handle);
+  return (s >= 0 && slotReady((uint8_t)s)) ? 1 : 0;
+}
+
+static int32_t devCommand(int32_t handle, const char *name, int32_t *args, uint8_t argc,
+                          bool wantFloat, uint16_t floatMask)
+{
+  int8_t s = handleSlot(handle);
+  if (s < 0 || !slotReady((uint8_t)s)) return 0;   // not reachable: 0 straight away
+
+  uint8_t k = 0;
+  while (k < SCRIPT_REQS && scriptReq[k].state != REQ_FREE) k++;
+  if (k == SCRIPT_REQS) return 0;                   // too many in flight
+
+  LineSrc &L = lineSrc[SRC_REQ0 + k];
+  int len = snprintf(L.buf, ARB_LINE_MAX, "%s", name);
+  for (uint8_t i = 0; i < argc && len < ARB_LINE_MAX - 2; i++)
+  {
+    if (i < 16 && (floatMask & (1u << i)))
+    {
+      float f;
+      memcpy(&f, &args[i], sizeof(f));
+      len += snprintf(L.buf + len, ARB_LINE_MAX - len, ",%.7g", (double)f);
+    }
+    else len += snprintf(L.buf + len, ARB_LINE_MAX - len, ",%d", (int)args[i]);
+  }
+  if (len > ARB_LINE_MAX - 2) len = ARB_LINE_MAX - 2;
+  L.buf[len++] = '\n';
+  L.len   = (uint16_t)len;
+  L.ready = true;
+
+  ScriptReq &q = scriptReq[k];
+  q.state     = REQ_QUEUED;
+  q.slot      = (uint8_t)s;
+  q.wantFloat = wantFloat;
+  q.replyLen  = 0;
+  srcTarget[SRC_REQ0 + k] = (uint8_t)s;
+
+  GAACEScript::vmRequestWait(((int32_t)q.gen << 8) | (k + 1));
+  return 0;
+}
+
+// ScriptRuntime's poll function: is the request behind `token` finished?
+bool scriptWaitPoll(int32_t token, int32_t *result)
+{
+  uint8_t k   = (uint8_t)((token & 0xFF) - 1);
+  uint8_t gen = (uint8_t)(token >> 8);
+  if (k >= SCRIPT_REQS || scriptReq[k].gen != gen)
+  {
+    *result = 0;          // stale (already reclaimed): don't leave the script hanging
+    return true;
+  }
+  ScriptReq &q = scriptReq[k];
+  if (q.state != REQ_DONE) return false;
+  *result = q.result;
+  q.state = REQ_FREE;
+  q.gen++;
+  return true;
+}
+
+const GAACEScript::DeviceBridge scriptDeviceBridge = { devLookup, devReady, devCommand };
 
 // =============================================================================
 //  SECTION 6a — PERIODIC ADC -> DOWNSTREAM-DEVICE COMMAND UPDATE
@@ -2861,6 +3108,11 @@ void setup()
   scripts.registerSyscalls(scriptSyscalls,
                            sizeof(scriptSyscalls) / sizeof(scriptSyscalls[0]));
 
+  // Named devices for scripts (device()/ready()/dcmd()/dcmdf(), Section 6e).
+  // Built-ins, not syscalls: the syscall table hash above is unchanged.
+  scripts.setDeviceBridge(&scriptDeviceBridge);
+  scripts.setWaitPoll(scriptWaitPoll);
+
   // ── 5b. Script slot persistence (flash; Section 6b) ─────────────────────────
   //  Mount the on-chip flash filesystem, then try restoring every slot from
   //  its saved file. A slot with no saved file (or a filesystem that fails
@@ -2921,4 +3173,5 @@ void loop()
   if (ethCtrlClient && ethCtrlClient.connected()) ethCtrlClient.flush();
   control.run();
   modeTable[currentMode].loop();
+  scripts.poll();   // resume any script whose dcmd()/dcmdf() reply has arrived (Section 6e)
 }

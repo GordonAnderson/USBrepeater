@@ -382,6 +382,41 @@ the `GAACE_Script` library, so it needs a build against its current `main`
 it). Scripts that use it need that firmware; int-only scripts are
 unchanged. Not yet run on hardware.
 
+### Scripts that talk to instruments by name
+
+A script can read from and control any connected instrument by its name
+(its `GNAME`), including several at once:
+
+```
+q = device("QUAD");
+e = device("IsoElectrometer");
+if (ready(q) && ready(e)) {
+    v = dcmdf(q, "GRFADRV", 1);    // read from one instrument
+    dcmd(q, "SRFADRV", 2, v);      // set another value
+}
+```
+
+- A handle stands for the name, not a slot or connector: move the
+  instrument to another connector and the script keeps working. `ready()`
+  is 0 while it's absent.
+- `dcmd()`/`dcmdf()` go through the instrument's arbiter like any host
+  command: they wait their turn, never interleave with a host app using
+  the same instrument, and the reply goes only to the script. The script
+  pauses until the reply arrives; passthrough and everything else keep
+  running.
+- Results follow `cmd()`'s rules: ACK + number -> that number,
+  `TRUE`/`FALSE` -> 1/0; a bare ACK (a set command), a NAK, no reply within
+  1 s, or an absent instrument -> 0. Use single-line commands.
+- Up to 8 device commands can be in flight across all script slots.
+- Measured: about 6 ms per command to a MIPS; a script doing 3 device
+  commands per run keeps up with a 100 ms (10 Hz) interval.
+- `GSCRIPTVAR,<slot>,<var>` shows a script's variable, for debugging
+  (`gsc.py --disasm` shows which number each variable has).
+
+These are GAACE_Script built-ins, not syscalls, so the syscall table hash
+(`GSYSCALLS`) is unchanged and saved scripts still restore. The language
+reference is GAACE_Script's `tools/README.md`.
+
 ### `cmd()` with bool (`TRUE`/`FALSE`) commands
 
 Scripts can read and set bool commands (2026-11-05):
@@ -535,7 +570,7 @@ every registered command and its help string, `HELP,<cmd>` looks up one.
 | `GDEV2` / `SDEV2,<n>` | Same for `SerialUSB2`: 0 = automatic (next occupied slot after data port 1's), 1-8 = pinned. `SDEV2` rejects a pinned value equal to `ActiveDevice` |
 | `GADCDEV` / `SADCDEV,<n>` | Get/set which downstream slot (1-8) `ADCThread`/the script demo targets |
 | `GDEVSTAT` | One row per slot (1-8): `dev,connected,bytesWaiting,bytesDropped` |
-| `GARBSTAT` | Per-slot arbiter: `slot,busy,owner,exchanges,timeouts`. `owner` is who has the open exchange (`USB1`, `USB2`, `ETH`, `INT` = the repeater itself, or `-`); `exchanges`/`timeouts` count since boot. A rising `timeouts` means the device isn't answering some commands within 1 s |
+| `GARBSTAT` | Per-slot arbiter: `slot,busy,owner,exchanges,timeouts`. `owner` is who has the open exchange (`USB1`, `USB2`, `ETH`, `INT` = the repeater's ADC sends, `SCRIPT` = a script's `dcmd()`, or `-`); `exchanges`/`timeouts` count since boot. A rising `timeouts` means the device isn't answering some commands within 1 s |
 | `GDEVPATH` | Diagnostic: one row per slot (`slot,connected,connector,innerPort,vid,pid,speed,addr,hubAddr,hubPort`), then one per hub driver. `connector` is the board connector (1-4, matches the labels); `innerPort` is the port on a device's own internal hub, 0 if none. Also lists any attached device left without a slot, as slot 0 |
 | `GDEVLIST` | One row per occupied slot: `slot,connector,role,vid,pid,state,name`. `role` `MAIN` (slot 1-4) or `EXTRA` (5-8); `state` `NAMED`/`PENDING`/`NONAME`/`NOTQUERIED`; `name` from the device's `GNAME`, asked on attach |
 | `GDEVSLOT,<name>` | Slot (1-8) of the device whose `GNAME` is `<name>` (case-insensitive); NAK if none |

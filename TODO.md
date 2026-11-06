@@ -661,15 +661,51 @@ Facts this design relies on (per the user):
   - Not yet tested: the MIPS host application itself through the arbiter
     (data port 1 and over TCP), and a device that sends unsolicited
     output.
-- VM "waiting" state: a script pauses at a device call and resumes when
-  the reply arrives, so the main loop and other devices never stall.
-- Language: `device("NAME")` returns a handle that stands for the name,
-  not a slot (survives replug), `ready(dev)`, `dcmd(dev, "CMD", args)` /
-  `dcmdf(...)`. Changes the syscall table hash, so saved scripts must be
-  recompiled and reloaded once.
-- Move the ADC target (`SADCDEV`/`SADCCMD`) to names.
-- Scripts run once a second up to about 10 Hz; measure real MIPS reply
-  times early.
+- [x] **B2. VM "waiting" state — done (2026-11-05)**, GAACE_Script
+  `1a38a1d`. A syscall calls `vmRequestWait(token)`; the VM stops after
+  that call with `VM_WAITING`, keeping its place, and `vmResume()` pushes
+  the result later. `ScriptRuntime::setWaitPoll()`/`poll()` (called every
+  `loop()` pass) resume a waiting slot once its result is ready; its
+  periodic tick doesn't restart it. Native tests only (no device use yet).
+- [x] **B3. Language — done (2026-11-05), hardware-tested.** GAACE_Script
+  `7fe6c2b`: built-ins `device("NAME")`, `ready(dev)`,
+  `dcmd(dev, "CMD", args)`, `dcmdf(...)` (new opcodes appended; a
+  `DeviceBridge` the project registers), plus `GSCRIPTVAR,<slot>,<var>` for
+  debugging. **Built-ins, not syscalls: the syscall table hash did not
+  change** (still `6501A214`), so saved scripts didn't need recompiling,
+  contrary to the plan above. USBrepeater side (Section 6e): handles stand
+  for a name (looked up by `GNAME` on every use, so they survive a
+  replug); each `dcmd()` becomes a script request (`SCRIPT_REQS` = 8 in
+  flight) queued in the device's arbiter, answered at the reply's first
+  newline, and the script resumes via `scripts.poll()`. Device absent or
+  gone -> 0 without pausing; no reply -> 0 after `ARB_TIMEOUT_MS`.
+  `GARBSTAT` shows `SCRIPT` as owner.
+
+  Found and fixed on hardware: the MIPS firmware ends a bare ACK and a NAK
+  with `\n\r` (but value replies with `\r\n`), so after a script request
+  settled on `\n` a lone `\r` could reach the device's next requester. The
+  same applied to the `GNAME` query on attach. Both now drop the other
+  line-ending character if it arrives next.
+
+  Hardware results (QUAD on slot 1, IsoElectrometer on slot 3):
+  - Lookup: handles 1/2/3 for QUAD/IsoElectrometer/NOPE; `ready()` 1/1/0;
+    `dcmdf(q,"GRFADRV",1)` matched a direct read; absent device -> 0.
+  - Write and read back by name, script every 100 ms, 28 runs:
+    `dcmd(q,"SRFADRV",1,2.5)` then `dcmdf(q,"GRFADRV",1)` = 2.5 every
+    time, while data port 1 sent 200 `GVER`s to QUAD: 0 bad host replies,
+    0 timeouts. RF drive restored to 0.00 afterwards.
+  - Leak test after the fix: set + NAK + read every 100 ms (about 10 Hz
+    with 3 device exchanges per run), 163 exchanges, 0 bytes reaching the
+    idle data port 1, 0 timeouts.
+  - Slot 1 currently holds a test script in RAM (disabled, not saved); the
+    saved slot 1 script comes back on the next boot.
+  - Known: a set command's bare ACK reads as 0, same as a NAK (cmd()'s
+    rule), so a script can't tell a successful set from a failed one by
+    the return value. Possible change: bare ACK -> 1.
+- [ ] B4. Move the ADC target (`SADCDEV`/`SADCCMD`) to names.
+- [x] Scripts run once a second up to about 10 Hz; measure real MIPS reply
+  times early. **Measured:** about 6 ms per MIPS exchange over USB; a
+  3-exchange script sustains about 10 Hz.
 
 Open questions:
 - [x] Does the MIPS host app send non-command data (binary, firmware
