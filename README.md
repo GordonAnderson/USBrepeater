@@ -1,4 +1,10 @@
-# USBrepeater
+# GAACE Gateway
+
+**Product name: GAACE Gateway.** This repository is its firmware. The
+repository, source files and some internal identifiers keep the original
+working name, *USBrepeater* (for example `src/USBrepeater.cpp`, and the
+firmware's own `GVER`/`GNAME` replies); "USBrepeater" in these docs means
+this firmware or the GAACE Gateway itself.
 
 A Teensy 4.1 USB-CDC repeater/controller built on the
 [GAACE](https://github.com/GordonAnderson) (GAA Custom Electronics Core
@@ -7,7 +13,7 @@ and [ArduinoThread](https://github.com/GordonAnderson/ArduinoThread), following
 the same layout as [GordonAnderson/Template](https://github.com/GordonAnderson/Template).
 
 At its core it transparently relays a USB CDC connection from a PC through the
-Teensy's USB host port to one of up to 6 downstream USB serial devices (on 4 physical connectors), exactly
+Teensy's USB host port to one of up to 8 downstream USB serial devices (on 4 physical connectors), exactly
 like a plain USB-to-USB serial repeater with a switch on the downstream side.
 On top of that it adds a GAACE command processor, a mode framework, a
 cooperative thread scheduler, persistent settings, Ethernet, and a periodic
@@ -18,7 +24,8 @@ disturbing it.
 
 - Teensy 4.1
 - Either a single downstream USB CDC device wired directly to the Teensy's
-  host port (5-pin header), or the **USBrepeater Hub Carrier** board — a
+  host port (5-pin header), or the **GAACE Gateway board** (originally the
+  USBrepeater Hub Carrier) — a
   Microchip USB2514B 4-port hub on that same host port, driving 4 downstream
   USB-A ports plus an analog input and digital I/O (see
   [TODO.md](TODO.md)'s "Hardware-verified development plan" for the full
@@ -133,7 +140,8 @@ on an Apache-2.0 TCP/IP stack) if this needs revisiting before a closed-
 source commercial release.
 
 The USB Manufacturer string (`GAA Custom Electronics, LLC`) and Product string
-(`USBrepeater`) are shared by both ports — see
+(`GAACE Gateway`, what the PC shows for the device) are shared by all three
+ports — see
 `board_vendor` / `board_build.usb_product` in `platformio.ini` and
 [scripts/usb_name.py](scripts/usb_name.py) (Teensyduino's `USB_DUAL_SERIAL`
 descriptor has one Manufacturer/Product string for the whole composite device,
@@ -326,9 +334,14 @@ called on demand at any time, not just on `ADCThread`'s own schedule — the
 filter's real-world time constant stays correct regardless of which
 caller triggers a given read.
 
-**REF-channel ratiometric correction** — the board's 2.5V precision
-reference (on `A1`) lets firmware cancel AIN gain drift against the
-Teensy's 3.3V rail. Run `CALREF` once, with the REF input in its
+**REF-channel ratiometric correction** — the board's 1.25 V precision
+reference (on `A1`; changed from 2.5 V in the original design) lets
+firmware cancel AIN gain drift against the Teensy's 3.3 V rail. The
+correction is a ratio of two readings of the same reference
+(`RefCal`/`REF_now`), so the firmware doesn't depend on the reference
+voltage; the 1.25 V reference reads about 1550 counts. `RefCal` must be
+captured on a board with the reference it actually has: a value captured
+against a 2.5 V reference is wrong for a 1.25 V board. Run `CALREF` once, with the REF input in its
 known-good state, to capture the current reading into `RefCal` (`SAVE` to
 persist); from then on, `scaleAdcValue()` multiplies by
 `RefCal`/`REF_now` on every read. `GREFCAL` reads back the captured value;

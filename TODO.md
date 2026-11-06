@@ -1,5 +1,17 @@
 # TODO
 
+**Product name: GAACE Gateway (2026-11-05).** The firmware repository and
+files keep the working name USBrepeater; "USBrepeater" below means this
+firmware or the product.
+
+**Hardware change (2026-11-05): the REF reference on `A1` is now 1.25 V**
+(was the 2.5 V ISL21070CIH325Z). No firmware change needed: the REF
+correction is ratiometric (`RefCal`/`REF_now`), so the reference voltage
+never appears in the math, and 1.25 V reads about 1550 counts at 12 bits,
+well within range. `RefCal` has to be captured (`CALREF`) on a board with
+the 1.25 V reference; nothing was captured on the 2.5 V design (factory
+default 0 = off). Comments and README updated.
+
 Design notes and open decisions for planned USBrepeater features. The
 architecture below (4-device hub + Ethernet) is a **settled design as of
 2026-09-25** — captured from design discussion so implementation can start

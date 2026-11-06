@@ -924,7 +924,9 @@ static void cmdSetAdcInterval(void)
 #define ADC_HW_AVERAGING     32   // analogReadAveraging() — hardware oversampling
 #define ADC_SW_SAMPLES       16   // additional software average on top of the above
 
-#define AIN_REF_PIN  A1   // ISL21070CIH325Z 2.5V precision reference (confirmed via netlist, TODO.md)
+#define AIN_REF_PIN  A1   // 1.25 V precision reference (was 2.5 V in the original design; see TODO.md).
+                          // The REF correction is ratiometric (RefCal/REF_now), so the voltage itself
+                          // isn't used anywhere; ~1550 counts at 12 bits. Re-run CALREF if it changes.
 
 static float readAveragedCounts(uint8_t pin)
 {
