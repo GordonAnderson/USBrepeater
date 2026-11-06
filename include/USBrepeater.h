@@ -20,17 +20,18 @@
 // switchable USB data port (SerialUSB2 / SDEV2).
 #define SIGNATURE  0xAA55A5AD
 
-// Number of downstream serial-device slots ("DevPorts"). Deliberately more
-// than the board's 4 physical USB-A connectors: a downstream instrument can
-// expose more than one USB serial device behind its own internal hub (e.g. a
-// MIPS unit's controller plus its FTDI RS-485 adapter), and slots are
-// assigned in USB claim order, not by connector. ActiveDevice/ActiveDevice2/
-// AdcTargetDevice below are 1-based indices into this range. Each slot also
-// gets a TCP data port (EthDataPortBase + slot - 1); QNEthernet's default
-// limit of 8 TCP connections covers 1 control + 6 data, so going past 6
-// needs its lwIP limits raised too. See src/USBrepeater.cpp Section 6 for
-// the per-slot state this drives (userial1..userial6, one ring buffer each).
-#define DEVPORT_COUNT 6
+// Number of downstream serial-device slots ("DevPorts"), numbered by board
+// connector: the instrument on connector N is slot N (1-4); a USB-serial
+// bridge behind that instrument's own internal hub (a MIPS's RS-485
+// temperature-controller adapter) is slot N+4 (5-8). Any device can go in
+// any connector; the connector decides its number. ActiveDevice/
+// ActiveDevice2/AdcTargetDevice below are 1-based indices into this range
+// (ActiveDevice/ActiveDevice2 also take 0 = automatic). Each slot also gets
+// a TCP data port (EthDataPortBase + slot - 1): 1 control + 8 data
+// connections needs QNEthernet's lwIP limits raised (MEMP_NUM_TCP_PCB /
+// MEMP_NUM_TCP_PCB_LISTEN, set in platformio.ini). See src/USBrepeater.cpp
+// Section 6 (updateSlotMap(), one ring buffer per slot).
+#define DEVPORT_COUNT 8
 
 #define DEVPORT_XSTR(x) DEVPORT_STR(x)
 #define DEVPORT_STR(x)  #x

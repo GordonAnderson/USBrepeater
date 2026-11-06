@@ -54,7 +54,7 @@ one dedicated passthrough port per downstream device:
 | Port | Purpose |
 | --- | --- |
 | `EthCtrlPort` (default 5000) | Control port: every `SerialUSB1` command works verbatim over this TCP connection — same commandProcessor, same ASCII protocol. |
-| `EthDataPortBase` (default 5001) | Device 1's dedicated passthrough port. Devices 2-6 get `EthDataPortBase`+1 through +5 (5002-5006 by default) — always reachable regardless of which device `SDEV` currently has Serial pointed at, since Ethernet isn't endpoint-limited the way USB is. |
+| `EthDataPortBase` (default 5001) | Device 1's dedicated passthrough port. Slots 2-8 get `EthDataPortBase`+1 through +7 (5002-5008 by default; slot N = connector N, see "Downstream ports") — always reachable regardless of which device `SDEV` currently has Serial pointed at, since Ethernet isn't endpoint-limited the way USB is. |
 
 All 5 are single-session — a new connection on a given port takes over from
 whatever was previously connected on that same port, same policy every
@@ -152,21 +152,28 @@ Adding a mode: append to the `SystemMode` enum, write a
 ### Downstream ports
 
 4 physical downstream USB-A connectors (via the Hub Carrier's USB2514B),
-feeding **6 serial-device slots** (`DEVPORT_COUNT`, numbered 1-6), each
-with its own `USBSerial_BigBuffer` and ring buffer. There are more slots
-than connectors because one instrument can present several USB serial
-devices behind its own internal hub — a MIPS unit's controller plus its
-FTDI RS-485 adapter, for example. Nested hubs are supported (one extra
-`USBHub` driver per connector), and both high-speed (512-byte) and
-full-speed (64-byte, e.g. SAMD boards, FTDI/CP210x/CH340 adapters) serial
-devices are claimed.
+feeding **8 serial-device slots** (`DEVPORT_COUNT`), each with its own
+ring buffer. Nested hubs are supported (one extra `USBHub` driver per
+connector), and both high-speed (512-byte) and full-speed (64-byte, e.g.
+SAMD boards, FTDI/CP210x/CH340 adapters) serial devices are claimed.
 
-**Slot numbers follow USB claim order, not the connector.** A device takes
-the first free slot when it enumerates, so moving a device between
-connectors doesn't change its slot, and the slots can come out in a
-different order after a reboot or replug. Host software should identify a
-slot's device by asking it (`GNAME`/`GVER` over that slot's passthrough
-path), not assume a fixed mapping.
+**Slots are numbered by connector.** Any device can go in any connector;
+the connector decides its number, regardless of boot or plug order:
+
+| Slot | What | TCP data port |
+|---|---|---|
+| 1-4 | The instrument on connector 1-4 | 5001-5004 |
+| 5-8 | A USB-serial bridge behind connector 1-4's instrument's own internal hub | 5005-5008 |
+
+Slots 5-8 are for a MIPS with an internal temperature controller on a
+USB-RS485 adapter (FTDI, behind the MIPS's own hub): that adapter is
+always 4 slots above its MIPS. A recognised bridge chip (FTDI, CP210x,
+CH340, PL2303) behind an inner hub takes slot N+4; anything else takes
+slot N. A bridge-chip adapter plugged straight into a connector is the
+instrument itself and gets slot N. A device that finds both of its
+connector's slots taken is left unassigned and shown as slot 0 in
+`GDEVPATH`. `GDEVPATH` shows each slot's connector, inner-hub port and
+VID/PID.
 
 All slots stay connected and auto-reconnecting continuously, and each one
 **keeps capturing incoming
@@ -177,17 +184,29 @@ is never silently lost.
 On the USB side, two ports are each bridged to one device at a time:
 `SDEV,<n>`/`GDEV` for `Serial`, `SDEV2,<n>`/`GDEV2` for `SerialUSB2` — the
 hardware's 3-CDC-port ceiling (control + 2 data) means two switchable USB
-paths is the most available, not four. **`ActiveDevice` and
-`ActiveDevice2` are kept mutually exclusive** — `SDEV`/`SDEV2` reject
-(NAK) a value that would point both ports at the same device, so a given
-device is never contended by more than one switchable USB port at once.
+paths is the most available, not four.
+
+**By default both are automatic (`SDEV,0`/`SDEV2,0`)**: data port 1 takes
+the lowest occupied slot and data port 2 the next one. With two
+instruments in any two connectors, the two data ports reach them with no
+setup, transparent to the host software. Adding a device on a lower
+connector later shifts the assignment (a device added on connector 1 takes
+data port 1). `SDEV,<n>`/`SDEV2,<n>` with n = 1-8 pins a port to that
+slot instead; the other port, if automatic, skips it. `GDEV`/`GDEV2`
+reply `<setting>,<effective slot>`, e.g. `0,4` = automatic, currently slot
+4 (effective 0 = nothing connected to bridge). Don't switch a data port
+while a host app has it open: the app would suddenly be talking to a
+different instrument. **`ActiveDevice` and `ActiveDevice2` are kept
+mutually exclusive** — `SDEV`/`SDEV2` reject (NAK) a value that would pin
+both ports to the same slot, so a given device is never contended by more
+than one switchable USB port at once.
 Switching either delivers that port's buffered backlog on the very next
 tick, with no separate "flush" step — the firmware always flushes a
 selected port's backlog to whoever last spoke to it, so what built up
 while it wasn't selected goes out immediately once it is.
 
 On the Ethernet side, every port is independent of `SDEV`/`SDEV2`: each of
-the 6 slots has its own dedicated, always-reachable TCP data
+the 8 slots has its own dedicated, always-reachable TCP data
 port (see the Ethernet section above), so a client connected to device 3's
 port gets device 3's traffic whether or not `SDEV`/`SDEV2` currently points
 either USB port at device 3. For whichever device *is* currently selected
@@ -199,11 +218,9 @@ upstream path, so there's no arbitration to do there. Because
 arbitrate between *both* switchable USB ports and Ethernet at once — at
 most one switchable port plus Ethernet, the same two-way case either way.
 
-Identifying what's plugged into which port is **the host's job, not
-firmware's**: switch `SDEV`/`SDEV2` through 1–4 and ask each one
-`GNAME`/`GVER` yourself over the ordinary passthrough path to build your
-own port-to-device table. Firmware never tries to identify a device
-itself.
+To check which instrument a data port reaches, send `GNAME` through it:
+the instrument itself answers. (Planned: the firmware asks each device's
+`GNAME` on attach and reports names per slot; see TODO.md.)
 
 `ADCThread` and the script demo (below) target a separate, independent
 selection — `SADCDEV,<n>` / `GADCDEV` — so switching which device the host
@@ -506,10 +523,10 @@ every registered command and its help string, `HELP,<cmd>` looks up one.
 | `GLINK` | `ActiveDevice`'s USB connection state (`TRUE`/`FALSE`) |
 | `GLINK2` | `ActiveDevice2`'s USB connection state (`TRUE`/`FALSE`) |
 | `GBAUD` / `SBAUD,<baud>` | Baud rate to the downstream device; set explicitly for Ethernet-only use |
-| `GDEV` / `SDEV,<n>` | Get/set which downstream slot (1-6) `Serial` is bridged to; `SDEV` rejects a value equal to `ActiveDevice2` |
-| `GDEV2` / `SDEV2,<n>` | Get/set which downstream slot (1-6) `SerialUSB2` is bridged to; `SDEV2` rejects a value equal to `ActiveDevice` |
-| `GADCDEV` / `SADCDEV,<n>` | Get/set which downstream slot (1-6) `ADCThread`/the script demo targets |
-| `GDEVSTAT` | One row per slot (1-6): `dev,connected,bytesWaiting,bytesDropped` |
+| `GDEV` / `SDEV,<n>` | Get/set which slot `Serial` is bridged to: 0 = automatic (lowest occupied slot, the default), 1-8 = pinned. `GDEV` replies `<setting>,<effective slot>`. `SDEV` rejects a pinned value equal to `ActiveDevice2` |
+| `GDEV2` / `SDEV2,<n>` | Same for `SerialUSB2`: 0 = automatic (next occupied slot after data port 1's), 1-8 = pinned. `SDEV2` rejects a pinned value equal to `ActiveDevice` |
+| `GADCDEV` / `SADCDEV,<n>` | Get/set which downstream slot (1-8) `ADCThread`/the script demo targets |
+| `GDEVSTAT` | One row per slot (1-8): `dev,connected,bytesWaiting,bytesDropped` |
 | `GDEVPATH` | Diagnostic: one row per slot (`slot,connected,connector,innerPort,vid,pid,speed,addr,hubAddr,hubPort`), then one per hub driver. `connector` is the board connector (1-4, matches the labels); `innerPort` is the port on a device's own internal hub, 0 if none |
 | `GETHDHCP` / `SETHDHCP,TRUE\|FALSE` | DHCP vs. static IP; reboot to apply |
 | `GETHIP` / `SETHIP,<a.b.c.d>` | Static IP address; reboot to apply |
@@ -517,7 +534,7 @@ every registered command and its help string, `HELP,<cmd>` looks up one.
 | `GETHGW` / `SETHGW,<a.b.c.d>` | Static gateway; reboot to apply |
 | `GETHCTRLPORT` / `SETHCTRLPORT,<port>` | TCP port for the network control port; reboot to apply |
 | `GETHDATAPORT` / `SETHDATAPORT,<port>` | TCP port for network passthrough; reboot to apply |
-| `GETHSTAT` | Live: `link,mode,ip,ctrlConnected,` then one `dataConnected` flag per slot (1-6) |
+| `GETHSTAT` | Live: `link,mode,ip,ctrlConnected,` then one `dataConnected` flag per slot (1-8) |
 | `GADCEN` / `SADCEN,TRUE\|FALSE` | ADC-update master enable |
 | `GADCPIN` / `SADCPIN,<pin>` | ADC input pin |
 | `GADCINT` / `SADCINT,<mS>` | ADC update interval |
@@ -575,6 +592,6 @@ including one behind a nested hub and one full-speed), both switchable
 USB paths and the per-slot Ethernet data ports, with "last speaker wins"
 confirmed across USB/Ethernet on the same device, script persistence
 across a real reboot, and DIO (control-port and script-syscall paths
-both). Remaining open work: slot 6 (untested), simultaneous multi-port TCP
+both). Remaining open work: slots 5-8 (untested), simultaneous multi-port TCP
 load, and the AIN REF-correction/filter work (needs a known calibration
 signal, not yet applied).

@@ -26,12 +26,12 @@
 //  single switchable upstream path (Serial) at a time — data.ActiveDevice,
 //  set via SDEV/GDEV — because the hardware doesn't have upstream USB
 //  endpoints to spare for more. Ethernet isn't endpoint-limited the same
-//  way: each of the 4 ports also has its own dedicated, always-reachable
-//  TCP data port (EthDataPortBase+0..3, Section 6c), independent of SDEV.
-//  The host is responsible for mapping port number to device identity: it
-//  switches SDEV through 1-DEVPORT_COUNT and asks each one GNAME/GVER itself over the
-//  ordinary passthrough path; firmware never tries to identify what's
-//  plugged in. ADCThread/the script demo (below) target a second,
+//  way: each slot also has its own dedicated, always-reachable TCP data
+//  port (EthDataPortBase + slot - 1, Section 6c), independent of SDEV.
+//  Slots are numbered by board connector (slot N = connector N; a MIPS's
+//  RS-485 adapter behind its own hub = N+4), so a slot's number, data port
+//  and TCP port stay the same across boots and replugs as long as the
+//  cabling does (Section 6, updateSlotMap()). ADCThread/the script demo (below) target a second,
 //  independent selection (data.AdcTargetDevice, SADCDEV/GADCDEV) so
 //  background monitoring of one device isn't disrupted by the host switching
 //  interactive focus to another.
@@ -184,8 +184,8 @@ Data DefaultData =
   1,              // Rev  — increment when hardware changes
   MODE_REPEATER,  // Mode — boot into repeater mode by default
 
-  1,              // ActiveDevice    — downstream port 1, boots selected by default
-  2,              // ActiveDevice2   — port 2, distinct from ActiveDevice (mutually exclusive, see USBrepeater.h)
+  0,              // ActiveDevice    — 0 = automatic: lowest occupied slot (see effectiveDev())
+  0,              // ActiveDevice2   — 0 = automatic: next occupied slot after data port 1's
   1,              // AdcTargetDevice — independent selection, no exclusivity constraint
 
   false,          // AdcEnabled  — off until a pin/command/scale is configured
@@ -248,7 +248,7 @@ void HousekeepingUpdate(void)
 
 // ADCUpdate — periodic ADC-driven downstream command injector. Implemented in
 // Section 6a (below), alongside the per-port state it shares with
-// RepeaterModeLoop() (userialPtr[]/devPort[], Section 6). ADCThread.onRun(
+// RepeaterModeLoop() (slotDrv[]/devPort[], Section 6). ADCThread.onRun(
 // ADCUpdate) is wired up in setup() (Section 8), which comes after Section 6a
 // in this file, so no forward declaration is needed.
 Thread ADCThread = Thread();
@@ -332,6 +332,7 @@ static int portLimits[] = {1, 65535};  // range check for ?ETHCTRLPORT / ?ETHDAT
 // dev1based is in [1, DEVPORT_COUNT]; callers here always pass a value
 // already range-checked by cp.getValue() or a persisted Data field.
 bool     isDeviceConnected(uint8_t dev1based);
+uint8_t  effectiveDev(uint8_t which);   // data port 1 or 2 -> slot it's bridged to now (1-based, 0 = none)
 uint16_t deviceBytesWaiting(uint8_t dev1based);
 uint32_t deviceBytesDropped(uint8_t dev1based);
 void     reinitDeviceBaud(uint8_t dev1based, uint32_t baud);
@@ -518,14 +519,14 @@ extern EthernetClient ethDataClient[DEVPORT_COUNT];   // defined in Section 6c
 static void cmdGetLink(void)
 {
   cp.sendACK(false);
-  cp.println(isDeviceConnected(data.ActiveDevice));
+  cp.println(isDeviceConnected(effectiveDev(1)));
 }
 
 // GLINK2 — same as GLINK, for SerialUSB2's selection (ActiveDevice2).
 static void cmdGetLink2(void)
 {
   cp.sendACK(false);
-  cp.println(isDeviceConnected(data.ActiveDevice2));
+  cp.println(isDeviceConnected(effectiveDev(2)));
 }
 
 // -----------------------------------------------------------------------------
@@ -543,12 +544,26 @@ static void cmdGetLink2(void)
 // for why: it keeps each device's upstream arbitration to at most one
 // switchable USB port plus its own Ethernet client, never both switchable
 // ports at once.
+//
+// 0 = automatic (the factory default): data port 1 follows the lowest
+// occupied slot, data port 2 the next one (see effectiveDev(), Section 6).
+// Slots are numbered by connector, so with two devices plugged in the two
+// data ports reach them with no setup, whichever connectors they're in.
+// A non-zero value pins the port to that slot. GDEV/GDEV2 reply
+// "<setting>,<effective slot>" (effective 0 = nothing to talk to).
 // -----------------------------------------------------------------------------
+static void printDevSelection(uint8_t setting, uint8_t which)
+{
+  cp.sendACK(false);
+  cp.print((int)setting);
+  cp.print(",");
+  cp.println((int)effectiveDev(which));
+}
+
 static void cmdGetDev(void)
 {
   if (!cp.checkExpectedArgs(0)) return;
-  cp.sendACK(false);
-  cp.println((int)data.ActiveDevice);
+  printDevSelection(data.ActiveDevice, 1);
 }
 
 static void cmdSetDev(void)
@@ -556,7 +571,7 @@ static void cmdSetDev(void)
   if (!cp.checkExpectedArgs(1)) return;
 
   int n;
-  if (!cp.getValue(&n, 1, DEVPORT_COUNT) || n == (int)data.ActiveDevice2)
+  if (!cp.getValue(&n, 0, DEVPORT_COUNT) || (n != 0 && n == (int)data.ActiveDevice2))
   {
     cp.sendNAK(ERR_BADARG);
     return;
@@ -569,8 +584,7 @@ static void cmdSetDev(void)
 static void cmdGetDev2(void)
 {
   if (!cp.checkExpectedArgs(0)) return;
-  cp.sendACK(false);
-  cp.println((int)data.ActiveDevice2);
+  printDevSelection(data.ActiveDevice2, 2);
 }
 
 static void cmdSetDev2(void)
@@ -578,7 +592,7 @@ static void cmdSetDev2(void)
   if (!cp.checkExpectedArgs(1)) return;
 
   int n;
-  if (!cp.getValue(&n, 1, DEVPORT_COUNT) || n == (int)data.ActiveDevice)
+  if (!cp.getValue(&n, 0, DEVPORT_COUNT) || (n != 0 && n == (int)data.ActiveDevice))
   {
     cp.sendNAK(ERR_BADARG);
     return;
@@ -661,7 +675,7 @@ static void cmdSetBaud(void)
   }
 
   curBaud = b;
-  reinitDeviceBaud(data.ActiveDevice, curBaud);
+  reinitDeviceBaud(effectiveDev(1), curBaud);
   cp.sendACK();
 }
 
@@ -1192,13 +1206,16 @@ static void cmdScriptErase(void)
 //  every port also has its own dedicated, always-reachable Ethernet data
 //  port (Section 6c), independent of either USB selection.
 //
-//  The host is responsible for mapping port number to device identity/
-//  function — it does this itself, by switching SDEV/SDEV2 through 1-DEVPORT_COUNT and
-//  asking each one GNAME/GVER over the ordinary passthrough path. Firmware
-//  doesn't try to identify what's plugged into a port; that would require
-//  injecting and parsing a command on every connect, which is real
-//  complexity this design deliberately avoids by pushing the decision to
-//  the host instead.
+//  SLOTS FOLLOW CONNECTORS
+//  -----------------------
+//  USBHost_t36 hands attached devices to the serial driver objects
+//  (userial1..8) in its own claim order. updateSlotMap() then files each
+//  one under the slot its board connector dictates (devicePath() reads the
+//  connector from the device's hub chain), and everything else here works
+//  in slots via slotSerial(). The data ports default to automatic (SDEV/
+//  SDEV2 = 0): lowest occupied slot, then the next (resolveDataPorts()).
+//  This reverses the earlier "the host maps slots itself" design — claim
+//  order made slot numbers depend on boot timing (see TODO.md).
 //
 //  RING BUFFER / FLUSH MODEL
 //  -------------------------
@@ -1263,19 +1280,40 @@ TrackedHub         *hubPtr[] = { &hub1, &hub2, &hub3, &hub4, &hub5 };
 // claim only high-speed devices (>64-byte bulk endpoints), silently
 // rejecting every full-speed one -- SAMD/TinyUSB boards like the
 // IsoElectrometer, and most FTDI/CP210x/CH340 adapters.
+//
+// These are USB *driver objects*, handed out by USBHost_t36 in its own claim
+// order — not slots. updateSlotMap() (below) files each attached one under
+// the slot its connector dictates; everything else in this file works in
+// slots, via slotSerial(), never on these objects directly.
 SlotSerial          userial1(myusb, 1);
 SlotSerial          userial2(myusb, 1);
 SlotSerial          userial3(myusb, 1);
 SlotSerial          userial4(myusb, 1);
 SlotSerial          userial5(myusb, 1);
 SlotSerial          userial6(myusb, 1);
+SlotSerial          userial7(myusb, 1);
+SlotSerial          userial8(myusb, 1);
 
-// Indexed 0..DEVPORT_COUNT-1; devPort[]/the command handlers above use
-// 1-based device numbers throughout (dev1based - 1 to index in here).
-SlotSerial *userialPtr[] = { &userial1, &userial2, &userial3,
-                             &userial4, &userial5, &userial6 };
-static_assert(sizeof(userialPtr) / sizeof(userialPtr[0]) == DEVPORT_COUNT,
-              "declare one userial per DEVPORT_COUNT slot");
+SlotSerial *drvPtr[] = { &userial1, &userial2, &userial3, &userial4,
+                         &userial5, &userial6, &userial7, &userial8 };
+static_assert(sizeof(drvPtr) / sizeof(drvPtr[0]) == DEVPORT_COUNT,
+              "declare one serial driver per DEVPORT_COUNT slot");
+
+// Slot (0-based) -> the driver object currently assigned to it, NULL =
+// empty. devPort[]/the command handlers above use 1-based slot numbers
+// (dev1based - 1 to index in here).
+SlotSerial *slotDrv[DEVPORT_COUNT] = { NULL };
+
+static inline SlotSerial *slotSerial(uint8_t idx)
+{
+  return (idx < DEVPORT_COUNT) ? slotDrv[idx] : NULL;
+}
+
+static inline bool slotConnected(uint8_t idx)
+{
+  SlotSerial *s = slotSerial(idx);
+  return s != NULL && (bool)(*s);
+}
 
 // -----------------------------------------------------------------------------
 // devicePath — which board connector (USB2514B downstream port, 1-4) a
@@ -1325,6 +1363,111 @@ bool devicePath(const Device_t *d, uint8_t *connector, uint8_t *innerPort)
 }
 
 // -----------------------------------------------------------------------------
+// Slot assignment — slots follow connectors, not USB claim order.
+//
+//   connector N, the instrument itself           -> slot N      (1-4)
+//   connector N, a USB-serial bridge chip behind
+//   that instrument's own internal hub            -> slot N + 4  (5-8)
+//
+// The second case is a MIPS with its internal temperature controller on a
+// USB-RS485 adapter (FTDI) — the only known nested-hub setup — so that
+// adapter is always 4 slots above its MIPS. A bridge chip plugged straight
+// into a connector (no inner hub) is the instrument itself and gets slot N.
+// If the preferred slot is already taken (an unexpected second device
+// behind one connector), the other slot of that connector is used; if both
+// are taken, the device stays unassigned (GDEVPATH shows it as slot 0). A
+// device that isn't behind the board hub at all (no hub fitted) takes the
+// first free slot, so the firmware still works on a bare Teensy.
+// -----------------------------------------------------------------------------
+static bool isUsbSerialBridgeChip(uint16_t vid)
+{
+  return vid == 0x0403    // FTDI
+      || vid == 0x10C4    // Silicon Labs CP210x
+      || vid == 0x1A86    // WCH CH340/CH341
+      || vid == 0x067B;   // Prolific PL2303
+}
+
+static bool driverAssigned(SlotSerial *drv)
+{
+  for (uint8_t s = 0; s < DEVPORT_COUNT; s++)
+    if (slotDrv[s] == drv) return true;
+  return false;
+}
+
+static int8_t chooseSlot(SlotSerial *drv)
+{
+  uint8_t conn = 0, inner = 0;
+  if (!devicePath(drv->dev(), &conn, &inner) || conn < 1 || conn > 4)
+  {
+    for (uint8_t s = 0; s < DEVPORT_COUNT; s++)
+      if (slotDrv[s] == NULL) return (int8_t)s;
+    return -1;
+  }
+
+  uint8_t mainSlot  = (uint8_t)(conn - 1);
+  uint8_t extraSlot = (uint8_t)(conn - 1 + 4);
+  bool preferExtra  = (inner != 0) && isUsbSerialBridgeChip(drv->idVendor());
+
+  uint8_t first  = preferExtra ? extraSlot : mainSlot;
+  uint8_t second = preferExtra ? mainSlot  : extraSlot;
+  if (slotDrv[first]  == NULL) return (int8_t)first;
+  if (slotDrv[second] == NULL) return (int8_t)second;
+  return -1;
+}
+
+// Runs every RepeaterModeLoop() pass, right after myusb.Task(): drop slots
+// whose device has gone, then file any newly attached driver.
+static void updateSlotMap(void)
+{
+  for (uint8_t s = 0; s < DEVPORT_COUNT; s++)
+    if (slotDrv[s] != NULL && !(bool)(*slotDrv[s])) slotDrv[s] = NULL;
+
+  for (uint8_t i = 0; i < DEVPORT_COUNT; i++)
+  {
+    SlotSerial *drv = drvPtr[i];
+    if (!(bool)(*drv) || driverAssigned(drv)) continue;
+    int8_t s = chooseSlot(drv);
+    if (s >= 0) slotDrv[s] = drv;
+  }
+}
+
+// -----------------------------------------------------------------------------
+// effectiveDev — which slot data port 1 (which=1, Serial) or data port 2
+// (which=2, SerialUSB2) is bridged to right now. 1-based; 0 = none.
+//
+// A non-zero ActiveDevice/ActiveDevice2 pins that port to that slot. 0 is
+// automatic: data port 1 takes the lowest occupied slot, data port 2 the
+// next occupied one, skipping whatever the other port uses. Because slots
+// follow connectors, two devices in any two connectors reach the two data
+// ports with no setup. Adding a device on a lower connector later shifts
+// the automatic assignment.
+// -----------------------------------------------------------------------------
+static void resolveDataPorts(uint8_t *sel1, uint8_t *sel2)   // 0-based; DEVPORT_COUNT = none
+{
+  uint8_t a = data.ActiveDevice, b = data.ActiveDevice2;
+  *sel1 = (a >= 1 && a <= DEVPORT_COUNT) ? (uint8_t)(a - 1) : DEVPORT_COUNT;
+  *sel2 = (b >= 1 && b <= DEVPORT_COUNT) ? (uint8_t)(b - 1) : DEVPORT_COUNT;
+
+  if (a == 0)
+    for (uint8_t s = 0; s < DEVPORT_COUNT; s++)
+      if (slotConnected(s) && s != *sel2) { *sel1 = s; break; }
+
+  if (b == 0)
+    for (uint8_t s = 0; s < DEVPORT_COUNT; s++)
+      if (slotConnected(s) && s != *sel1) { *sel2 = s; break; }
+
+  if (*sel2 == *sel1) *sel2 = DEVPORT_COUNT;   // defensive: SDEV/SDEV2 keep pinned values distinct
+}
+
+uint8_t effectiveDev(uint8_t which)
+{
+  uint8_t s1, s2;
+  resolveDataPorts(&s1, &s2);
+  uint8_t s = (which == 2) ? s2 : s1;
+  return (s < DEVPORT_COUNT) ? (uint8_t)(s + 1) : 0;
+}
+
+// -----------------------------------------------------------------------------
 // GDEVPATH — diagnostic: for every serial driver slot, what's attached and
 // where (connector, inner-hub port, VID/PID, speed, USB address/hub
 // address/hub port), then every hub driver. Lets the connector mapping be
@@ -1337,6 +1480,22 @@ static void printHex4(uint16_t v)
   cp.print(buf);
 }
 
+static void printDevPathRow(int slot, const Device_t *d)
+{
+  uint8_t conn = 0, inner = 0;
+  devicePath(d, &conn, &inner);
+  cp.print(slot);                 cp.print(",");
+  cp.print(d != NULL);            cp.print(",");
+  cp.print((int)conn);            cp.print(",");
+  cp.print((int)inner);           cp.print(",");
+  printHex4(d ? d->idVendor : 0); cp.print(",");
+  printHex4(d ? d->idProduct : 0); cp.print(",");
+  cp.print((int)(d ? d->speed : 0));       cp.print(",");
+  cp.print((int)(d ? d->address : 0));     cp.print(",");
+  cp.print((int)(d ? d->hub_address : 0)); cp.print(",");
+  cp.println((int)(d ? d->hub_port : 0));
+}
+
 void cmdGetDevPath(void)
 {
   if (!cp.checkExpectedArgs(0)) return;
@@ -1345,19 +1504,14 @@ void cmdGetDevPath(void)
   cp.println("#slot,connected,connector,innerPort,vid,pid,speed,addr,hubAddr,hubPort");
   for (uint8_t i = 0; i < DEVPORT_COUNT; i++)
   {
-    const Device_t *d = userialPtr[i]->dev();
-    uint8_t conn = 0, inner = 0;
-    devicePath(d, &conn, &inner);
-    cp.print((int)(i + 1));         cp.print(",");
-    cp.print(d != NULL);            cp.print(",");
-    cp.print((int)conn);            cp.print(",");
-    cp.print((int)inner);           cp.print(",");
-    printHex4(d ? d->idVendor : 0); cp.print(",");
-    printHex4(d ? d->idProduct : 0); cp.print(",");
-    cp.print((int)(d ? d->speed : 0));       cp.print(",");
-    cp.print((int)(d ? d->address : 0));     cp.print(",");
-    cp.print((int)(d ? d->hub_address : 0)); cp.print(",");
-    cp.println((int)(d ? d->hub_port : 0));
+    SlotSerial *s = slotSerial(i);
+    printDevPathRow(i + 1, s ? s->dev() : NULL);
+  }
+  // Attached but not given a slot (both of its connector's slots taken):
+  // reported as slot 0 so the problem is visible, not silent.
+  for (uint8_t i = 0; i < DEVPORT_COUNT; i++)
+  {
+    if ((bool)(*drvPtr[i]) && !driverAssigned(drvPtr[i])) printDevPathRow(0, drvPtr[i]->dev());
   }
   cp.println("#hub,connected,vid,pid,addr,hubAddr,hubPort");
   for (uint8_t i = 0; i < HUB_COUNT; i++)
@@ -1386,7 +1540,7 @@ uint8_t  repeaterBuf[512];   // shared scratch buffer for all per-port USB reads
 
 struct DevPort
 {
-  bool     wasConnected       = false;
+  SlotSerial *startedDrv      = NULL;  // driver begin()'d for this slot; differs from slotDrv[] => (re)start it
   uint16_t rxHead             = 0;  // ring buffer write index
   uint16_t rxTail             = 0;  // ring buffer read index
   uint16_t rxCount            = 0;  // bytes currently buffered
@@ -1431,7 +1585,7 @@ Stream *pcSide2 = &SerialUSB2;
 bool isDeviceConnected(uint8_t dev1based)
 {
   if (dev1based < 1 || dev1based > DEVPORT_COUNT) return false;
-  return (bool)(*userialPtr[dev1based - 1]);
+  return slotConnected((uint8_t)(dev1based - 1));
 }
 
 uint16_t deviceBytesWaiting(uint8_t dev1based)
@@ -1449,7 +1603,7 @@ uint32_t deviceBytesDropped(uint8_t dev1based)
 void reinitDeviceBaud(uint8_t dev1based, uint32_t baud)
 {
   if (dev1based < 1 || dev1based > DEVPORT_COUNT) return;
-  if (isDeviceConnected(dev1based)) userialPtr[dev1based - 1]->begin(baud);
+  if (isDeviceConnected(dev1based)) slotSerial((uint8_t)(dev1based - 1))->begin(baud);
 }
 
 // -----------------------------------------------------------------------------
@@ -1476,14 +1630,16 @@ static void devPortPush(uint8_t idx, uint8_t b)
   p.rxCount++;
 }
 
-// Drain whatever's available from userialPtr[idx] into devPort[idx]'s ring
+// Drain whatever's available from slot idx's device into devPort[idx]'s ring
 // buffer. Runs for all DEVPORT_COUNT ports every tick, regardless of selection.
 static void devPortDrainIncoming(uint8_t idx)
 {
-  int n = userialPtr[idx]->available();
+  SlotSerial *s = slotSerial(idx);
+  if (s == NULL) return;
+  int n = s->available();
   if (n <= 0) return;
 
-  n = userialPtr[idx]->readBytes((char *)repeaterBuf, min(n, (int)sizeof(repeaterBuf)));
+  n = s->readBytes((char *)repeaterBuf, min(n, (int)sizeof(repeaterBuf)));
   for (int i = 0; i < n; i++) devPortPush(idx, repeaterBuf[i]);
 }
 
@@ -1508,10 +1664,12 @@ static void devPortFlush(uint8_t idx, Stream *out)
 static void devPortUpdateConnection(uint8_t idx)
 {
   DevPort &p = devPort[idx];
-  bool connected = (bool)(*userialPtr[idx]);
+  SlotSerial *s = slotConnected(idx) ? slotSerial(idx) : NULL;
 
-  if (connected && !p.wasConnected) userialPtr[idx]->begin(curBaud);
-  p.wasConnected = connected;
+  // Start the driver when a device lands in this slot, including a
+  // different driver object replacing the previous one in the same pass.
+  if (s != NULL && s != p.startedDrv) s->begin(curBaud);
+  p.startedDrv = s;
 }
 
 void RepeaterModeSetup(void)
@@ -1532,6 +1690,7 @@ void RepeaterModeSetup(void)
 void RepeaterModeLoop(void)
 {
   myusb.Task();
+  updateSlotMap();   // file newly attached devices under their connector's slot
 
   // Connection management + incoming capture: all DEVPORT_COUNT ports, every tick,
   // unconditionally. This is what makes "nothing is lost" true regardless
@@ -1542,18 +1701,23 @@ void RepeaterModeLoop(void)
     devPortDrainIncoming(i);
   }
 
-  uint8_t selIdx = (uint8_t)(data.ActiveDevice - 1);
-  if (selIdx >= DEVPORT_COUNT) selIdx = 0;   // defensive; ActiveDevice is range-checked at SDEV time
-  USBSerial_BigBuffer *sel = userialPtr[selIdx];
-  bool connected = (bool)(*sel);
+  // Which slot each data port is bridged to this pass (pinned by SDEV/SDEV2,
+  // or automatic — see effectiveDev()). DEVPORT_COUNT = nothing to bridge;
+  // the blocks below then leave that data port idle.
+  uint8_t selIdx, selIdx2;
+  resolveDataPorts(&selIdx, &selIdx2);
+  USBSerial_BigBuffer *sel        = slotSerial(selIdx);
+  bool                 connected  = slotConnected(selIdx);
+  USBSerial_BigBuffer *sel2       = slotSerial(selIdx2);
+  bool                 connected2 = slotConnected(selIdx2);
 
-  uint8_t selIdx2 = (uint8_t)(data.ActiveDevice2 - 1);
-  if (selIdx2 >= DEVPORT_COUNT) selIdx2 = 0;   // defensive; ActiveDevice2 is range-checked at SDEV2 time
-  if (selIdx2 == selIdx) selIdx2 = DEVPORT_COUNT;   // defensive: SDEV/SDEV2 enforce exclusivity, so this
-                                                     // should never happen; an out-of-range sentinel disables
-                                                     // the port2 block below rather than double-handling selIdx
-  USBSerial_BigBuffer *sel2       = (selIdx2 < DEVPORT_COUNT) ? userialPtr[selIdx2] : NULL;
-  bool                 connected2 = (sel2 != NULL) && (bool)(*sel2);
+  // When a data port moves to a different slot (SDEV/SDEV2, or the
+  // automatic choice shifting), its "last speaker" falls back to the USB
+  // port itself: an Ethernet client of the previous slot must never
+  // receive the new slot's output.
+  static uint8_t prevSelIdx = DEVPORT_COUNT, prevSelIdx2 = DEVPORT_COUNT;
+  if (selIdx  != prevSelIdx)  { pcSide  = &Serial;     prevSelIdx  = selIdx;  }
+  if (selIdx2 != prevSelIdx2) { pcSide2 = &SerialUSB2; prevSelIdx2 = selIdx2; }
 
   digitalWriteFast(LED_BUILTIN, connected ? HIGH : LOW);   // reflects ActiveDevice (port 1) only
 
@@ -1635,13 +1799,13 @@ void RepeaterModeLoop(void)
   {
     if (i == selIdx || i == selIdx2) continue;   // handled above, arbitrated with Serial/SerialUSB2
     if (!(ethDataClient[i] && ethDataClient[i].connected())) continue;
-    if (!(bool)(*userialPtr[i])) continue;   // nothing connected to write to
+    if (!slotConnected(i)) continue;   // nothing connected to write to
 
     int n = ethDataClient[i].available();
     if (n > 0)
     {
       n = ethDataClient[i].read(repeaterBuf, min(n, (int)sizeof(repeaterBuf)));
-      userialPtr[i]->write(repeaterBuf, n);
+      slotSerial(i)->write(repeaterBuf, n);
       devPort[i].lastHostToDeviceMs = millis();
     }
   }
@@ -1655,7 +1819,7 @@ void RepeaterModeLoop(void)
   // buffered (see the ring-buffer/flush header comment above for why
   // that's the right default rather than discarding it or forcing it onto
   // a switchable USB port it was never meant for).
-  devPortFlush(selIdx, pcSide);
+  if (selIdx  < DEVPORT_COUNT) devPortFlush(selIdx,  pcSide);
   if (selIdx2 < DEVPORT_COUNT) devPortFlush(selIdx2, pcSide2);
   for (uint8_t i = 0; i < DEVPORT_COUNT; i++)
   {
@@ -1710,7 +1874,7 @@ void ADCUpdate(void)
 
   uint8_t idx = (uint8_t)(data.AdcTargetDevice - 1);
   if (idx >= DEVPORT_COUNT) return;   // defensive; AdcTargetDevice is range-checked at SADCDEV time
-  if (!(bool)(*userialPtr[idx])) return;   // nothing connected to control
+  if (!slotConnected(idx)) return;   // nothing connected to control
 
   if ((millis() - devPort[idx].lastHostToDeviceMs) < ADC_QUIET_GUARD_MS) return;  // link busy, try next cycle
 
@@ -1722,7 +1886,7 @@ void ADCUpdate(void)
   if (len <= 0) return;
   if (len >= (int)sizeof(cmdLine)) len = sizeof(cmdLine) - 1;  // truncated; still send what fits
 
-  userialPtr[idx]->write((uint8_t *)cmdLine, len);
+  slotSerial(idx)->write((uint8_t *)cmdLine, len);
   devPort[idx].swallowUntilMs = millis() + ADC_SWALLOW_WINDOW_MS;
 }
 
@@ -1779,7 +1943,7 @@ static int32_t sys_link_ready(int32_t *args, uint8_t argc)
 
   uint8_t idx = (uint8_t)(data.AdcTargetDevice - 1);
   if (idx >= DEVPORT_COUNT) return 0;
-  if (!(bool)(*userialPtr[idx])) return 0;                                      // nothing connected
+  if (!slotConnected(idx)) return 0;                                      // nothing connected
   if ((millis() - devPort[idx].lastHostToDeviceMs) < ADC_QUIET_GUARD_MS) return 0; // link busy
   return 1;
 }
@@ -1804,7 +1968,7 @@ static int32_t sys_scale_send(int32_t *args, uint8_t argc)
   if (len <= 0) return 0;
   if (len >= (int)sizeof(cmdLine)) len = sizeof(cmdLine) - 1;  // truncated; still send what fits
 
-  userialPtr[idx]->write((uint8_t *)cmdLine, len);
+  slotSerial(idx)->write((uint8_t *)cmdLine, len);
   devPort[idx].swallowUntilMs = millis() + ADC_SWALLOW_WINDOW_MS;
   return 1;
 }

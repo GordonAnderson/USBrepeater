@@ -537,15 +537,48 @@ Facts this design relies on (per the user):
 
 **Part A — stable slots and names (build now):**
 1. [x] Connector detection (`devicePath()`, `GDEVPATH`), verified above.
-2. [ ] Slots by connector: the GAACE device on connector N is slot N, an
+2. [x] Slots by connector: the GAACE device on connector N is slot N, an
        RS-485 adapter behind that connector's MIPS is slot N+4 (8 slots,
-       TCP 5001-5008; raise QNEthernet's `MEMP_NUM_TCP_PCB` to at least 9).
-       Any device can go in any connector; the connector decides its
-       number. `GDEVSTAT`/`GETHSTAT` grow to 8 entries (host-visible).
-3. [ ] Data ports follow the lowest occupied connectors: data port 1
+       TCP 5001-5008). Any device can go in any connector; the connector
+       decides its number. `GDEVSTAT`/`GETHSTAT` grow to 8 entries
+       (host-visible). **Done (2026-11-05).** USBHost_t36's driver objects
+       (`userial1..8`, claim order) are now separate from slots:
+       `updateSlotMap()` files each attached driver under its connector's
+       slot every loop pass, and every former `userialPtr[slot]` use goes
+       through `slotSerial()`/`slotConnected()`. Rule for the extra slot:
+       a known bridge chip (FTDI `0403`, CP210x `10C4`, CH340 `1A86`,
+       PL2303 `067B`) *behind an inner hub* prefers N+4, anything else N;
+       if the preferred slot is taken the other is used, and if both are
+       taken the device stays unassigned (slot 0 in `GDEVPATH`). Not behind
+       the board hub at all = first free slot. lwIP `MEMP_NUM_TCP_PCB` and
+       `MEMP_NUM_TCP_PCB_LISTEN` raised to 12 (`platformio.ini`). RAM1
+       free 174 KB -> 155 KB.
+3. [x] Data ports follow the lowest occupied connectors: data port 1
        takes the lowest-numbered connector with a device, data port 2 the
        next. Deterministic from cabling alone; adding a device on a lower
        connector shifts the assignment. A saved `SDEV`/`SDEV2` overrides.
+       **Done (2026-11-05).** `SDEV`/`SDEV2` take 0 = automatic (now the
+       factory default, no `Data` layout change, so no signature bump;
+       a board with saved 1/2 keeps them until `SDEV,0`/`SDEV2,0` +
+       `SAVE`). `GDEV`/`GDEV2` reply `<setting>,<effective slot>`
+       (host-visible format change). When a data port's effective slot
+       changes, its "last speaker" resets to the USB port, so an Ethernet
+       client of the old slot never gets the new slot's output.
+
+   **Hardware-tested (2026-11-05)**, QUAD (MIPS) and IsoElectrometer:
+   - QUAD on connector 1, electrometer on connector 4: slots 1 and 4
+     (under claim order the electrometer had been slot 2); `GDEV`/`GDEV2`
+     `0,1`/`0,4`; `GNAME` through data port 1/2 answered `QUAD`/
+     `IsoElectrometer` with no setup.
+   - `SDEV2,1` pinned data port 2 to QUAD and data port 1 moved to the
+     electrometer automatically; `SDEV,1` was then NAKed (port 2 held slot
+     1); `SDEV,9` NAKed; `SDEV,0`/`SDEV2,0` restored the default layout.
+   - Electrometer moved from connector 4 to connector 2 live: it became
+     slot 2, slot 4 cleared, data port 2 followed it (`GDEV2` `0,2`,
+     `GNAME` `IsoElectrometer`), QUAD undisturbed on slot 1/data port 1.
+   - Not yet tested: Ethernet (link was down, so TCP 5001-5008 unchecked),
+     a reboot with both plugged in, and the slot N+4 rule (needs the MIPS
+     with the internal hub/RS-485 temperature controller).
 4. [ ] `GNAME` queried on attach (retry while the MIPS boots, reply
        swallowed, slot held out of passthrough until answered or timed
        out); no reply = not a GAACE device. New `GDEVLIST` (slot,
