@@ -174,6 +174,7 @@ using namespace qindesign::network;
 
 // Active runtime data. Loaded from EEPROM on boot; written back by SAVE.
 Data data;
+ExtData ext = { "", EXT_SIGNATURE };   // see ExtData in USBrepeater.h
 
 // Default (factory) values written whenever EEPROM is un-initialised or its
 // signature is invalid (first boot, or a blank chip).
@@ -396,8 +397,8 @@ Command cmds[] =
   {"SDEV",     CMDfunction, -1, (void *)cmdSetDev,         NULL, "Set Serial's active downstream device, " DEVPORT_RANGE_STR " (must differ from ActiveDevice2)"},
   {"GDEV2",    CMDfunction, -1, (void *)cmdGetDev2,        NULL, "Get SerialUSB2's active downstream device, " DEVPORT_RANGE_STR},
   {"SDEV2",    CMDfunction, -1, (void *)cmdSetDev2,        NULL, "Set SerialUSB2's active downstream device, " DEVPORT_RANGE_STR " (must differ from ActiveDevice)"},
-  {"GADCDEV",  CMDfunction, -1, (void *)cmdGetAdcDev,      NULL, "Get ADCThread/script target device, " DEVPORT_RANGE_STR},
-  {"SADCDEV",  CMDfunction, -1, (void *)cmdSetAdcDev,      NULL, "Set ADCThread/script target device, " DEVPORT_RANGE_STR},
+  {"GADCDEV",  CMDfunction, -1, (void *)cmdGetAdcDev,      NULL, "Get ADCThread/script target: <slot " DEVPORT_RANGE_STR " or name>,<effective slot>"},
+  {"SADCDEV",  CMDfunction, -1, (void *)cmdSetAdcDev,      NULL, "Set ADCThread/script target: slot " DEVPORT_RANGE_STR ", or an instrument name (its GNAME)"},
   {"GDEVSTAT", CMDfunction,  0, (void *)cmdGetDevStat,     NULL, "Per-port status: dev,connected,bytesWaiting,bytesDropped"},
   {"GDEVPATH", CMDfunction,  0, (void *)cmdGetDevPath,     NULL, "Diagnostic: each slot's board connector, inner-hub port, VID/PID, USB addresses; then each hub"},
   {"GDEVLIST", CMDfunction,  0, (void *)cmdGetDevList,     NULL, "Occupied slots: slot,connector,MAIN|EXTRA,vid,pid,state,name (name from GNAME on attach)"},
@@ -615,26 +616,70 @@ static void cmdSetDev2(void)
 // the GAACE_Script demo send to. Deliberately independent of GDEV/SDEV: see
 // the command table comment above.
 // -----------------------------------------------------------------------------
+//
+// The target is either a slot number (SADCDEV,<n>, n = 1-8) or an
+// instrument name (SADCDEV,<name>, its GNAME, e.g. SADCDEV,QUAD). A name
+// follows the instrument to whatever slot/connector it's in and sends
+// nothing while it's absent; a number is a fixed slot, as before. Setting
+// a number clears the name. GADCDEV replies "<setting>,<effective slot>",
+// e.g. "QUAD,1" or "3,3" (effective 0 = the named instrument isn't
+// connected). The name is saved by SAVE, in the ExtData record.
+// -----------------------------------------------------------------------------
+int8_t slotByName(const char *name);   // Section 6
+
+// The slot (0-based) ADCThread / the script demo send to right now, or
+// DEVPORT_COUNT if a named target isn't connected.
+uint8_t adcTargetIdx(void)
+{
+  if (ext.AdcTargetName[0] != '\0')
+  {
+    int8_t s = slotByName(ext.AdcTargetName);
+    return (s >= 0) ? (uint8_t)s : DEVPORT_COUNT;
+  }
+  uint8_t idx = (uint8_t)(data.AdcTargetDevice - 1);
+  return (idx < DEVPORT_COUNT) ? idx : DEVPORT_COUNT;
+}
+
 static void cmdGetAdcDev(void)
 {
   if (!cp.checkExpectedArgs(0)) return;
+  uint8_t idx = adcTargetIdx();
   cp.sendACK(false);
-  cp.println((int)data.AdcTargetDevice);
+  if (ext.AdcTargetName[0] != '\0') cp.print(ext.AdcTargetName);
+  else                              cp.print((int)data.AdcTargetDevice);
+  cp.print(",");
+  cp.println((int)(idx < DEVPORT_COUNT ? idx + 1 : 0));
 }
 
 static void cmdSetAdcDev(void)
 {
   if (!cp.checkExpectedArgs(1)) return;
 
-  int n;
-  if (!cp.getValue(&n, 1, DEVPORT_COUNT))
-  {
-    cp.sendNAK(ERR_BADARG);
-    return;
-  }
+  char *tok;
+  if (!cp.getValue(&tok)) { cp.sendNAK(ERR_BADARG); return; }
 
-  data.AdcTargetDevice = (uint8_t)n;
-  cp.sendACK();
+  bool numeric = (tok[0] != '\0');
+  for (const char *c = tok; *c; c++) if (*c < '0' || *c > '9') { numeric = false; break; }
+
+  bool ok = true;
+  if (numeric)
+  {
+    int n = atoi(tok);
+    if (n >= 1 && n <= DEVPORT_COUNT)
+    {
+      data.AdcTargetDevice = (uint8_t)n;
+      ext.AdcTargetName[0] = '\0';
+    }
+    else ok = false;
+  }
+  else if (strlen(tok) < EXT_NAME_LEN)
+  {
+    strcpy(ext.AdcTargetName, tok);   // need not be connected yet
+  }
+  else ok = false;
+
+  cp.ca->free(tok);
+  if (ok) cp.sendACK(); else cp.sendNAK(ERR_BADARG);
 }
 
 // -----------------------------------------------------------------------------
@@ -2289,8 +2334,9 @@ void RepeaterModeLoop(void)
 //  and is answered at the reply's first newline. The script pauses
 //  meanwhile (GAACE_Script's waiting syscalls) and nothing else on the
 //  repeater waits; ScriptRuntime::poll() resumes it with the result. Result
-//  rules match cmd(): ACK -> number, TRUE/FALSE -> 1/0, otherwise (NAK, no
-//  reply within ARB_TIMEOUT_MS, device absent or gone) 0. Up to SCRIPT_REQS
+//  rules match cmd(): ACK + number -> number, bare ACK -> 1, TRUE/FALSE ->
+//  1/0, otherwise (NAK, no reply within ARB_TIMEOUT_MS, device absent or
+//  gone) 0. Up to SCRIPT_REQS
 //  requests can be in flight across all script slots; past that a call
 //  returns 0 straight away. Scripts should use single-line commands: the
 //  tail of a multi-line reply would reach the device's next requester.
@@ -2326,15 +2372,17 @@ static int8_t handleSlot(int32_t h)
   return slotByName(scriptDevName[h - 1]);
 }
 
-// Same reply rules as GAACE_Script's cmd() bridge: after the ACK, TRUE/FALSE
-// -> 1/0, else a number; anything else -> 0. Floats come back as bits.
+// Same reply rules as GAACE_Script's cmd() bridge: after the ACK, nothing
+// (a bare ACK: a set command that worked) -> 1, TRUE/FALSE -> 1/0, else a
+// number; anything else (NAK) -> 0. Floats come back as bits.
 static int32_t parseReply(const char *r, bool wantFloat)
 {
   if ((uint8_t)r[0] != 0x06) return 0;
   const char *v = r + 1;
   while (*v == ' ') v++;
   float f;
-  if      (strncasecmp(v, "TRUE", 4) == 0 && !isalnum((unsigned char)v[4]))  f = 1.0f;
+  if      (*v == '\0')                                                       f = 1.0f;
+  else if (strncasecmp(v, "TRUE", 4) == 0 && !isalnum((unsigned char)v[4]))  f = 1.0f;
   else if (strncasecmp(v, "FALSE", 5) == 0 && !isalnum((unsigned char)v[5])) f = 0.0f;
   else if (!wantFloat) return (int32_t)atoi(v);
   else f = (float)atof(v);
@@ -2498,8 +2546,8 @@ void ADCUpdate(void)
 {
   if (!data.AdcEnabled) return;
 
-  uint8_t idx = (uint8_t)(data.AdcTargetDevice - 1);
-  if (idx >= DEVPORT_COUNT) return;   // defensive; AdcTargetDevice is range-checked at SADCDEV time
+  uint8_t idx = adcTargetIdx();
+  if (idx >= DEVPORT_COUNT) return;   // named target not connected
   if (!slotReady(idx)) return;   // nothing connected to control, or GNAME pending
 
   float counts = readAdcCounts();
@@ -2564,8 +2612,8 @@ static int32_t sys_link_ready(int32_t *args, uint8_t argc)
 {
   (void)args; (void)argc;
 
-  uint8_t idx = (uint8_t)(data.AdcTargetDevice - 1);
-  if (idx >= DEVPORT_COUNT) return 0;
+  uint8_t idx = adcTargetIdx();
+  if (idx >= DEVPORT_COUNT) return 0;   // named target not connected
   if (!slotReady(idx)) return 0;         // nothing connected, or GNAME pending
   if (arbInternalBusy(idx)) return 0;    // our previous send hasn't gone out / been answered yet
   return 1;
@@ -2581,8 +2629,8 @@ static int32_t sys_scale_send(int32_t *args, uint8_t argc)
 {
   (void)argc;
 
-  uint8_t idx = (uint8_t)(data.AdcTargetDevice - 1);
-  if (idx >= DEVPORT_COUNT) return 0;
+  uint8_t idx = adcTargetIdx();
+  if (idx >= DEVPORT_COUNT) return 0;   // named target not connected
   if (!slotReady(idx)) return 0;   // empty slot (no driver object to write to), or GNAME pending
 
   float value = scaleAdcValue((float)args[0]);
@@ -2998,6 +3046,19 @@ static int32_t sys_dio_read(int32_t *args, uint8_t argc)
 // =============================================================================
 
 #define EEPROM_ADDR 0
+#define EXT_EEPROM_ADDR (EEPROM_ADDR + sizeof(Data))   // ExtData right after Data
+
+// Read the ExtData record; keep the defaults if it was never saved.
+static void loadExtSettings(void)
+{
+  ExtData te;
+  EEPROM.get(EXT_EEPROM_ADDR, te);
+  if (te.Signature == EXT_SIGNATURE)
+  {
+    te.AdcTargetName[EXT_NAME_LEN - 1] = '\0';
+    ext = te;
+  }
+}
 
 // SaveSettings — write the current Data struct to EEPROM.
 // The Signature is set here (not at load time) so that a partial write caused
@@ -3006,6 +3067,8 @@ void SaveSettings(void)
 {
   data.Signature = SIGNATURE;
   EEPROM.put(EEPROM_ADDR, data);
+  ext.Signature = EXT_SIGNATURE;
+  EEPROM.put(EXT_EEPROM_ADDR, ext);
   cp.sendACK();
 }
 
@@ -3019,6 +3082,7 @@ void RestoreSettings(void)
   {
     data        = td;
     currentMode = data.Mode;
+    loadExtSettings();
     cp.sendACK();
   }
   else
@@ -3037,6 +3101,7 @@ void setup()
   // ── 1. Restore persistent data ──────────────────────────────────────────────
   EEPROM.get(EEPROM_ADDR, data);
   if (data.Signature != SIGNATURE) data = DefaultData;
+  else loadExtSettings();   // only alongside a valid Data record
   currentMode = data.Mode;
   if (currentMode >= NUM_MODES) currentMode = MODE_REPEATER;
 

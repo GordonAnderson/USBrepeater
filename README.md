@@ -240,9 +240,13 @@ If two devices report the same name, `GDEVSLOT` returns the lower slot.
 You can also check a data port directly by sending `GNAME` through it.
 
 `ADCThread` and the script demo (below) target a separate, independent
-selection — `SADCDEV,<n>` / `GADCDEV` — so switching which device the host
+selection — `SADCDEV` / `GADCDEV` — so switching which device the host
 is interactively looking at never interrupts background monitoring of a
-different one.
+different one. The target can be a slot (`SADCDEV,3`) or, better, an
+instrument's name (`SADCDEV,QUAD`, its `GNAME`): a name follows the
+instrument to whatever connector it's in and sends nothing while it's
+absent. `GADCDEV` replies `<setting>,<effective slot>`, e.g. `QUAD,1`
+(effective 0 = not connected). `SAVE` keeps the name.
 
 `GDEVSTAT` reports one line per port: `dev,connected,bytesWaiting,
 bytesDropped`. `bytesDropped` is a monotonic since-boot counter — if a
@@ -404,9 +408,10 @@ if (ready(q) && ready(e)) {
   the same instrument, and the reply goes only to the script. The script
   pauses until the reply arrives; passthrough and everything else keep
   running.
-- Results follow `cmd()`'s rules: ACK + number -> that number,
-  `TRUE`/`FALSE` -> 1/0; a bare ACK (a set command), a NAK, no reply within
-  1 s, or an absent instrument -> 0. Use single-line commands.
+- Results follow `cmd()`'s rules: ACK + number -> that number, a bare ACK
+  (a set command that worked) -> 1, `TRUE`/`FALSE` -> 1/0; a NAK, no reply
+  within 1 s, or an absent instrument -> 0. So `ok = dcmd(q, "SRFADRV", 1,
+  v);` tells you whether the set worked. Use single-line commands.
 - Up to 8 device commands can be in flight across all script slots.
 - Measured: about 6 ms per command to a MIPS; a script doing 3 device
   commands per run keeps up with a 100 ms (10 Hz) interval.
@@ -432,7 +437,8 @@ commands (`SADCEN`, `SETHDHCP`, `SDIODIR`, `SDOUT`, and `STENA`) accept
 `1`/`0` as well as `TRUE`/`FALSE`, from a script or from a person typing
 them. (`STENA` also needs a thread name, which a script can't pass, so
 it's still control-port only.) Replies are still `TRUE`/`FALSE`. A `FALSE` reply and a NAK both
-read as `0` in a script. Needs current `GAACE_Core` and `GAACE_Script`
+read as `0` in a script. A set command that succeeds (a bare ACK) returns
+`1` (since 2026-11-05; it used to read as `0`, like a NAK). Needs current `GAACE_Core` and `GAACE_Script`
 `main`; a script using `true`/`false` must be compiled with the current
 `gsc.py`. No bytecode or syscall-hash change, so saved scripts still
 restore.
@@ -568,7 +574,7 @@ every registered command and its help string, `HELP,<cmd>` looks up one.
 | `GBAUD` / `SBAUD,<baud>` | Baud rate to the downstream device; set explicitly for Ethernet-only use |
 | `GDEV` / `SDEV,<n>` | Get/set which slot `Serial` is bridged to: 0 = automatic (lowest occupied slot, the default), 1-8 = pinned. `GDEV` replies `<setting>,<effective slot>`. `SDEV` rejects a pinned value equal to `ActiveDevice2` |
 | `GDEV2` / `SDEV2,<n>` | Same for `SerialUSB2`: 0 = automatic (next occupied slot after data port 1's), 1-8 = pinned. `SDEV2` rejects a pinned value equal to `ActiveDevice` |
-| `GADCDEV` / `SADCDEV,<n>` | Get/set which downstream slot (1-8) `ADCThread`/the script demo targets |
+| `GADCDEV` / `SADCDEV,<n\|name>` | Get/set what `ADCThread`/the script demo targets: a slot (1-8) or an instrument name (its `GNAME`; follows it between connectors). `GADCDEV` replies `<setting>,<effective slot>`, e.g. `QUAD,1` (effective 0 = not connected). Setting a slot clears the name |
 | `GDEVSTAT` | One row per slot (1-8): `dev,connected,bytesWaiting,bytesDropped` |
 | `GARBSTAT` | Per-slot arbiter: `slot,busy,owner,exchanges,timeouts`. `owner` is who has the open exchange (`USB1`, `USB2`, `ETH`, `INT` = the repeater's ADC sends, `SCRIPT` = a script's `dcmd()`, or `-`); `exchanges`/`timeouts` count since boot. A rising `timeouts` means the device isn't answering some commands within 1 s |
 | `GDEVPATH` | Diagnostic: one row per slot (`slot,connected,connector,innerPort,vid,pid,speed,addr,hubAddr,hubPort`), then one per hub driver. `connector` is the board connector (1-4, matches the labels); `innerPort` is the port on a device's own internal hub, 0 if none. Also lists any attached device left without a slot, as slot 0 |

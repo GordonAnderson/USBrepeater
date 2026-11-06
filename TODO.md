@@ -699,10 +699,33 @@ Facts this design relies on (per the user):
     idle data port 1, 0 timeouts.
   - Slot 1 currently holds a test script in RAM (disabled, not saved); the
     saved slot 1 script comes back on the next boot.
-  - Known: a set command's bare ACK reads as 0, same as a NAK (cmd()'s
-    rule), so a script can't tell a successful set from a failed one by
-    the return value. Possible change: bare ACK -> 1.
-- [ ] B4. Move the ADC target (`SADCDEV`/`SADCCMD`) to names.
+  - ~~Known: a set command's bare ACK reads as 0, same as a NAK~~ —
+    **changed (2026-11-05, per the user): a bare ACK now returns 1** in
+    both `cmd()` (GAACE_Script `1d6974c`) and `dcmd()` (`parseReply()`,
+    Section 6e). Hardware-tested from a script: repeater set (`SADCEN`) ->
+    1, MIPS set (`SRFADRV`, with the MIPS's `\n\r` ending) -> 1, unknown
+    commands on either -> 0, `cmdf("GADCINT")` -> 1000.0. Behavior change
+    for any script that relied on a set returning 0.
+- [x] **B4. ADC target by name — done (2026-11-05), hardware-tested.**
+  `SADCDEV,<name>` targets an instrument by its `GNAME` (case-insensitive);
+  `SADCDEV,<n>` still targets slot n and clears the name. `GADCDEV` now
+  replies `<setting>,<effective slot>` (host-visible format change).
+  `adcTargetIdx()` resolves it for `ADCUpdate()`, `link_ready()` and
+  `scale_send()`; an absent named target sends nothing. The name is a new
+  setting, so it lives in a separate EEPROM record (`ExtData`, right after
+  `Data`, own signature `EXT_SIGNATURE`) instead of in `Data`: changing
+  `Data` would have meant a new `SIGNATURE` and every board resetting to
+  defaults on its next boot. `SAVE` writes both, boot/`RESTORE` read both,
+  and a board that never saved `ExtData` behaves exactly as before. Future
+  settings can be appended to `ExtData` the same way.
+  Hardware results: `SADCDEV,QUAD` -> `QUAD,1`, `SADCDEV,isoelectrometer`
+  -> `isoelectrometer,3`, `SADCDEV,NOPE` -> `NOPE,0`; slot 9 and a 24-char
+  name NAKed. With `SADCCMD,GVER` every 50 ms: targeting the electrometer by
+  name gave 47 arbiter exchanges on its slot in 2 s; targeting `NOPE`
+  sent nothing to any device. ADC settings restored afterwards (target 1,
+  `SETVAL`, 1000 ms, disabled; never saved). Not yet tested: `SAVE` +
+  reboot keeping the name (left alone so as not to overwrite the board's
+  saved settings).
 - [x] Scripts run once a second up to about 10 Hz; measure real MIPS reply
   times early. **Measured:** about 6 ms per MIPS exchange over USB; a
   3-exchange script sustains about 10 Hz.

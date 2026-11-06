@@ -155,6 +155,28 @@ typedef struct
   unsigned int  Signature;      // Must equal SIGNATURE for the struct to be considered valid
 } Data;
 
+// ── Extension record (saved right after Data in EEPROM) ──────────────────
+//  Settings added after Data's layout settled. Kept as a separate record
+//  with its own signature so adding them didn't change Data (a new Data
+//  layout means a new SIGNATURE, which resets every board's saved settings
+//  to defaults on its next boot). SAVE writes both records; boot and
+//  RESTORE read both. A board that has never saved this record gets the
+//  defaults below, which reproduce the behavior from before it existed.
+//  Append new fields before Signature and bump EXT_SIGNATURE only if a
+//  field's meaning changes.
+#define EXT_SIGNATURE  0x5A5AE001
+#define EXT_NAME_LEN   24
+
+typedef struct
+{
+  // ADC/script-demo target by instrument name (its GNAME), e.g. "QUAD".
+  // Empty = use AdcTargetDevice (a slot number), the original behavior.
+  // Set with SADCDEV,<name>; SADCDEV,<n> clears it. See Section 6a.
+  char          AdcTargetName[EXT_NAME_LEN];
+
+  unsigned int  Signature;      // Must equal EXT_SIGNATURE
+} ExtData;
+
 // Forward declarations — implementations are in src/USBrepeater.cpp.
 void SaveSettings(void);
 void RestoreSettings(void);
