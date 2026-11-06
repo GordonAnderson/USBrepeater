@@ -616,7 +616,11 @@ Facts this design relies on (per the user):
        the parser settled on `\r`); fixed by also dropping the `\n` after a
        settled reply. Retested: `DEVIDENT,1`/`DEVIDENT,2` went `PENDING` ->
        `NAMED` with zero bytes reaching either open data port, and `GVER`
-       passthrough was clean afterwards on both.
+       passthrough was clean afterwards on both. Hot-plug: the electrometer
+       moved live from connector 2 to 3 was re-identified on its new slot
+       (`3,3,MAIN,239A,801E,NAMED,IsoElectrometer`), `GDEVSLOT` followed it
+       (-> 3), data port 2 followed automatically (`GDEV2` `0,3`, `GVER`
+       clean) and TCP 5003 answered `GNAME`; nothing left buffered.
 
 **Part B — scripts that talk to several MIPS (after Part A is proven):**
 - Per-MIPS arbiter: one command in progress per MIPS; host passthrough
