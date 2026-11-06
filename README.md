@@ -218,9 +218,27 @@ upstream path, so there's no arbitration to do there. Because
 arbitrate between *both* switchable USB ports and Ethernet at once — at
 most one switchable port plus Ethernet, the same two-way case either way.
 
-To check which instrument a data port reaches, send `GNAME` through it:
-the instrument itself answers. (Planned: the firmware asks each device's
-`GNAME` on attach and reports names per slot; see TODO.md.)
+**The firmware learns each instrument's name.** When a device lands in
+slot 1-4, the repeater sends it `GNAME` (every GAACE device answers with
+its system name) and retries for about 8 s while a MIPS boots. The reply
+is swallowed, never forwarded. While that's in progress (typically well
+under a second) the slot is held out of passthrough, ADC and script sends;
+host bytes simply wait. Slots 5-8 (a MIPS's RS-485 temperature-controller
+adapter) are not queried, so `GNAME` never goes out onto that RS-485 bus.
+
+```
+GDEVLIST          -> #slot,connector,role,vid,pid,state,name
+                     1,1,MAIN,2341,003E,NAMED,QUAD
+                     2,2,MAIN,239A,801E,NAMED,IsoElectrometer
+GDEVSLOT,QUAD     -> 1          (case-insensitive; NAK if no such name)
+```
+
+`state` is `NAMED`, `PENDING` (still asking), `NONAME` (NAKed `GNAME` or
+never answered: not a GAACE device) or `NOTQUERIED` (slot 5-8).
+`DEVIDENT,<slot>` asks again, for example after renaming an instrument
+with `SNAME` through the passthrough; on a slot 5-8 it forces a query.
+If two devices report the same name, `GDEVSLOT` returns the lower slot.
+You can also check a data port directly by sending `GNAME` through it.
 
 `ADCThread` and the script demo (below) target a separate, independent
 selection — `SADCDEV,<n>` / `GADCDEV` — so switching which device the host
@@ -527,7 +545,10 @@ every registered command and its help string, `HELP,<cmd>` looks up one.
 | `GDEV2` / `SDEV2,<n>` | Same for `SerialUSB2`: 0 = automatic (next occupied slot after data port 1's), 1-8 = pinned. `SDEV2` rejects a pinned value equal to `ActiveDevice` |
 | `GADCDEV` / `SADCDEV,<n>` | Get/set which downstream slot (1-8) `ADCThread`/the script demo targets |
 | `GDEVSTAT` | One row per slot (1-8): `dev,connected,bytesWaiting,bytesDropped` |
-| `GDEVPATH` | Diagnostic: one row per slot (`slot,connected,connector,innerPort,vid,pid,speed,addr,hubAddr,hubPort`), then one per hub driver. `connector` is the board connector (1-4, matches the labels); `innerPort` is the port on a device's own internal hub, 0 if none |
+| `GDEVPATH` | Diagnostic: one row per slot (`slot,connected,connector,innerPort,vid,pid,speed,addr,hubAddr,hubPort`), then one per hub driver. `connector` is the board connector (1-4, matches the labels); `innerPort` is the port on a device's own internal hub, 0 if none. Also lists any attached device left without a slot, as slot 0 |
+| `GDEVLIST` | One row per occupied slot: `slot,connector,role,vid,pid,state,name`. `role` `MAIN` (slot 1-4) or `EXTRA` (5-8); `state` `NAMED`/`PENDING`/`NONAME`/`NOTQUERIED`; `name` from the device's `GNAME`, asked on attach |
+| `GDEVSLOT,<name>` | Slot (1-8) of the device whose `GNAME` is `<name>` (case-insensitive); NAK if none |
+| `DEVIDENT,<slot>` | Ask that slot's device its `GNAME` again (also forces a query on a slot 5-8) |
 | `GETHDHCP` / `SETHDHCP,TRUE\|FALSE` | DHCP vs. static IP; reboot to apply |
 | `GETHIP` / `SETHIP,<a.b.c.d>` | Static IP address; reboot to apply |
 | `GETHMASK` / `SETHMASK,<a.b.c.d>` | Static subnet mask; reboot to apply |

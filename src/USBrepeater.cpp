@@ -313,6 +313,9 @@ static void cmdGetAdcDev(void);
 static void cmdSetAdcDev(void);
 static void cmdGetDevStat(void);
 void        cmdGetDevPath(void);   // Section 6 (needs the USB driver objects)
+void        cmdGetDevList(void);   // Section 6 (device names, GNAME on attach)
+void        cmdGetDevSlot(void);   // Section 6
+void        cmdDevIdent(void);     // Section 6
 static void cmdGetDioDir(void);
 static void cmdSetDioDir(void);
 static void cmdGetDout(void);
@@ -396,6 +399,9 @@ Command cmds[] =
   {"SADCDEV",  CMDfunction, -1, (void *)cmdSetAdcDev,      NULL, "Set ADCThread/script target device, " DEVPORT_RANGE_STR},
   {"GDEVSTAT", CMDfunction,  0, (void *)cmdGetDevStat,     NULL, "Per-port status: dev,connected,bytesWaiting,bytesDropped"},
   {"GDEVPATH", CMDfunction,  0, (void *)cmdGetDevPath,     NULL, "Diagnostic: each slot's board connector, inner-hub port, VID/PID, USB addresses; then each hub"},
+  {"GDEVLIST", CMDfunction,  0, (void *)cmdGetDevList,     NULL, "Occupied slots: slot,connector,MAIN|EXTRA,vid,pid,state,name (name from GNAME on attach)"},
+  {"GDEVSLOT", CMDfunction,  1, (void *)cmdGetDevSlot,     NULL, "Slot (" DEVPORT_RANGE_STR ") of the device whose GNAME is <name>, NAK if none"},
+  {"DEVIDENT", CMDfunction,  1, (void *)cmdDevIdent,       NULL, "Ask slot <n>'s device its GNAME again (also queries an extra slot 5-8)"},
   {"GLINK2",   CMDfunction,  0, (void *)cmdGetLink2,       NULL, "ActiveDevice2's USB connection state"},
 
   // ── Ethernet (control port + one dedicated data port per device; Section 6c) ─
@@ -1552,6 +1558,217 @@ struct DevPort
 
 DevPort devPort[DEVPORT_COUNT];
 
+// -----------------------------------------------------------------------------
+// Device identification — ask each newly attached device its GNAME.
+//
+// Every GAACE device answers GNAME with its (unique, by convention) system
+// name. When a device lands in slot 1-4, the firmware sends "GNAME\n" and
+// waits for one reply line: ACK + name -> NAMED; NAK -> NONAME (answers, but
+// isn't a GAACE device); no reply -> retry every IDENT_RETRY_MS (a MIPS may
+// still be booting) up to IDENT_MAX_TRIES, then NONAME. Lines that aren't an
+// ACK/NAK reply (a boot banner, an echoed command) are ignored.
+//
+// While identification is PENDING the slot is held out of everything else:
+// its incoming bytes go to the reply parser instead of its ring buffer, and
+// host passthrough, ADCUpdate() and script sends to it wait (slotReady()).
+// The data-port assignment (resolveDataPorts()) still counts it as
+// occupied, so the automatic layout doesn't shift while it's identified.
+//
+// Slots 5-8 (a USB-serial bridge behind a MIPS's own hub — its RS-485
+// temperature controller) are NOT queried automatically: "GNAME" would go
+// out onto that controller's RS-485 bus. DEVIDENT,<slot> forces a query.
+// -----------------------------------------------------------------------------
+#define IDENT_FIRST_DELAY_MS   300   // after attach, before the first GNAME
+#define IDENT_REPLY_TIMEOUT_MS 300   // wait this long for each reply
+#define IDENT_RETRY_MS         700   // gap before retrying a query that got no reply
+#define IDENT_MAX_TRIES        8     // ~8 s in total, enough for a MIPS to boot
+#define DEV_NAME_LEN           24
+
+enum IdentState : uint8_t
+{
+  IDENT_EMPTY = 0,   // no device in the slot
+  IDENT_PENDING,     // querying GNAME
+  IDENT_NAMED,       // answered; name[] valid
+  IDENT_NONAME,      // NAK or no reply: not a GAACE device
+  IDENT_SKIPPED      // extra slot (5-8), not queried
+};
+
+struct DevIdent
+{
+  IdentState state      = IDENT_EMPTY;
+  uint8_t    tries      = 0;
+  bool       awaiting   = false;   // a GNAME is outstanding
+  bool       eatLF      = false;   // reply ended on '\r': drop the '\n' that follows it
+  uint32_t   nextMs     = 0;       // when to send the next GNAME
+  uint32_t   deadlineMs = 0;       // when the outstanding one times out
+  uint8_t    lineLen    = 0;
+  char       line[DEV_NAME_LEN + 8];
+  char       name[DEV_NAME_LEN];
+};
+
+DevIdent devIdent[DEVPORT_COUNT];
+
+// Connected and not being identified: safe for passthrough, ADC and scripts.
+static inline bool slotReady(uint8_t idx)
+{
+  return slotConnected(idx) && devIdent[idx].state != IDENT_PENDING;
+}
+
+static void identStart(uint8_t idx, bool force)
+{
+  DevIdent &id = devIdent[idx];
+  id.name[0]  = '\0';
+  id.tries    = 0;
+  id.awaiting = false;
+  id.eatLF    = false;
+  id.lineLen  = 0;
+  if (!force && idx >= 4) { id.state = IDENT_SKIPPED; return; }
+  id.state  = IDENT_PENDING;
+  id.nextMs = millis() + IDENT_FIRST_DELAY_MS;
+}
+
+// Send / time out the GNAME query. Runs every loop pass for every slot.
+static void identPoll(uint8_t idx)
+{
+  DevIdent &id = devIdent[idx];
+  if (id.state != IDENT_PENDING) return;
+
+  SlotSerial *s = slotSerial(idx);
+  if (s == NULL || !(bool)(*s)) return;   // detach is handled by devPortUpdateConnection()
+
+  uint32_t now = millis();
+  if (!id.awaiting)
+  {
+    if ((int32_t)(now - id.nextMs) < 0) return;
+    s->write((const uint8_t *)"GNAME\n", 6);
+    id.awaiting   = true;
+    id.deadlineMs = now + IDENT_REPLY_TIMEOUT_MS;
+    id.lineLen    = 0;
+    id.tries++;
+  }
+  else if ((int32_t)(now - id.deadlineMs) >= 0)
+  {
+    id.awaiting = false;
+    if (id.tries >= IDENT_MAX_TRIES) id.state = IDENT_NONAME;
+    else id.nextMs = now + IDENT_RETRY_MS;
+  }
+}
+
+// One incoming byte while PENDING. Only a complete ACK/NAK line settles it.
+static void identFeed(uint8_t idx, uint8_t b)
+{
+  DevIdent &id = devIdent[idx];
+  if (b != '\n' && b != '\r')
+  {
+    if (id.lineLen < sizeof(id.line) - 1) id.line[id.lineLen++] = (char)b;
+    return;
+  }
+  if (id.lineLen == 0) return;
+  id.line[id.lineLen] = '\0';
+  id.lineLen = 0;
+  if (!id.awaiting) return;   // e.g. a boot banner before the first query
+
+  // GAACE replies end "\r\n". If this '\r' settles the reply, the '\n' still
+  // to come must not leak through to the host as a stray blank line.
+  id.eatLF = (b == '\r');
+
+  if ((uint8_t)id.line[0] == 0x06)
+  {
+    const char *n = id.line + 1;
+    while (*n == ' ') n++;
+    strncpy(id.name, n, DEV_NAME_LEN - 1);
+    id.name[DEV_NAME_LEN - 1] = '\0';
+    for (int i = (int)strlen(id.name) - 1; i >= 0 && id.name[i] == ' '; i--) id.name[i] = '\0';
+    id.state = (id.name[0] != '\0') ? IDENT_NAMED : IDENT_NONAME;
+    id.awaiting = false;
+  }
+  else if ((uint8_t)id.line[0] == 0x15)
+  {
+    id.state = IDENT_NONAME;
+    id.awaiting = false;
+  }
+  // anything else (unsolicited output, echoed "GNAME"): keep waiting
+}
+
+static const char *identStateName(IdentState s)
+{
+  switch (s)
+  {
+    case IDENT_PENDING: return "PENDING";
+    case IDENT_NAMED:   return "NAMED";
+    case IDENT_NONAME:  return "NONAME";
+    case IDENT_SKIPPED: return "NOTQUERIED";
+    default:            return "EMPTY";
+  }
+}
+
+// Slot (0-based) whose device answered GNAME with `name` (case-insensitive),
+// or -1. Lowest slot wins if two devices share a name.
+int8_t slotByName(const char *name)
+{
+  for (uint8_t i = 0; i < DEVPORT_COUNT; i++)
+    if (slotConnected(i) && devIdent[i].state == IDENT_NAMED && strcasecmp(devIdent[i].name, name) == 0)
+      return (int8_t)i;
+  return -1;
+}
+
+// -----------------------------------------------------------------------------
+// GDEVLIST — one row per occupied slot:
+//   slot,connector,role,vid,pid,state,name
+// role MAIN (slot 1-4, the instrument) or EXTRA (5-8, a bridge behind its
+// hub); state NAMED / PENDING / NONAME / NOTQUERIED; name empty unless NAMED.
+// GDEVSLOT,<name> — the slot (1-8) of the device with that name, NAK if none.
+// DEVIDENT,<slot> — ask that slot's device its GNAME again (also forces a
+// query on an extra slot 5-8).
+// -----------------------------------------------------------------------------
+void cmdGetDevList(void)
+{
+  if (!cp.checkExpectedArgs(0)) return;
+
+  cp.sendACK(false);
+  cp.println("#slot,connector,role,vid,pid,state,name");
+  for (uint8_t i = 0; i < DEVPORT_COUNT; i++)
+  {
+    if (!slotConnected(i)) continue;
+    const Device_t *d = slotSerial(i)->dev();
+    uint8_t conn = 0, inner = 0;
+    devicePath(d, &conn, &inner);
+    char row[24];
+    cp.print((int)(i + 1));                   cp.print(",");
+    cp.print((int)conn);                      cp.print(",");
+    cp.print(i < 4 ? "MAIN" : "EXTRA");       cp.print(",");
+    snprintf(row, sizeof(row), "%04X,%04X", d ? d->idVendor : 0, d ? d->idProduct : 0);
+    cp.print(row);                            cp.print(",");
+    cp.print(identStateName(devIdent[i].state)); cp.print(",");
+    cp.println(devIdent[i].state == IDENT_NAMED ? devIdent[i].name : "");
+  }
+}
+
+void cmdGetDevSlot(void)
+{
+  if (!cp.checkExpectedArgs(1)) return;
+  char *tok;
+  if (!cp.getValue(&tok)) { cp.sendNAK(ERR_BADARG); return; }
+  int8_t s = slotByName(tok);
+  cp.ca->free(tok);
+  if (s < 0) { cp.sendNAK(ERR_BADARG); return; }
+  cp.sendACK(false);
+  cp.println((int)(s + 1));
+}
+
+void cmdDevIdent(void)
+{
+  if (!cp.checkExpectedArgs(1)) return;
+  int n;
+  if (!cp.getValue(&n, 1, DEVPORT_COUNT) || !slotConnected((uint8_t)(n - 1)))
+  {
+    cp.sendNAK(ERR_BADARG);
+    return;
+  }
+  identStart((uint8_t)(n - 1), true);
+  cp.sendACK();
+}
+
 // Whichever source — Serial, or ActiveDevice's OWN dedicated Ethernet data
 // client (Section 6c) — most recently sent bytes to it. Only ActiveDevice
 // has two competing upstream sources (Serial follows SDEV; every device's
@@ -1640,7 +1857,19 @@ static void devPortDrainIncoming(uint8_t idx)
   if (n <= 0) return;
 
   n = s->readBytes((char *)repeaterBuf, min(n, (int)sizeof(repeaterBuf)));
-  for (int i = 0; i < n; i++) devPortPush(idx, repeaterBuf[i]);
+  for (int i = 0; i < n; i++)
+  {
+    // While its GNAME is outstanding a slot's bytes are the reply, not
+    // host-bound traffic; once settled, the rest of the chunk flows normally.
+    DevIdent &id = devIdent[idx];
+    if (id.state == IDENT_PENDING) { identFeed(idx, repeaterBuf[i]); continue; }
+    if (id.eatLF)
+    {
+      id.eatLF = false;
+      if (repeaterBuf[i] == '\n') continue;   // tail of the settled GNAME reply
+    }
+    devPortPush(idx, repeaterBuf[i]);
+  }
 }
 
 // Write out everything currently buffered for port idx, in order, to `out`.
@@ -1668,7 +1897,12 @@ static void devPortUpdateConnection(uint8_t idx)
 
   // Start the driver when a device lands in this slot, including a
   // different driver object replacing the previous one in the same pass.
-  if (s != NULL && s != p.startedDrv) s->begin(curBaud);
+  if (s != NULL && s != p.startedDrv)
+  {
+    s->begin(curBaud);
+    identStart(idx, false);   // new device in this slot: find out its name
+  }
+  if (s == NULL) devIdent[idx].state = IDENT_EMPTY;
   p.startedDrv = s;
 }
 
@@ -1698,18 +1932,21 @@ void RepeaterModeLoop(void)
   for (uint8_t i = 0; i < DEVPORT_COUNT; i++)
   {
     devPortUpdateConnection(i);
+    identPoll(i);
     devPortDrainIncoming(i);
   }
 
   // Which slot each data port is bridged to this pass (pinned by SDEV/SDEV2,
   // or automatic — see effectiveDev()). DEVPORT_COUNT = nothing to bridge;
-  // the blocks below then leave that data port idle.
+  // the blocks below then leave that data port idle. A slot still being
+  // identified (GNAME pending) counts as "not connected" for forwarding:
+  // host bytes wait in Serial/SerialUSB2/the TCP client until it's settled.
   uint8_t selIdx, selIdx2;
   resolveDataPorts(&selIdx, &selIdx2);
   USBSerial_BigBuffer *sel        = slotSerial(selIdx);
-  bool                 connected  = slotConnected(selIdx);
+  bool                 connected  = slotReady(selIdx);
   USBSerial_BigBuffer *sel2       = slotSerial(selIdx2);
-  bool                 connected2 = slotConnected(selIdx2);
+  bool                 connected2 = slotReady(selIdx2);
 
   // When a data port moves to a different slot (SDEV/SDEV2, or the
   // automatic choice shifting), its "last speaker" falls back to the USB
@@ -1799,7 +2036,7 @@ void RepeaterModeLoop(void)
   {
     if (i == selIdx || i == selIdx2) continue;   // handled above, arbitrated with Serial/SerialUSB2
     if (!(ethDataClient[i] && ethDataClient[i].connected())) continue;
-    if (!slotConnected(i)) continue;   // nothing connected to write to
+    if (!slotReady(i)) continue;   // nothing connected to write to, or GNAME pending
 
     int n = ethDataClient[i].available();
     if (n > 0)
@@ -1874,7 +2111,7 @@ void ADCUpdate(void)
 
   uint8_t idx = (uint8_t)(data.AdcTargetDevice - 1);
   if (idx >= DEVPORT_COUNT) return;   // defensive; AdcTargetDevice is range-checked at SADCDEV time
-  if (!slotConnected(idx)) return;   // nothing connected to control
+  if (!slotReady(idx)) return;   // nothing connected to control, or GNAME pending
 
   if ((millis() - devPort[idx].lastHostToDeviceMs) < ADC_QUIET_GUARD_MS) return;  // link busy, try next cycle
 
@@ -1943,7 +2180,7 @@ static int32_t sys_link_ready(int32_t *args, uint8_t argc)
 
   uint8_t idx = (uint8_t)(data.AdcTargetDevice - 1);
   if (idx >= DEVPORT_COUNT) return 0;
-  if (!slotConnected(idx)) return 0;                                      // nothing connected
+  if (!slotReady(idx)) return 0;                                          // nothing connected, or GNAME pending
   if ((millis() - devPort[idx].lastHostToDeviceMs) < ADC_QUIET_GUARD_MS) return 0; // link busy
   return 1;
 }
@@ -1960,6 +2197,7 @@ static int32_t sys_scale_send(int32_t *args, uint8_t argc)
 
   uint8_t idx = (uint8_t)(data.AdcTargetDevice - 1);
   if (idx >= DEVPORT_COUNT) return 0;
+  if (!slotReady(idx)) return 0;   // empty slot (no driver object to write to), or GNAME pending
 
   float value = scaleAdcValue((float)args[0]);
 

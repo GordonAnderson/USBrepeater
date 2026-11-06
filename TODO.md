@@ -587,10 +587,36 @@ Facts this design relies on (per the user):
      data ports 1/2 and TCP 5001/5002 answered `QUAD`/`IsoElectrometer`.
    - Not yet tested: the slot N+4 rule (needs the MIPS with the internal
      hub/RS-485 temperature controller).
-4. [ ] `GNAME` queried on attach (retry while the MIPS boots, reply
+4. [x] `GNAME` queried on attach (retry while the MIPS boots, reply
        swallowed, slot held out of passthrough until answered or timed
        out); no reply = not a GAACE device. New `GDEVLIST` (slot,
        connector, name, VID/PID, main/extra).
+       **Done (2026-11-05).** Per-slot `DevIdent` state machine (Section
+       6): first `GNAME` 300 ms after attach, 300 ms reply timeout, retry
+       every 700 ms, 8 tries (~8 s), then `NONAME`; a NAK is `NONAME`
+       straight away. Only a complete ACK/NAK line settles it, so a boot
+       banner or an echoed command is ignored. While `PENDING`, the slot's
+       bytes go to the parser, and `slotReady()` holds it out of host
+       passthrough, Ethernet, `ADCUpdate()` and the script syscalls; the
+       automatic data-port layout still counts it as occupied, so nothing
+       shifts. Slots 5-8 are not queried (would put `GNAME` on a temperature
+       controller's RS-485 bus); `DEVIDENT,<slot>` forces it. Also
+       `GDEVSLOT,<name>` (case-insensitive, lowest slot wins on a
+       duplicate) and `slotByName()` for the scripts work in Part B.
+       Fixed along the way: `sys_scale_send()` wrote to the target slot
+       without checking a device was there; with connector slots an empty
+       slot has no driver object, so a script would have crashed the board.
+       It now checks `slotReady()`.
+
+       **Hardware-tested (2026-11-05)**, QUAD on connector 1 and
+       IsoElectrometer on connector 2: both identified at boot (`GDEVLIST`
+       `NAMED,QUAD` / `NAMED,IsoElectrometer`); `GDEVSLOT,QUAD` -> 1,
+       `GDEVSLOT,isoelectrometer` -> 2, `GDEVSLOT,NOPE` NAKed. First run
+       leaked one `\n` to the open data port (GAACE replies end `\r\n` and
+       the parser settled on `\r`); fixed by also dropping the `\n` after a
+       settled reply. Retested: `DEVIDENT,1`/`DEVIDENT,2` went `PENDING` ->
+       `NAMED` with zero bytes reaching either open data port, and `GVER`
+       passthrough was clean afterwards on both.
 
 **Part B — scripts that talk to several MIPS (after Part A is proven):**
 - Per-MIPS arbiter: one command in progress per MIPS; host passthrough
