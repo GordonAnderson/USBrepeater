@@ -795,9 +795,12 @@ Open questions:
       ports by name (each answered the right `GNAME`), all three collision
       cases NAKed, an absent name left data port 1 idle without touching
       data port 2, `GDEVPORT,QUAD` -> 5001 and TCP 5001 answered `QUAD`;
-      restored to automatic afterwards. Not yet tested: a named data port
-      following its instrument through a replug (same `slotByName()` path
-      the ADC target and scripts already use).
+      restored to automatic afterwards. **Replug tested (2026-11-06):**
+      with `SDEV,Astraea` (16C0:0483) on connector 1, `GDEV` read
+      `Astraea,1` and `GNAME` through USB data port 1 answered `Astraea`;
+      after moving it to connector 3, `GDEV` read `Astraea,3`,
+      `GDEVPORT,Astraea` 5003, and data port 1 still answered `Astraea`.
+      Not saved.
 - [ ] Unsolicited device output and no-reply timeouts under the arbiter.
 
 ## Settled design: 4 downstream devices via hub + Ethernet
