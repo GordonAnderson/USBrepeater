@@ -576,9 +576,14 @@ Facts this design relies on (per the user):
    - Electrometer moved from connector 4 to connector 2 live: it became
      slot 2, slot 4 cleared, data port 2 followed it (`GDEV2` `0,2`,
      `GNAME` `IsoElectrometer`), QUAD undisturbed on slot 1/data port 1.
-   - Not yet tested: Ethernet (link was down, so TCP 5001-5008 unchecked),
-     a reboot with both plugged in, and the slot N+4 rule (needs the MIPS
-     with the internal hub/RS-485 temperature controller).
+   - Ethernet (DHCP, 192.168.68.56): TCP 5001 answered `GNAME` `QUAD` and
+     5002 `IsoElectrometer` (slots 1/2 = connectors 1/2); 5003-5008
+     accepted connections and stayed silent (empty slots). All 9
+     connections (control 5000 + data 5001-5008) open at once worked:
+     `GETHSTAT` over TCP showed ctrl and all 8 data clients `TRUE`, and
+     5001/5002 still answered, confirming the raised lwIP limits.
+   - Not yet tested: a reboot with both plugged in, and the slot N+4 rule
+     (needs the MIPS with the internal hub/RS-485 temperature controller).
 4. [ ] `GNAME` queried on attach (retry while the MIPS boots, reply
        swallowed, slot held out of passthrough until answered or timed
        out); no reply = not a GAACE device. New `GDEVLIST` (slot,
