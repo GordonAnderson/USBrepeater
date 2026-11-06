@@ -316,6 +316,7 @@ void        cmdGetDevPath(void);   // Section 6 (needs the USB driver objects)
 void        cmdGetDevList(void);   // Section 6 (device names, GNAME on attach)
 void        cmdGetDevSlot(void);   // Section 6
 void        cmdDevIdent(void);     // Section 6
+void        cmdGetArbStat(void);   // Section 6 (per-slot arbiter)
 static void cmdGetDioDir(void);
 static void cmdSetDioDir(void);
 static void cmdGetDout(void);
@@ -402,16 +403,17 @@ Command cmds[] =
   {"GDEVLIST", CMDfunction,  0, (void *)cmdGetDevList,     NULL, "Occupied slots: slot,connector,MAIN|EXTRA,vid,pid,state,name (name from GNAME on attach)"},
   {"GDEVSLOT", CMDfunction,  1, (void *)cmdGetDevSlot,     NULL, "Slot (" DEVPORT_RANGE_STR ") of the device whose GNAME is <name>, NAK if none"},
   {"DEVIDENT", CMDfunction,  1, (void *)cmdDevIdent,       NULL, "Ask slot <n>'s device its GNAME again (also queries an extra slot 5-8)"},
+  {"GARBSTAT", CMDfunction,  0, (void *)cmdGetArbStat,     NULL, "Per-slot arbiter: slot,busy,owner,exchanges,timeouts"},
   {"GLINK2",   CMDfunction,  0, (void *)cmdGetLink2,       NULL, "ActiveDevice2's USB connection state"},
 
   // ── Ethernet (control port + one dedicated data port per device; Section 6c) ─
   //  EthCtrlPort mirrors every SerialUSB1 command over TCP. EthDataPortBase
-  //  is device 1's own dedicated passthrough TCP port; devices 2-4 get
-  //  EthDataPortBase+1/+2/+3 — 4 independent, always-reachable data ports,
-  //  not one switchable port like Serial. For the currently-SDEV-selected
-  //  device, that device's Ethernet port still competes with Serial — see
-  //  `pcSide` in Section 6 for how replies are routed back to whichever one
-  //  spoke most recently. EthDHCP/EthIP/EthMask/EthGw/EthDataPortBase take
+  //  is slot 1's own dedicated passthrough TCP port; slots 2-8 get
+  //  EthDataPortBase+1..+7 — independent, always-reachable data ports, not
+  //  one switchable port like Serial. A device reachable from both a USB
+  //  data port and its TCP port is shared through its per-slot arbiter
+  //  (Section 6): one command at a time, each reply back to its sender.
+  //  EthDHCP/EthIP/EthMask/EthGw/EthDataPortBase take
   //  effect on the next boot, not live; GETHSTAT always reflects live state.
   {"?ETHDHCP",     CMDbool,     -1, (void *)&data.EthDHCP,         NULL, "Use DHCP (TRUE) or static IP (FALSE); reboot to apply"},
   {"GETHIP",       CMDfunction, -1, (void *)cmdGetEthIp,           NULL, "Static IP address a.b.c.d; reboot to apply"},
@@ -1187,15 +1189,12 @@ static void cmdScriptErase(void)
 //  Teensy host port (5-pin header) <-> USB2514B hub <-> one of 4 downstream
 //  USB-A ports. There are now TWO independently switchable USB upstream
 //  paths (Serial/SDEV and SerialUSB2/SDEV2 — USB_TRIPLE_SERIAL), plus, as of
-//  Section 6c, each downstream port's own dedicated Ethernet data port. For
-//  whichever device Serial is currently bridged to, its own Ethernet port is
-//  a second possible "PC" for that same link — see `pcSide` below; same for
-//  SerialUSB2 and `pcSide2`. ActiveDevice and ActiveDevice2 are kept
-//  mutually exclusive (enforced at SDEV/SDEV2 time, Section 5), so no device
-//  ever has to arbitrate between THREE sources — every device has at most
-//  one switchable USB port plus its own Ethernet client contending for it,
-//  the same 2-way case, just possibly via either Serial or SerialUSB2
-//  depending on which one (if either) currently selects it.
+//  Section 6c, each slot's own dedicated Ethernet data port. Everything
+//  that talks to a device (a USB data port, its TCP client, the repeater's
+//  own ADC/script sends) goes through that slot's arbiter: one command line
+//  at a time, its reply routed back to whoever sent it (see PER-SLOT
+//  ARBITER below). ActiveDevice and ActiveDevice2 are still kept mutually
+//  exclusive (enforced at SDEV/SDEV2 time, Section 5).
 //
 //  TOPOLOGY
 //  --------
@@ -1227,13 +1226,12 @@ static void cmdScriptErase(void)
 //  -------------------------
 //  Every tick: drain available bytes from ALL DEVPORT_COUNT ports into their own ring
 //  buffers (devPortDrainIncoming()), unconditionally. Every port is then
-//  also flushed every tick (devPortFlush()) — a port selected by Serial or
-//  SerialUSB2 flushes to whoever last spoke to it over that shared USB/
-//  Ethernet path (`pcSide`/`pcSide2`); every other port flushes to its own
-//  dedicated Ethernet data client, only once that client is actually
-//  connected (if not, bytes just stay buffered — connecting to a port's
-//  Ethernet data port is this design's equivalent of "SDEV switches to it"
-//  for delivering backlog). This one mechanism covers both live forwarding
+//  also flushed every tick (devPortFlush()) to whatever arbOutput() says:
+//  the owner of the open exchange, or for unsolicited output the last
+//  owner, else the USB data port bridged to the slot, else its TCP client,
+//  else it stays buffered (connecting to a slot's TCP port is this design's
+//  equivalent of "SDEV switches to it" for delivering backlog). This one
+//  mechanism covers both live forwarding
 //  (a connected port's buffer drains about as fast as it fills, so latency
 //  in steady state is the same as direct passthrough) and "deliver the
 //  backlog" the moment a port starts actually being read — nothing special
@@ -1551,8 +1549,6 @@ struct DevPort
   uint16_t rxTail             = 0;  // ring buffer read index
   uint16_t rxCount            = 0;  // bytes currently buffered
   uint32_t rxDropped          = 0;  // bytes dropped because the buffer was full, since boot
-  uint32_t swallowUntilMs     = 0;  // while millis() < this, incoming bytes are discarded (ADC/script injection reply — Section 6a/6b)
-  uint32_t lastHostToDeviceMs = 0;  // last time host traffic was forwarded TO this port (ADC/script quiet guard)
   uint8_t  rxbuf[DEVPORT_RINGBUF_SIZE];
 };
 
@@ -1627,6 +1623,8 @@ static void identStart(uint8_t idx, bool force)
   id.nextMs = millis() + IDENT_FIRST_DELAY_MS;
 }
 
+static bool arbIdle(uint8_t idx);   // per-slot arbiter, defined below
+
 // Send / time out the GNAME query. Runs every loop pass for every slot.
 static void identPoll(uint8_t idx)
 {
@@ -1640,6 +1638,7 @@ static void identPoll(uint8_t idx)
   if (!id.awaiting)
   {
     if ((int32_t)(now - id.nextMs) < 0) return;
+    if (!arbIdle(idx)) return;   // DEVIDENT during an exchange: wait for it to end
     s->write((const uint8_t *)"GNAME\n", 6);
     id.awaiting   = true;
     id.deadlineMs = now + IDENT_REPLY_TIMEOUT_MS;
@@ -1769,31 +1768,115 @@ void cmdDevIdent(void)
   cp.sendACK();
 }
 
-// Whichever source — Serial, or ActiveDevice's OWN dedicated Ethernet data
-// client (Section 6c) — most recently sent bytes to it. Only ActiveDevice
-// has two competing upstream sources (Serial follows SDEV; every device's
-// Ethernet data port exists regardless of SDEV), so this arbitration only
-// ever applies to data.ActiveDevice — every other port's only upstream path
-// is its own Ethernet client (or, for ActiveDevice2, SerialUSB2 — see
-// pcSide2 below), with nothing to arbitrate. "Last speaker wins", the same
-// pattern commandProcessor::processStreams() already uses
-// (`serial = streams[i]; // route replies back to the stream that sent the command`).
-// This settles *who gets the reply*; it does not stop both sources writing
-// to the selected device in the same loop pass if both have data available
-// at once — see Section 6c for why that's accepted as a known edge case
-// rather than solved with hard exclusivity. Reset implicitly to &Serial on
-// boot; stays valid even if the operator later switches SDEV away and back,
-// since it's only consulted for whichever device is selected *now* — and
-// ActiveDevice/ActiveDevice2 are kept mutually exclusive, so this is never
-// consulted for a device that's actually ActiveDevice2's right now.
-Stream *pcSide = &Serial;
+// -----------------------------------------------------------------------------
+// PER-SLOT ARBITER — one command in progress per device.
+//
+// GAACE devices are strictly request/reply: a command line in, one reply
+// (ACK, ACK+value or NAK, ending in a newline) out. Several requesters can
+// want the same device: the USB data port bridged to it (Serial or
+// SerialUSB2), its own TCP data client, and the repeater itself (ADCUpdate,
+// script sends). Each requester is a "line source" that collects one
+// complete line; each slot's arbiter sends one line at a time, routes the
+// reply bytes to whoever sent it, and treats the exchange as finished once
+// the reply's newline has arrived and the device has then been quiet for
+// ARB_QUIET_MS (covers multi-line replies), or after ARB_TIMEOUT_MS with no
+// complete reply. Waiting lines simply stay in their source; a requester
+// that waits for its reply before sending again (as GAACE hosts do) never
+// needs more than one queued line, so the queue can't grow.
+//
+// Fast path: if the requester that owns the open exchange already has its
+// next line ready and nobody else is waiting, it's sent as soon as the reply
+// newline arrives, without the quiet gap, so a single host app sees no
+// added latency per command. Lines are forwarded once complete (newline,
+// ARB_LINE_MAX bytes, or ARB_PARTIAL_MS of silence for a host that doesn't
+// end its lines), never byte by byte: fine for the ASCII command traffic
+// the host apps send (per the user, no binary/firmware transfers).
+//
+// Bytes the device sends with no exchange open (unsolicited output) go to
+// whoever last owned an exchange on it, if that requester still targets the
+// slot, else to the USB data port bridged to it, else its TCP client, else
+// they stay buffered. A whitespace-only line (a stray "\r\n") is forwarded
+// without opening an exchange, since the device won't reply to it.
+//
+// Replaces the old "last speaker wins" pcSide/pcSide2 routing and the ADC
+// quiet-guard/swallow-window timing heuristics.
+// -----------------------------------------------------------------------------
+#define ARB_LINE_MAX     256    // longest line a source collects before forwarding anyway
+#define ARB_QUIET_MS     20     // after a reply's newline, quiet this long = exchange over
+#define ARB_TIMEOUT_MS   1000   // no complete reply this long after sending = give up
+#define ARB_PARTIAL_MS   50     // a partial line idle this long is forwarded as-is
 
-// Identical to pcSide, for SerialUSB2/ActiveDevice2. A separate variable,
-// not an array indexed by device, for the same reason pcSide itself isn't:
-// each only ever needs to track one device (whichever its own ActiveDeviceN
-// currently is), and the mutual-exclusivity constraint above means the two
-// never need to agree about the same device at the same time.
-Stream *pcSide2 = &SerialUSB2;
+enum : uint8_t
+{
+  SRC_USB1  = 0,                          // Serial (data port 1)
+  SRC_USB2  = 1,                          // SerialUSB2 (data port 2)
+  SRC_ETH0  = 2,                          // + slot: that slot's TCP data client
+  SRC_INT0  = SRC_ETH0 + DEVPORT_COUNT,   // + slot: the repeater itself (ADC, scripts)
+  SRC_COUNT = SRC_INT0 + DEVPORT_COUNT,
+  SRC_NONE  = 0xFF
+};
+
+struct LineSrc
+{
+  uint16_t len        = 0;
+  bool     ready      = false;   // a complete line is waiting to be sent
+  uint32_t lastByteMs = 0;
+  char     buf[ARB_LINE_MAX];
+};
+
+struct Arb
+{
+  uint8_t  owner     = SRC_NONE;   // requester whose exchange is open
+  uint8_t  lastOwner = SRC_NONE;   // last non-internal owner: gets unsolicited output
+  uint8_t  rr        = 0;          // round-robin start among the slot's requesters
+  bool     sawNL     = false;      // the open exchange's reply newline has arrived
+  uint32_t sentMs    = 0;
+  uint32_t lastRxMs  = 0;
+  uint32_t exchanges = 0;          // since boot
+  uint32_t timeouts  = 0;          // since boot
+};
+
+LineSrc lineSrc[SRC_COUNT];
+Arb     arb[DEVPORT_COUNT];
+uint8_t srcTarget[SRC_COUNT];      // slot each source addresses this pass (DEVPORT_COUNT = none)
+
+static inline bool isIntSrc(uint8_t src) { return src >= SRC_INT0 && src < SRC_COUNT; }
+
+// The stream a requester talks over, or NULL (internal, or a TCP client
+// that isn't connected).
+static Stream *srcStream(uint8_t src)
+{
+  if (src == SRC_USB1) return &Serial;
+  if (src == SRC_USB2) return &SerialUSB2;
+  if (src >= SRC_ETH0 && src < SRC_INT0)
+  {
+    uint8_t i = (uint8_t)(src - SRC_ETH0);
+    return (ethDataClient[i] && ethDataClient[i].connected()) ? &ethDataClient[i] : NULL;
+  }
+  return NULL;
+}
+
+// Queue a line from the repeater itself for slot idx (ADCUpdate, script
+// sends). Replaces any internal line still waiting: for a periodic value
+// the newest one is the one worth sending. The reply is discarded.
+static bool arbSubmitInternal(uint8_t idx, const char *line, int len)
+{
+  if (idx >= DEVPORT_COUNT || len <= 0) return false;
+  LineSrc &L = lineSrc[SRC_INT0 + idx];
+  if (len > ARB_LINE_MAX) len = ARB_LINE_MAX;
+  memcpy(L.buf, line, (size_t)len);
+  L.len   = (uint16_t)len;
+  L.ready = true;
+  return true;
+}
+
+static bool arbIdle(uint8_t idx) { return arb[idx].owner == SRC_NONE; }
+
+// True while the repeater's own line for slot idx is waiting or in progress.
+static bool arbInternalBusy(uint8_t idx)
+{
+  return lineSrc[SRC_INT0 + idx].ready || arb[idx].owner == (uint8_t)(SRC_INT0 + idx);
+}
 
 // -----------------------------------------------------------------------------
 // Per-port accessors — forward-declared in Section 5 for the command
@@ -1825,16 +1908,10 @@ void reinitDeviceBaud(uint8_t dev1based, uint32_t baud)
 
 // -----------------------------------------------------------------------------
 // devPortPush — accept one incoming byte into port idx's ring buffer.
-// Swallow check happens here (not at flush time): a byte arriving during
-// idx's swallow window is the reply to an ADCUpdate()/script-injected
-// command and is never meant for the host, on this port or any other, so it
-// must never enter the buffer at all — not dropped-and-counted (that's for
-// genuine overflow only), just discarded.
 // -----------------------------------------------------------------------------
 static void devPortPush(uint8_t idx, uint8_t b)
 {
   DevPort &p = devPort[idx];
-  if (millis() < p.swallowUntilMs) return;
 
   if (p.rxCount >= DEVPORT_RINGBUF_SIZE)
   {
@@ -1868,8 +1945,24 @@ static void devPortDrainIncoming(uint8_t idx)
       id.eatLF = false;
       if (repeaterBuf[i] == '\n') continue;   // tail of the settled GNAME reply
     }
+
+    // Track the open exchange's reply for the arbiter (end = newline + quiet).
+    Arb &a = arb[idx];
+    if (a.owner != SRC_NONE)
+    {
+      a.lastRxMs = millis();
+      if (repeaterBuf[i] == '\n') a.sawNL = true;
+      if (isIntSrc(a.owner)) continue;   // reply to the repeater's own command: not for any host
+    }
     devPortPush(idx, repeaterBuf[i]);
   }
+}
+
+static void devPortDiscard(uint8_t idx)
+{
+  DevPort &p = devPort[idx];
+  p.rxTail = p.rxHead;
+  p.rxCount = 0;
 }
 
 // Write out everything currently buffered for port idx, in order, to `out`.
@@ -1878,6 +1971,7 @@ static void devPortDrainIncoming(uint8_t idx)
 static void devPortFlush(uint8_t idx, Stream *out)
 {
   DevPort &p = devPort[idx];
+  if (p.rxCount == 0) return;
   while (p.rxCount > 0)
   {
     uint16_t contiguous = (uint16_t)min((int)p.rxCount, (int)(DEVPORT_RINGBUF_SIZE - p.rxTail));
@@ -1885,6 +1979,12 @@ static void devPortFlush(uint8_t idx, Stream *out)
     p.rxTail   = (uint16_t)((p.rxTail + contiguous) % DEVPORT_RINGBUF_SIZE);
     p.rxCount -= contiguous;
   }
+  // QNEthernet queues written data until flush() or lwIP's 250 ms TCP timer,
+  // so without this every reply over TCP waited up to a quarter second
+  // (measured ~250 ms/command). Only for TCP clients: USB Serial's flush()
+  // blocks until the host has read the data.
+  for (uint8_t i = 0; i < DEVPORT_COUNT; i++)
+    if (out == (Stream *)&ethDataClient[i]) { out->flush(); break; }
 }
 
 // Attach/detach + auto-reconnect for one port. Runs on all DEVPORT_COUNT every tick,
@@ -1900,10 +2000,161 @@ static void devPortUpdateConnection(uint8_t idx)
   if (s != NULL && s != p.startedDrv)
   {
     s->begin(curBaud);
+    arb[idx].owner = SRC_NONE;   // a new device: no exchange carries over
+    arb[idx].sawNL = false;
     identStart(idx, false);   // new device in this slot: find out its name
   }
-  if (s == NULL) devIdent[idx].state = IDENT_EMPTY;
+  if (s == NULL)
+  {
+    devIdent[idx].state = IDENT_EMPTY;
+    arb[idx].owner = SRC_NONE;
+  }
   p.startedDrv = s;
+}
+
+// -----------------------------------------------------------------------------
+// Arbiter helpers (see the PER-SLOT ARBITER comment above).
+// -----------------------------------------------------------------------------
+
+// Collect bytes from a host-side source into its line buffer, only while it
+// addresses a ready slot and has no complete line already waiting (so a
+// waiting line holds back the rest of that host's input in its own stream).
+static void srcFill(uint8_t src)
+{
+  LineSrc &L = lineSrc[src];
+  if (L.ready) return;
+  uint32_t now = millis();
+
+  uint8_t target = srcTarget[src];
+  Stream *st = srcStream(src);
+  if (target < DEVPORT_COUNT && slotReady(target) && st != NULL)
+  {
+    while (st->available() > 0)
+    {
+      int c = st->read();
+      if (c < 0) break;
+      L.buf[L.len++] = (char)c;
+      L.lastByteMs = now;
+      if (c == '\n' || L.len >= ARB_LINE_MAX) { L.ready = true; break; }
+    }
+  }
+  if (!L.ready && L.len > 0 && (now - L.lastByteMs) >= ARB_PARTIAL_MS) L.ready = true;
+}
+
+static void arbSend(uint8_t idx, uint8_t src)
+{
+  LineSrc &L = lineSrc[src];
+  Arb &a = arb[idx];
+  SlotSerial *s = slotSerial(idx);
+  if (s != NULL) s->write((const uint8_t *)L.buf, L.len);
+
+  bool blank = true;
+  for (uint16_t k = 0; k < L.len; k++)
+    if (L.buf[k] != '\r' && L.buf[k] != '\n' && L.buf[k] != ' ' && L.buf[k] != '\t') { blank = false; break; }
+
+  if (blank)
+  {
+    if (!isIntSrc(src)) a.lastOwner = src;   // nothing to wait for
+  }
+  else
+  {
+    a.owner    = src;
+    a.sentMs   = millis();
+    a.lastRxMs = a.sentMs;
+    a.sawNL    = false;
+    a.exchanges++;
+  }
+  L.len   = 0;
+  L.ready = false;
+}
+
+// Where slot idx's buffered output goes right now. *discard = true means it
+// belongs to a requester that's gone (a closed TCP client) or to the
+// repeater itself, and must not reach anyone else.
+static Stream *arbOutput(uint8_t idx, bool *discard)
+{
+  Arb &a = arb[idx];
+  *discard = false;
+  if (a.owner != SRC_NONE)
+  {
+    Stream *st = srcStream(a.owner);
+    if (st == NULL) *discard = true;
+    return st;
+  }
+  uint8_t o = a.lastOwner;
+  if (o != SRC_NONE && srcTarget[o] == idx && srcStream(o) != NULL) return srcStream(o);
+  if (srcTarget[SRC_USB1] == idx) return &Serial;
+  if (srcTarget[SRC_USB2] == idx) return &SerialUSB2;
+  return srcStream((uint8_t)(SRC_ETH0 + idx));   // NULL: no listener, stays buffered
+}
+
+static void arbService(uint8_t idx)
+{
+  Arb &a = arb[idx];
+  if (!slotConnected(idx)) { a.owner = SRC_NONE; return; }
+  uint32_t now = millis();
+
+  const uint8_t cand[4] = { SRC_USB1, SRC_USB2, (uint8_t)(SRC_ETH0 + idx), (uint8_t)(SRC_INT0 + idx) };
+  auto waiting = [&](uint8_t src) { return srcTarget[src] == idx && lineSrc[src].ready; };
+
+  if (a.owner != SRC_NONE)
+  {
+    uint8_t owner = a.owner;
+    bool othersWaiting = false;
+    for (uint8_t k = 0; k < 4; k++)
+      if (cand[k] != owner && waiting(cand[k])) othersWaiting = true;
+
+    bool done = false, fast = false;
+    if (a.sawNL)
+    {
+      if ((now - a.lastRxMs) >= ARB_QUIET_MS) done = true;
+      else if (waiting(owner) && !othersWaiting) { done = true; fast = true; }
+    }
+    if (!done && (now - a.sentMs) >= ARB_TIMEOUT_MS) { done = true; a.timeouts++; }
+    if (!done) return;
+
+    if (!isIntSrc(owner)) a.lastOwner = owner;
+    a.owner = SRC_NONE;
+    if (fast) { arbSend(idx, owner); return; }   // same requester, nobody else waiting
+  }
+
+  if (!slotReady(idx)) return;   // GNAME being asked: hold everything
+  for (uint8_t k = 0; k < 4 && a.owner == SRC_NONE; k++)
+  {
+    uint8_t pick = (uint8_t)((a.rr + k) % 4);
+    if (!waiting(cand[pick])) continue;
+    arbSend(idx, cand[pick]);
+    a.rr = (uint8_t)((pick + 1) % 4);
+    // a blank line opens no exchange: keep going so the next one is served too
+  }
+}
+
+// GARBSTAT — per slot: slot,busy,owner,exchanges,timeouts. owner is who has
+// the open exchange (USB1, USB2, ETH, INT or -); exchanges/timeouts are
+// since-boot counters. A rising timeouts count means the device isn't
+// answering some commands within ARB_TIMEOUT_MS.
+static const char *srcName(uint8_t src)
+{
+  if (src == SRC_NONE) return "-";
+  if (src == SRC_USB1) return "USB1";
+  if (src == SRC_USB2) return "USB2";
+  if (src < SRC_INT0)  return "ETH";
+  return "INT";
+}
+
+void cmdGetArbStat(void)
+{
+  if (!cp.checkExpectedArgs(0)) return;
+  cp.sendACK(false);
+  cp.println("#slot,busy,owner,exchanges,timeouts");
+  for (uint8_t i = 0; i < DEVPORT_COUNT; i++)
+  {
+    cp.print((int)(i + 1));                  cp.print(",");
+    cp.print(arb[i].owner != SRC_NONE);      cp.print(",");
+    cp.print(srcName(arb[i].owner));         cp.print(",");
+    cp.print(arb[i].exchanges);              cp.print(",");
+    cp.println(arb[i].timeouts);
+  }
 }
 
 void RepeaterModeSetup(void)
@@ -1936,27 +2187,22 @@ void RepeaterModeLoop(void)
     devPortDrainIncoming(i);
   }
 
-  // Which slot each data port is bridged to this pass (pinned by SDEV/SDEV2,
-  // or automatic — see effectiveDev()). DEVPORT_COUNT = nothing to bridge;
-  // the blocks below then leave that data port idle. A slot still being
-  // identified (GNAME pending) counts as "not connected" for forwarding:
-  // host bytes wait in Serial/SerialUSB2/the TCP client until it's settled.
+  // Which slot each source addresses this pass. Data ports: pinned by
+  // SDEV/SDEV2 or automatic (effectiveDev()); DEVPORT_COUNT = nothing to
+  // bridge, and that data port's input simply waits. TCP clients and the
+  // repeater's own lines always address their own slot.
   uint8_t selIdx, selIdx2;
   resolveDataPorts(&selIdx, &selIdx2);
-  USBSerial_BigBuffer *sel        = slotSerial(selIdx);
-  bool                 connected  = slotReady(selIdx);
-  USBSerial_BigBuffer *sel2       = slotSerial(selIdx2);
-  bool                 connected2 = slotReady(selIdx2);
+  srcTarget[SRC_USB1] = selIdx;
+  srcTarget[SRC_USB2] = selIdx2;
+  for (uint8_t i = 0; i < DEVPORT_COUNT; i++)
+  {
+    srcTarget[SRC_ETH0 + i] = i;
+    srcTarget[SRC_INT0 + i] = i;
+  }
 
-  // When a data port moves to a different slot (SDEV/SDEV2, or the
-  // automatic choice shifting), its "last speaker" falls back to the USB
-  // port itself: an Ethernet client of the previous slot must never
-  // receive the new slot's output.
-  static uint8_t prevSelIdx = DEVPORT_COUNT, prevSelIdx2 = DEVPORT_COUNT;
-  if (selIdx  != prevSelIdx)  { pcSide  = &Serial;     prevSelIdx  = selIdx;  }
-  if (selIdx2 != prevSelIdx2) { pcSide2 = &SerialUSB2; prevSelIdx2 = selIdx2; }
-
-  digitalWriteFast(LED_BUILTIN, connected ? HIGH : LOW);   // reflects ActiveDevice (port 1) only
+  bool connected = slotReady(selIdx);
+  digitalWriteFast(LED_BUILTIN, connected ? HIGH : LOW);   // reflects data port 1's device only
 
   // Follow the baud rate the PC application sets (matters for FTDI/CP210x/CH340 bridges).
   // Applies only to Serial's selected device — see curBaud's own comment
@@ -1965,106 +2211,24 @@ void RepeaterModeLoop(void)
   if (b != 0 && b != curBaud)
   {
     curBaud = b;
-    if (connected) sel->begin(curBaud);
+    if (connected) slotSerial(selIdx)->begin(curBaud);
   }
 
-  // PC -> ActiveDevice: only meaningful if it's actually connected. Both
-  // Serial and that device's own Ethernet data client can drive it;
-  // whichever one actually sends bytes this pass becomes pcSide, and also
-  // marks this port as "just heard from the host" for ADCUpdate()'s quiet
-  // guard (Section 6a). If both have data in the same pass, both still get
-  // forwarded here (in this order) and can interleave on the wire — see
-  // Section 6c.
-  if (connected)
-  {
-    int n = Serial.available();
-    if (n > 0)
-    {
-      n = Serial.readBytes((char *)repeaterBuf, min(n, (int)sizeof(repeaterBuf)));
-      sel->write(repeaterBuf, n);
-      devPort[selIdx].lastHostToDeviceMs = millis();
-      pcSide = &Serial;
-    }
+  // Host -> device: collect complete lines from every host-side source.
+  srcFill(SRC_USB1);
+  srcFill(SRC_USB2);
+  for (uint8_t i = 0; i < DEVPORT_COUNT; i++) srcFill((uint8_t)(SRC_ETH0 + i));
 
-    if (ethDataClient[selIdx] && ethDataClient[selIdx].connected())
-    {
-      int n2 = ethDataClient[selIdx].available();
-      if (n2 > 0)
-      {
-        n2 = ethDataClient[selIdx].read(repeaterBuf, min(n2, (int)sizeof(repeaterBuf)));
-        sel->write(repeaterBuf, n2);
-        devPort[selIdx].lastHostToDeviceMs = millis();
-        pcSide = &ethDataClient[selIdx];
-      }
-    }
-  }
-
-  // PC -> ActiveDevice2: identical to the ActiveDevice block above, via
-  // SerialUSB2/pcSide2 instead of Serial/pcSide. selIdx2 is only ever a
-  // valid index here when it actually differs from selIdx (see the
-  // defensive sentinel above), so this can never double-handle the same
-  // device as the block above.
-  if (connected2)
-  {
-    int n = SerialUSB2.available();
-    if (n > 0)
-    {
-      n = SerialUSB2.readBytes((char *)repeaterBuf, min(n, (int)sizeof(repeaterBuf)));
-      sel2->write(repeaterBuf, n);
-      devPort[selIdx2].lastHostToDeviceMs = millis();
-      pcSide2 = &SerialUSB2;
-    }
-
-    if (ethDataClient[selIdx2] && ethDataClient[selIdx2].connected())
-    {
-      int n2 = ethDataClient[selIdx2].available();
-      if (n2 > 0)
-      {
-        n2 = ethDataClient[selIdx2].read(repeaterBuf, min(n2, (int)sizeof(repeaterBuf)));
-        sel2->write(repeaterBuf, n2);
-        devPort[selIdx2].lastHostToDeviceMs = millis();
-        pcSide2 = &ethDataClient[selIdx2];
-      }
-    }
-  }
-
-  // PC -> every OTHER device, over its own dedicated Ethernet data port —
-  // independent of SDEV/SDEV2, since Ethernet isn't endpoint-limited the
-  // way USB is: each device is always reachable on its own port, not just
-  // the two switchable paths Serial/SerialUSB2 provide.
+  // Device -> host first, then arbitration: everything drained this pass
+  // belongs to the exchange that was open while it arrived, so it's
+  // delivered before the arbiter can hand the device to someone else.
   for (uint8_t i = 0; i < DEVPORT_COUNT; i++)
   {
-    if (i == selIdx || i == selIdx2) continue;   // handled above, arbitrated with Serial/SerialUSB2
-    if (!(ethDataClient[i] && ethDataClient[i].connected())) continue;
-    if (!slotReady(i)) continue;   // nothing connected to write to, or GNAME pending
-
-    int n = ethDataClient[i].available();
-    if (n > 0)
-    {
-      n = ethDataClient[i].read(repeaterBuf, min(n, (int)sizeof(repeaterBuf)));
-      slotSerial(i)->write(repeaterBuf, n);
-      devPort[i].lastHostToDeviceMs = millis();
-    }
-  }
-
-  // Device -> PC: ActiveDevice's backlog goes to whoever last spoke to it
-  // (pcSide, arbitrated above); ActiveDevice2's goes to pcSide2 likewise —
-  // both flushed even if their device isn't connected right now, since a
-  // backlog captured before a disconnect is still worth delivering. Every
-  // other device flushes to its own dedicated Ethernet client only once
-  // that client is actually connected — if not, the backlog just stays
-  // buffered (see the ring-buffer/flush header comment above for why
-  // that's the right default rather than discarding it or forcing it onto
-  // a switchable USB port it was never meant for).
-  if (selIdx  < DEVPORT_COUNT) devPortFlush(selIdx,  pcSide);
-  if (selIdx2 < DEVPORT_COUNT) devPortFlush(selIdx2, pcSide2);
-  for (uint8_t i = 0; i < DEVPORT_COUNT; i++)
-  {
-    if (i == selIdx || i == selIdx2) continue;
-    if (ethDataClient[i] && ethDataClient[i].connected())
-    {
-      devPortFlush(i, &ethDataClient[i]);
-    }
+    bool discard;
+    Stream *out = arbOutput(i, &discard);
+    if (discard)    devPortDiscard(i);
+    else if (out)   devPortFlush(i, out);
+    arbService(i);
   }
 }
 
@@ -2077,33 +2241,11 @@ void RepeaterModeLoop(void)
 //  directly to data.AdcTargetDevice's userial — a specific downstream port,
 //  independent of whatever data.ActiveDevice (SDEV) the host currently has
 //  selected — because that IS the connection to the device being
-//  controlled. There is no framing on that raw byte stream, so two guards,
-//  now tracked per-port (DevPort::lastHostToDeviceMs/swallowUntilMs, Section
-//  6), keep injected commands from colliding with ordinary repeater traffic:
-//
-//   1. QUIET GUARD (before sending): skip this cycle if the host forwarded
-//      bytes to THIS port within the last ADC_QUIET_GUARD_MS. Only actually
-//      possible if the ADC target happens to also be the selected device —
-//      a non-selected port's timestamp just sits stale, which correctly
-//      never blocks an injection. Reduces the chance of splicing our own
-//      bytes into the middle of a host-initiated command that's still
-//      arriving.
-//
-//   2. SWALLOW WINDOW (after sending): for ADC_SWALLOW_WINDOW_MS after
-//      injecting, devPortPush() (Section 6) discards this port's incoming
-//      bytes instead of buffering them, so the downstream device's reply to
-//      our command can never reach the host — on this port or any other —
-//      whether or not it happens to be selected right now.
-//
-//  Neither guard is a hard guarantee — a downstream device that replies
-//  unusually slowly could see its reply forwarded anyway (swallow window
-//  expired), and a host command that happens to start in the few mS after an
-//  injection could still overlap it. They are heuristics sized for typical
-//  short ASCII command/reply traffic, not a real bus arbitration protocol.
-//  Widen the windows here if your downstream device is slower to reply.
-
-#define ADC_QUIET_GUARD_MS     5   // skip this cycle if the link was busy this recently
-#define ADC_SWALLOW_WINDOW_MS  100 // discard downstream traffic for this long after injecting
+//  controlled. The command goes through that slot's arbiter (Section 6,
+//  arbSubmitInternal()) as the repeater's own requester: it waits its turn
+//  behind any host command in progress, never splices into one, and its
+//  reply is discarded so it never reaches a host. If the previous value is
+//  still waiting to be sent, the new one replaces it.
 
 void ADCUpdate(void)
 {
@@ -2113,8 +2255,6 @@ void ADCUpdate(void)
   if (idx >= DEVPORT_COUNT) return;   // defensive; AdcTargetDevice is range-checked at SADCDEV time
   if (!slotReady(idx)) return;   // nothing connected to control, or GNAME pending
 
-  if ((millis() - devPort[idx].lastHostToDeviceMs) < ADC_QUIET_GUARD_MS) return;  // link busy, try next cycle
-
   float counts = readAdcCounts();
   float value  = scaleAdcValue(counts);
 
@@ -2123,8 +2263,7 @@ void ADCUpdate(void)
   if (len <= 0) return;
   if (len >= (int)sizeof(cmdLine)) len = sizeof(cmdLine) - 1;  // truncated; still send what fits
 
-  slotSerial(idx)->write((uint8_t *)cmdLine, len);
-  devPort[idx].swallowUntilMs = millis() + ADC_SWALLOW_WINDOW_MS;
+  arbSubmitInternal(idx, cmdLine, len);
 }
 
 // =============================================================================
@@ -2137,10 +2276,9 @@ void ADCUpdate(void)
 //  ADCThread. This is a real integration, not a standalone toy: the syscalls
 //  below drive the actual downstream link for data.AdcTargetDevice (the same
 //  target ADCThread uses), the actual calibration fields (AdcPin/AdcScaleM/
-//  AdcScaleB/AdcCmdName), and that port's own guard/swallow state
-//  (DevPort::lastHostToDeviceMs/swallowUntilMs, Section 6) — so the two
-//  features can't collide with ordinary repeater traffic any differently
-//  than ADCUpdate() already doesn't.
+//  AdcScaleB/AdcCmdName), and the same per-slot arbiter path ADCUpdate()
+//  uses (Section 6) — so the two features can't collide with ordinary
+//  repeater traffic any differently than ADCUpdate() already doesn't.
 //
 //  This is a demonstration, not a replacement for ADCThread — the two do the
 //  same conceptual job (read the ADC, send a scaled value downstream), so
@@ -2162,7 +2300,8 @@ void ADCUpdate(void)
 //  is compiled in at build time (include/ScriptBytecode.h) without a device
 //  to ask. Keep these ids (the current table order) if that file is not
 //  regenerated:
-//    0 = link_ready()      — data.AdcTargetDevice connected AND quiet-guard elapsed
+//    0 = link_ready()      — data.AdcTargetDevice connected, identified, and the
+//                             repeater's previous send to it already done
 //    1 = read_adc()         — readAdcCounts() rounded to int32 via lroundf()
 //                             (the VM is int32-only; see readAdcCounts()'s
 //                             own comment in Section 5 for the averaging)
@@ -2180,8 +2319,8 @@ static int32_t sys_link_ready(int32_t *args, uint8_t argc)
 
   uint8_t idx = (uint8_t)(data.AdcTargetDevice - 1);
   if (idx >= DEVPORT_COUNT) return 0;
-  if (!slotReady(idx)) return 0;                                          // nothing connected, or GNAME pending
-  if ((millis() - devPort[idx].lastHostToDeviceMs) < ADC_QUIET_GUARD_MS) return 0; // link busy
+  if (!slotReady(idx)) return 0;         // nothing connected, or GNAME pending
+  if (arbInternalBusy(idx)) return 0;    // our previous send hasn't gone out / been answered yet
   return 1;
 }
 
@@ -2206,9 +2345,7 @@ static int32_t sys_scale_send(int32_t *args, uint8_t argc)
   if (len <= 0) return 0;
   if (len >= (int)sizeof(cmdLine)) len = sizeof(cmdLine) - 1;  // truncated; still send what fits
 
-  slotSerial(idx)->write((uint8_t *)cmdLine, len);
-  devPort[idx].swallowUntilMs = millis() + ADC_SWALLOW_WINDOW_MS;
-  return 1;
+  return arbSubmitInternal(idx, cmdLine, len) ? 1 : 0;
 }
 
 // -----------------------------------------------------------------------------
@@ -2424,11 +2561,8 @@ bool eraseScriptSlotFromFlash(uint8_t slot)
 //      regardless of which device data.ActiveDevice/SDEV currently selects —
 //      unlike Serial's single switchable path, Ethernet isn't endpoint-
 //      limited, so every device gets its own port rather than sharing one.
-//      For whichever device is currently selected, its Ethernet port still
-//      competes with Serial for RepeaterModeLoop() (Section 6); see `pcSide`
-//      there for how replies are routed back to whichever source spoke most
-//      recently. Every other device's Ethernet port is its only upstream
-//      path, so there's nothing to arbitrate there.
+//      A device's TCP client and a USB data port bridged to it share it
+//      through the slot's arbiter (Section 6).
 //
 //  All client globals are reused across reconnects (`ethXClient = newClient`
 //  inside EthernetUpdate() below) rather than replaced, because
@@ -2442,16 +2576,13 @@ bool eraseScriptSlotFromFlash(uint8_t slot)
 //  has since disconnected) safely returns 0/false rather than crashing or
 //  blocking.
 //
-//  KNOWN LIMITATION (carried over from design discussion, not solved here):
-//  pcSide (Section 6) resolves who gets a reply, not simultaneous writes. If
-//  Serial and the selected device's own ethDataClient[] both have bytes
-//  available in the same RepeaterModeLoop() pass, both still get forwarded
-//  to that device's userial that pass and can interleave on the wire. This
-//  only bites under sustained concurrent traffic from both sides at once,
-//  not "one connected while the other is idle" — accepted as a known edge
-//  case, same as the equivalent ADC-injection guards are heuristics rather
-//  than a real bus-arbitration protocol. Doesn't apply to a non-selected
-//  device's Ethernet port at all, since Serial never reaches it.
+//  Simultaneous USB and TCP traffic to one device used to be able to
+//  interleave on the wire ("last speaker wins" only routed replies). The
+//  per-slot arbiter (Section 6) replaced that: lines are sent one at a time.
+//
+//  FLUSHING: QNEthernet queues written data until flush() or lwIP's 250 ms
+//  TCP timer, so devPortFlush() and loop() flush TCP clients after writing
+//  (measured ~250 ms -> ~10 ms per command); setNoDelay(true) on accept.
 //
 //  BAUD RATE: Serial.baud() (Section 6) only exists for a USB CDC host; a
 //  pure-Ethernet client has no equivalent way to signal a baud rate, so
@@ -2491,13 +2622,18 @@ static void EthernetUpdate(void)
 
   // accept() is non-blocking: it returns an unconnected client immediately
   // if nobody is trying to connect right now.
+  // setNoDelay(true) turns off Nagle's algorithm: a reply often goes out in
+  // two small writes (the ACK byte, then the value), and with Nagle the
+  // second waits for the host to acknowledge the first, which a host's
+  // delayed-ACK timer holds back ~200 ms. Measured: ~240 ms per command over
+  // TCP with Nagle on, against ~6 ms over USB.
   EthernetClient nc = ethCtrlServer.accept();
-  if (nc) { if (ethCtrlClient) ethCtrlClient.stop(); ethCtrlClient = nc; }
+  if (nc) { if (ethCtrlClient) ethCtrlClient.stop(); nc.setNoDelay(true); ethCtrlClient = nc; }
 
   for (uint8_t i = 0; i < DEVPORT_COUNT; i++)
   {
     EthernetClient nd = ethDataServer[i].accept();
-    if (nd) { if (ethDataClient[i]) ethDataClient[i].stop(); ethDataClient[i] = nd; }
+    if (nd) { if (ethDataClient[i]) ethDataClient[i].stop(); nd.setNoDelay(true); ethDataClient[i] = nd; }
   }
 }
 
@@ -2779,6 +2915,10 @@ void loop()
 {
   cp.processStreams();
   cp.processCommands();
+  // Push any command reply to the TCP control client out now: QNEthernet
+  // otherwise holds it for lwIP's 250 ms TCP timer (measured ~250 ms per
+  // command on port 5000). Cheap when there's nothing queued.
+  if (ethCtrlClient && ethCtrlClient.connected()) ethCtrlClient.flush();
   control.run();
   modeTable[currentMode].loop();
 }

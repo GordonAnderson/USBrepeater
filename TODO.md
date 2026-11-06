@@ -623,11 +623,44 @@ Facts this design relies on (per the user):
        clean) and TCP 5003 answered `GNAME`; nothing left buffered.
 
 **Part B — scripts that talk to several MIPS (after Part A is proven):**
-- Per-MIPS arbiter: one command in progress per MIPS; host passthrough
-  and script commands queue (one entry per requester, about 7). Script
-  replies end at the first newline (GAACE replies are one line:
-  ACK, ACK+value or NAK `?`, then a newline). Host replies end at the
-  newline plus a short silence, to cover multi-line replies.
+- [x] **B1. Per-MIPS arbiter — done (2026-11-05), hardware-tested.**
+  One command in progress per device; host passthrough and the repeater's
+  own sends queue. As built (`src/USBrepeater.cpp` Section 6, "PER-SLOT
+  ARBITER"): line sources for data port 1, data port 2, each slot's TCP
+  client, and one internal source per slot (ADC/script sends; a newer
+  value replaces one still waiting). An exchange ends at the reply's
+  newline plus 20 ms of quiet (`ARB_QUIET_MS`; covers multi-line replies)
+  or after 1 s (`ARB_TIMEOUT_MS`, counted in `GARBSTAT`). Fast path: the
+  same requester's next line, with nobody else waiting, goes straight out
+  without the quiet gap. Output is flushed to the exchange's owner before
+  the arbiter can hand the device to someone else; unsolicited output
+  goes to the last owner, else the bridged USB port, else the TCP client.
+  Whitespace-only lines open no exchange. Partial lines are forwarded
+  after 50 ms idle. Replaces `pcSide`/`pcSide2` and the ADC quiet-guard/
+  swallow-window heuristics (`DevPort` fields removed). New `GARBSTAT`.
+  The same internal path is what B3's `dcmd()` will use.
+
+  Found and fixed on the way: **every TCP reply waited ~250 ms**
+  (QNEthernet holds written data until `flush()` or lwIP's 250 ms TCP
+  timer; this predates the arbiter). TCP clients are now flushed after
+  each write (data ports in `devPortFlush()`, the control port in
+  `loop()`) and get `setNoDelay(true)` on accept: data port 250 -> 10 ms,
+  control port 250 -> 3.7 ms per command.
+
+  Hardware results (QUAD on slot 1, IsoElectrometer on slot 3):
+  - Single host: USB 5.9 ms/command, TCP ~10-12 ms.
+  - USB data port 1 (`GVER`) and TCP 5001 (`GNAME`) hammering QUAD at
+    once, 100 each: 0 misrouted replies.
+  - Four requesters on two devices at once (USB1 + TCP 5001 on QUAD, USB2
+    + TCP 5003 on the electrometer), 150 each: 600 exchanges, 0 misrouted,
+    0 timeouts, ~22-33 ms/command each under contention.
+  - ADC sends (`GVER,<value>` every 50 ms, harmless: NAKed) interleaved
+    with 200 host `GNAME`s to the electrometer: 330 exchanges, 0 bad host
+    replies, 0 stray bytes, 0 timeouts. ADC settings restored afterwards
+    (target 1, `SETVAL`, 1000 ms; never saved).
+  - Not yet tested: the MIPS host application itself through the arbiter
+    (data port 1 and over TCP), and a device that sends unsolicited
+    output.
 - VM "waiting" state: a script pauses at a device call and resumes when
   the reply arrives, so the main loop and other devices never stall.
 - Language: `device("NAME")` returns a handle that stands for the name,

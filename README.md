@@ -61,21 +61,25 @@ whatever was previously connected on that same port, same policy every
 commercial serial-to-Ethernet device server uses. Each device's port is
 independent of the others.
 
-**Passthrough arbitration — "last speaker wins", scoped to the selected
-device.** `Serial` only ever talks to whichever device `SDEV` currently
-selects, so only that device has two competing upstream sources: `Serial`
-and its own dedicated Ethernet client. Whichever one most recently sent
-bytes to it becomes `pcSide` (`src/USBrepeater.cpp`, Section 6), and that
-device's replies are routed back only to it — the same pattern
-`commandProcessor::processStreams()` already uses internally
-(`serial = streams[i];`). Every other device has only one upstream path (its
-own Ethernet port), so there's nothing to arbitrate there — it's always
-read from and flushed to, independent of `SDEV`. This resolves *who gets the
-reply* for the selected device; it does not prevent both sources writing to
-it in the same loop pass if both have data available at once — accepted as
-a known edge case under sustained concurrent traffic from both sides, not
-solved with hard exclusivity. See Section 6c's header comment for the full
-reasoning.
+**Passthrough arbitration — one command at a time per device.** Several
+requesters can want the same device at once: the USB data port bridged to
+it, its own TCP data client, and the repeater itself (ADC and script
+sends). Each device has an arbiter (`src/USBrepeater.cpp`, Section 6): each
+requester's input is collected one line at a time, the arbiter sends one
+line, routes the reply back to whoever sent it, and only then serves the
+next requester. An exchange ends once the reply's newline has arrived and
+the device has been quiet for 20 ms (so a multi-line reply isn't cut off),
+or after 1 s with no complete reply (`GARBSTAT` counts these). When the
+same requester sends its next command and nobody else is waiting, it goes
+out straight away, so a single host app sees no extra delay. Output the
+device sends on its own goes to whoever last talked to it. Lines are
+forwarded when complete, not byte by byte: right for the ASCII command
+traffic hosts send, not for binary transfers (none are used).
+
+Measured on real hardware (2026-11-05): about 6 ms per command over USB
+and 10 ms over TCP for a single host; with four requesters on two devices
+at once, 600 exchanges with no misrouted replies and no timeouts (about
+25 ms per command each).
 
 **Baud rate**: `Serial.baud()` auto-follows the PC's chosen baud for the USB
 side; there's no TCP equivalent, so `GBAUD`/`SBAUD` exist for a pure-Ethernet
@@ -209,14 +213,9 @@ On the Ethernet side, every port is independent of `SDEV`/`SDEV2`: each of
 the 8 slots has its own dedicated, always-reachable TCP data
 port (see the Ethernet section above), so a client connected to device 3's
 port gets device 3's traffic whether or not `SDEV`/`SDEV2` currently points
-either USB port at device 3. For whichever device *is* currently selected
-by `Serial` or `SerialUSB2`, its Ethernet port also competes with that one
-switchable USB port for who gets its replies ("last speaker wins",
-`pcSide`/`pcSide2`); every other device's Ethernet port is its only
-upstream path, so there's no arbitration to do there. Because
-`ActiveDevice`/`ActiveDevice2` can never collide, no device ever has to
-arbitrate between *both* switchable USB ports and Ethernet at once — at
-most one switchable port plus Ethernet, the same two-way case either way.
+either USB port at device 3. A device reachable from both a USB data port
+and its TCP port is shared through its arbiter (see "Passthrough
+arbitration" above), so both can be used at the same time.
 
 **The firmware learns each instrument's name.** When a device lands in
 slot 1-4, the repeater sends it `GNAME` (every GAACE device answers with
@@ -322,19 +321,10 @@ through the low-pass filter above — REF is a slowly-drifting calibration
 factor, not a noisy signal to track quickly, so plain averaging is the
 right amount of smoothing for it.
 
-Because this writes to the same link the repeater pumps PC<->device traffic
-over, two guards keep it from colliding with ordinary passthrough traffic
-(see Section 6a in `src/USBrepeater.cpp` for the full explanation):
-
-- **Quiet guard** — skips a cycle if the PC forwarded bytes to the device in
-  the last 5 ms.
-- **Swallow window** — discards device-\>PC bytes for 100 ms after injecting,
-  so the downstream device's reply to the injected command doesn't show up as
-  unsolicited bytes in the PC application's stream.
-
-Both are heuristics sized for short ASCII command/reply traffic, not a real
-bus-arbitration protocol — widen them if your downstream device replies
-slowly.
+The command goes through the device's arbiter as the repeater's own
+request: it waits for any host command in progress to finish, never splices
+into one, and the device's reply is discarded so it never reaches a host
+app. If the previous value hasn't been sent yet, the newer one replaces it.
 
 ### GAACE_Script ADC demo
 
@@ -355,7 +345,7 @@ This is a demonstration running in parallel, not a replacement, so
 `Script0` starts **disabled**. Enable it with `STENA,Script0,TRUE` — but
 not at the same time as `ADCEN,TRUE` against the same downstream command,
 which would double-send. It reuses the same `AdcPin`/`AdcScaleM`/
-`AdcScaleB`/`AdcCmdName` settings and the same guard/swallow state as
+`AdcScaleB`/`AdcCmdName` settings and the same arbiter path as
 `ADCUpdate()`. Change its rate with `STINT,Script0,<mS>` — starting,
 stopping, and rate all come from GAACE_Core's `threadCommands`
 (`?TENA`/`?TINT`), not from anything specific to this feature; see
@@ -545,6 +535,7 @@ every registered command and its help string, `HELP,<cmd>` looks up one.
 | `GDEV2` / `SDEV2,<n>` | Same for `SerialUSB2`: 0 = automatic (next occupied slot after data port 1's), 1-8 = pinned. `SDEV2` rejects a pinned value equal to `ActiveDevice` |
 | `GADCDEV` / `SADCDEV,<n>` | Get/set which downstream slot (1-8) `ADCThread`/the script demo targets |
 | `GDEVSTAT` | One row per slot (1-8): `dev,connected,bytesWaiting,bytesDropped` |
+| `GARBSTAT` | Per-slot arbiter: `slot,busy,owner,exchanges,timeouts`. `owner` is who has the open exchange (`USB1`, `USB2`, `ETH`, `INT` = the repeater itself, or `-`); `exchanges`/`timeouts` count since boot. A rising `timeouts` means the device isn't answering some commands within 1 s |
 | `GDEVPATH` | Diagnostic: one row per slot (`slot,connected,connector,innerPort,vid,pid,speed,addr,hubAddr,hubPort`), then one per hub driver. `connector` is the board connector (1-4, matches the labels); `innerPort` is the port on a device's own internal hub, 0 if none. Also lists any attached device left without a slot, as slot 0 |
 | `GDEVLIST` | One row per occupied slot: `slot,connector,role,vid,pid,state,name`. `role` `MAIN` (slot 1-4) or `EXTRA` (5-8); `state` `NAMED`/`PENDING`/`NONAME`/`NOTQUERIED`; `name` from the device's `GNAME`, asked on attach |
 | `GDEVSLOT,<name>` | Slot (1-8) of the device whose `GNAME` is `<name>` (case-insensitive); NAK if none |
@@ -610,8 +601,8 @@ compile-verified-only so far. As of 2026-11-05, the first Hub Carrier
 board exists and most of this is now real-hardware-verified: hub bring-up,
 all 4 connectors with 4 real instruments at once (5 serial devices,
 including one behind a nested hub and one full-speed), both switchable
-USB paths and the per-slot Ethernet data ports, with "last speaker wins"
-confirmed across USB/Ethernet on the same device, script persistence
+USB paths and the per-slot Ethernet data ports, with the per-device
+arbiter verified under concurrent USB/Ethernet/ADC traffic, script persistence
 across a real reboot, and DIO (control-port and script-syscall paths
 both). Remaining open work: slots 5-8 (untested), simultaneous multi-port TCP
 load, and the AIN REF-correction/filter work (needs a known calibration
