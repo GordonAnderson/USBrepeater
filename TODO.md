@@ -429,10 +429,34 @@ yet to test against.** `src/USBrepeater.cpp` Section 5:
       during a 12 s steady hold (noise well under the 20-count threshold).
       The log stopped after 26 s only because the MIPS host application
       opened the same USB passthrough port mid-test; the board was fine.
-- [ ] **`GADCM`/`GADCB` show only 2 decimal places** (`CMDfloat`
-      formatting), so `GADCM` reads `0.01` for a slope of 0.003891 — a set
-      calibration can't be read back or verified. Fix before calibrating:
-      print these with enough significant digits (e.g. 6).
+- [x] ~~**`GADCM`/`GADCB` show only 2 decimal places**~~ (2026-11-06).
+      They are now function commands that print 7 significant digits
+      (`GADCM` -> `0.0053988`). `SADCM`/`SADCB` also NAK a non-number:
+      the old `CMDfloat` path used `String::toFloat()`, so `SADCM,abc`
+      silently set the slope to 0.
+- [x] **AIN calibration, ±10 V board (2026-11-06).** Bench source at the
+      AIN connector, 30 `GADC` reads per point, filter off:
+
+      | Input | Counts | Default scale | Calibrated |
+      |---|---|---|---|
+      | open | 2083.6 | +0.183 V | |
+      | 0 V | 2070.91 | +0.115 V | -0.006 V |
+      | +10 V | 3921.45 | +10.012 V | +10.003 V |
+      | -10 V | 216.92 | -9.800 V | -10.003 V |
+      | +5 V (check point, not in the fit) | 2995.97 | | +5.0004 V |
+
+      Least-squares fit: `SADCM,0.0053988` / `SADCB,-11.1742` (defaults
+      were 0.005348 / -10.96, about 1 % low in gain). Error within ±6 mV
+      over ±10 V; the two halves differ by 0.19 % in slope, which is the
+      6 mV bow at 0 V. Noise about 0.1 count (0.5 mV) std. Range about
+      -11.17 V to +10.93 V before the ADC clips. Then `CALREF` (RefCal =
+      3110.06 counts), `SAVE`, and a reboot: all three values came back,
+      and an unsaved change was discarded as expected.
+- [ ] **REF reads 3110 counts, about 2.51 V, not the expected ~1550
+      (1.25 V).** Either this board still has the 2.5 V reference, or
+      there's gain/a divider on the REF path. The correction is
+      ratiometric, so it works either way; this only matters for
+      confirming the hardware matches the 1.25 V change.
 
 ### Phase 3a — AIN low-pass filter (tunable without reflashing)
 

@@ -622,8 +622,8 @@ every registered command and its help string, `HELP,<cmd>` looks up one.
 | `GADCPIN` / `SADCPIN,<pin>` | ADC input pin |
 | `GADCINT` / `SADCINT,<mS>` | ADC update interval |
 | `GADCCMD` / `SADCCMD,<name>[,<fixed args>...]` | Command prefix sent to the downstream device as `<prefix>,<value>`; extra arguments are joined with commas, e.g. `SADCCMD,SRFADRV,1` sends `SRFADRV,1,<value>` (19 characters max) |
-| `GADCM` / `SADCM,<m>` | ADC scale slope |
-| `GADCB` / `SADCB,<b>` | ADC scale offset |
+| `GADCM` / `SADCM,<m>` | ADC scale slope (read back with 7 significant digits; a non-number is NAKed) |
+| `GADCB` / `SADCB,<b>` | ADC scale offset (read back with 7 significant digits; a non-number is NAKed) |
 | `GADCFILTER` / `SADCFILTER,<mS>` | AIN low-pass filter time constant, mS (`0`=disabled); tunable live, no reflash |
 | `CALREF` | Capture the current REF reading into `RefCal`, enabling ratiometric correction (`SAVE` to persist) |
 | `GREFCAL` | Read back `RefCal`; `0` means the REF correction is disabled |

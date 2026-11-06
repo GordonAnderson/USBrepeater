@@ -295,6 +295,10 @@ static void cmdGetLink2(void);
 static void cmdGetAdcInterval(void);
 static void cmdSetAdcInterval(void);
 static void cmdGetAdc(void);
+static void cmdGetAdcM(void);
+static void cmdSetAdcM(void);
+static void cmdGetAdcB(void);
+static void cmdSetAdcB(void);
 static void cmdCalRef(void);
 static void cmdGetRefCal(void);
 static void cmdGetBaud(void);
@@ -441,8 +445,12 @@ Command cmds[] =
   {"SADCINT",  CMDfunction, -1, (void *)cmdSetAdcInterval, NULL, "Set ADC update interval, mS"},
   {"GADCCMD",  CMDfunction,  0, (void *)cmdGetAdcCmd,      NULL, "Get the command prefix sent to the downstream device"},
   {"SADCCMD",  CMDfunction, -1, (void *)cmdSetAdcCmd,      NULL, "Set the command prefix, name[,fixed args...]; e.g. SADCCMD,SRFADRV,1 sends SRFADRV,1,<value>"},
-  {"?ADCM",    CMDfloat,    -1, (void *)&data.AdcScaleM,   NULL, "ADC scale slope: value = M * counts + B"},
-  {"?ADCB",    CMDfloat,    -1, (void *)&data.AdcScaleB,   NULL, "ADC scale offset: value = M * counts + B"},
+  // GADCM/GADCB are functions, not CMDfloat, so they print enough digits
+  // to read a calibration back (CMDfloat prints 2 decimals: 0.0053988 -> 0.01).
+  {"GADCM",    CMDfunction,  0, (void *)cmdGetAdcM,        NULL, "Get ADC scale slope (7 significant digits): value = M * counts + B"},
+  {"SADCM",    CMDfunction,  1, (void *)cmdSetAdcM,        NULL, "Set ADC scale slope: value = M * counts + B"},
+  {"GADCB",    CMDfunction,  0, (void *)cmdGetAdcB,        NULL, "Get ADC scale offset (7 significant digits): value = M * counts + B"},
+  {"SADCB",    CMDfunction,  1, (void *)cmdSetAdcB,        NULL, "Set ADC scale offset: value = M * counts + B"},
   {"?ADCFILTER", CMDfloat,  -1, (void *)&data.AdcFilterTauMs, NULL, "AIN low-pass time constant, mS (0 = disabled); tunable live, no reflash"},
   {"CALREF",   CMDfunction,  0, (void *)cmdCalRef,        NULL, "Capture the current REF reading into RefCal (then SAVE to persist)"},
   {"GREFCAL",  CMDfunction,  0, (void *)cmdGetRefCal,      NULL, "Get RefCal; 0 = REF ratiometric correction disabled"},
@@ -1040,6 +1048,39 @@ static void cmdGetAdc(void)
   cp.print(",");
   cp.println(value, 4);
 }
+
+// -----------------------------------------------------------------------------
+// GADCM/SADCM, GADCB/SADCB — the AIN calibration (value = M * counts + B).
+// The getters print 7 significant digits (a float's full precision) so a
+// calibration can be read back and checked; the setters take any finite number and NAK anything else.
+// -----------------------------------------------------------------------------
+static void printFloat7(float v)
+{
+  char buf[24];
+  snprintf(buf, sizeof(buf), "%.7g", (double)v);
+  cp.sendACK(false);
+  cp.println(buf);
+}
+
+static void setFloatArg(float *dst)
+{
+  // Parsed here with strtof, not getValue(float*): that uses String::toFloat(),
+  // which turns a typo ("abc") into 0 and would silently zero the calibration.
+  char *arg;
+  if (!cp.getValue(&arg)) { cp.sendNAK(ERR_BADARG); return; }
+  char *end;
+  float v = strtof(arg, &end);
+  bool ok = (end != arg) && (*end == '\0') && isfinite(v);
+  cp.ca->free(arg);
+  if (!ok) { cp.sendNAK(ERR_BADARG); return; }
+  *dst = v;
+  cp.sendACK();
+}
+
+static void cmdGetAdcM(void) { if (cp.checkExpectedArgs(0)) printFloat7(data.AdcScaleM); }
+static void cmdSetAdcM(void) { if (cp.checkExpectedArgs(1)) setFloatArg(&data.AdcScaleM); }
+static void cmdGetAdcB(void) { if (cp.checkExpectedArgs(0)) printFloat7(data.AdcScaleB); }
+static void cmdSetAdcB(void) { if (cp.checkExpectedArgs(1)) setFloatArg(&data.AdcScaleB); }
 
 // -----------------------------------------------------------------------------
 // CALREF — capture the REF channel's current averaged reading into
