@@ -2,9 +2,12 @@
 
 **Product name: GAACE Gateway.** This repository is its firmware. The
 repository, source files and some internal identifiers keep the original
-working name, *USBrepeater* (for example `src/USBrepeater.cpp`, and the
-firmware's own `GVER`/`GNAME` replies); "USBrepeater" in these docs means
-this firmware or the GAACE Gateway itself.
+working name, *USBrepeater* (for example `src/USBrepeater.cpp`);
+"USBrepeater" in these docs means this firmware or the GAACE Gateway
+itself. The firmware identifies itself as `GAACEgateway`: `GVER` replies
+`GAACEgateway, version ...` and the factory-default `GNAME` is
+`GAACEgateway`. A board that already has a saved name keeps it until
+`SNAME,GAACEgateway` + `SAVE` (or a settings reset).
 
 A Teensy 4.1 USB-CDC repeater/controller built on the
 [GAACE](https://github.com/GordonAnderson) (GAA Custom Electronics Core

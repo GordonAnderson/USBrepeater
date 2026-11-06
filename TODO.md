@@ -2,7 +2,8 @@
 
 **Product name: GAACE Gateway (2026-11-05).** The firmware repository and
 files keep the working name USBrepeater; "USBrepeater" below means this
-firmware or the product.
+firmware or the product. `GVER` and the factory-default `GNAME` now say
+`GAACEgateway`; a board with a saved name keeps it until `SNAME` + `SAVE`.
 
 **Hardware change (2026-11-05): the REF reference on `A1` is now 1.25 V**
 (was the 2.5 V ISL21070CIH325Z). No firmware change needed: the REF

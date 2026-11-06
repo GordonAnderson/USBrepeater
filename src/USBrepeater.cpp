@@ -181,7 +181,7 @@ ExtData ext = { "", "", "", EXT_SIGNATURE };   // see ExtData in USBrepeater.h
 Data DefaultData =
 {
   sizeof(Data),   // Size — always first so future code can detect struct growth
-  "USBrepeater",  // Name
+  "GAACEgateway", // Name (GNAME); factory default only, a saved name is kept
   1,              // Rev  — increment when hardware changes
   MODE_REPEATER,  // Mode — boot into repeater mode by default
 
@@ -212,7 +212,7 @@ Data DefaultData =
 };
 
 // Version string returned by the GVER command.
-const char *Version = "USBrepeater, version 1.1 Sept 27, 2026";
+const char *Version = "GAACEgateway, version 1.1 Sept 27, 2026";
 
 // Currently active mode. Mirrors data.Mode but kept as a separate runtime
 // variable so a mode change can be applied live without requiring SAVE.
