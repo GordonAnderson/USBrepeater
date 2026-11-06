@@ -582,8 +582,11 @@ Facts this design relies on (per the user):
      connections (control 5000 + data 5001-5008) open at once worked:
      `GETHSTAT` over TCP showed ctrl and all 8 data clients `TRUE`, and
      5001/5002 still answered, confirming the raised lwIP limits.
-   - Not yet tested: a reboot with both plugged in, and the slot N+4 rule
-     (needs the MIPS with the internal hub/RS-485 temperature controller).
+   - Power cycle with both plugged in (connectors 1/2): same layout after
+     boot (fresh USB addresses 2/3): slots 1/2, `GDEV`/`GDEV2` `0,1`/`0,2`,
+     data ports 1/2 and TCP 5001/5002 answered `QUAD`/`IsoElectrometer`.
+   - Not yet tested: the slot N+4 rule (needs the MIPS with the internal
+     hub/RS-485 temperature controller).
 4. [ ] `GNAME` queried on attach (retry while the MIPS boots, reply
        swallowed, slot held out of passthrough until answered or timed
        out); no reply = not a GAACE device. New `GDEVLIST` (slot,
