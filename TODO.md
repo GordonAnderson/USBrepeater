@@ -639,9 +639,11 @@ Facts this design relies on (per the user):
   times early.
 
 Open questions:
-- [ ] Does the MIPS host app send non-command data (binary, firmware
+- [x] Does the MIPS host app send non-command data (binary, firmware
       uploads) through the passthrough? If so, a raw mode that bypasses
-      the arbiter is needed.
+      the arbiter is needed. **Answered (2026-11-05, per the user): no,
+      ASCII text only.** No raw mode for now; host traffic can be handled
+      line by line. Revisit if a host ever needs binary transfers.
 - [ ] Host-side features (`SDEV` by name, name-to-TCP-port lookup) are
       to be decided. Don't switch a data port while a host app has it
       open.
