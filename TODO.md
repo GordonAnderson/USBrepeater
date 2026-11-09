@@ -1480,7 +1480,7 @@ a new constraint.
             tested: actually reordering the syscall table and reflashing
             to confirm `SCRIPTRESTORE` NAKs a now-stale saved script
             (`SCRIPT_RESTORE_STALE`) instead of silently misrunning it.
-- [ ] **A saved script comes back at the default 1000 mS interval; its own
+- [x] **A saved script comes back at the default 1000 mS interval; its own
       interval (and enabled state) aren't saved (noted 2026-11-08).**
       `SCRIPTSAVE` stores the code and string pool (plus the syscall-table
       `.sig`), nothing about the slot's thread. At boot `setup()` (Section 5b)
@@ -1509,6 +1509,15 @@ a new constraint.
       with `GTINT,Script<n>` after a power cycle. The MIPS app's Device
       Scripts dialog has no interval control or "save to flash" button yet
       either (`SCRIPTSAVE` and `STINT` have to be typed in the Terminal tab).
+      **Done 2026-11-09 (option 1, interval only).** `SCRIPTSAVE` also writes
+      `/script<N>.cfg` (`[version=1][intervalMs:u32]`) from the slot's current
+      interval; a restore applies it, clamped to 5 mS..1 h. The enabled flag is
+      not saved: a restored script still always starts, because SCRIPTLOAD
+      leaves a slot disabled and "upload, then SCRIPTSAVE" would otherwise
+      come back stopped. Older saves (no `.cfg`) restore at 1000 mS as before;
+      `SCRIPTERASE` removes the `.cfg` too. Tested on hardware: `STINT,Script1,50`
+      + `SCRIPTSAVE,1`, power cycle -> `GTINT,Script1` = 50. Still open: the MIPS
+      app has no interval control or save-to-flash button.
 - [ ] A general "device just rebooted" notification — raised during design
       discussion as a real gap (a host has no way to know a script's state
       was lost to an unexpected reset), but it's a GAACE_Core-level concern

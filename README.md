@@ -511,6 +511,13 @@ is also attempted automatically at boot** (`setup()`, Section 8), so a
 saved script resumes running on its own after a power cycle or reflash —
 no manual re-load needed.
 
+`SCRIPTSAVE` also saves the slot's interval (`STINT,Script<N>,<mS>`) in
+`/script<N>.cfg`, so a restored script runs at the rate it was saved at
+(clamped to 5 mS..1 h) instead of the 1000 mS default. Set the interval
+first, then save. The on/off state is not saved: a restored script always
+starts running. A script saved before this existed has no `.cfg` and
+restores at 1000 mS.
+
 A script that calls syscalls is saved with the hash of the syscall table it
 was compiled against (`/script<N>.sig`, 4 bytes, next to its `.bin`). On
 restore — at boot or via `SCRIPTRESTORE` — the hash is compared with this
@@ -642,7 +649,7 @@ every registered command and its help string, `HELP,<cmd>` looks up one.
 | `SCRIPTCOMMIT,<slot>,<totalLen>[,<hash>]` | Finalize a buffer assembled via `SCRIPTAPPEND` calls and make the slot runnable |
 | `GSCRIPTLIMITS` | `slots,maxCodeLen,stackSize,varSlots,maxSyscalls` for the script runtime |
 | `GSCRIPTST,<slot>` | `loaded(TRUE\|FALSE),lastStatus` for one script slot |
-| `SCRIPTSAVE,<slot>` | Save a loaded slot's buffer to on-chip flash (survives reboot/power loss) |
+| `SCRIPTSAVE,<slot>` | Save a loaded slot's buffer and its interval (`STINT`) to on-chip flash (survives reboot/power loss) |
 | `SCRIPTRESTORE,<slot>` | Reload a slot's buffer from flash now (also attempted automatically at boot); refused if it was compiled against a different syscall table than this firmware has |
 | `SCRIPTERASE,<slot>` | Delete a slot's saved copy so it is no longer restored (and auto-enabled) at boot; the copy loaded in RAM keeps running until disabled. ACKs if nothing was saved |
 | `GCMDS` | List all commands and help strings |

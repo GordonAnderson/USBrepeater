@@ -492,7 +492,7 @@ Command cmds[] =
   //  stays hardware-agnostic — LittleFS_Program is Teensy-only). Every
   //  slot is attempted at boot (setup(), Section 8), overriding the
   //  compiled-in ADC demo for slot 0 if slot 0 has a saved file.
-  {"SCRIPTSAVE",    CMDfunction, -1, (void *)cmdScriptSave,    NULL, "SCRIPTSAVE,<slot> -- save a loaded script's buffer to flash"},
+  {"SCRIPTSAVE",    CMDfunction, -1, (void *)cmdScriptSave,    NULL, "SCRIPTSAVE,<slot> -- save a loaded script and its interval (STINT) to flash"},
   {"SCRIPTRESTORE", CMDfunction, -1, (void *)cmdScriptRestore, NULL, "SCRIPTRESTORE,<slot> -- reload a slot's buffer from flash"},
   {"SCRIPTERASE",   CMDfunction, -1, (void *)cmdScriptErase,   NULL, "SCRIPTERASE,<slot> -- delete a slot's saved copy from flash (RAM copy untouched)"},
 
@@ -2869,6 +2869,66 @@ static void scriptSigPath(uint8_t slot, char *buf, size_t bufLen)
   snprintf(buf, bufLen, "/script%u.sig", (unsigned)slot);
 }
 
+// A slot's thread settings are saved beside its buffer in "/script<N>.cfg"
+// so a restored script runs at the rate it was saved at, not Thread's default
+// 1000 mS (an analog input controlling a parameter typically wants 10-50 mS,
+// and an unattended install has no host to send STINT after each power-up).
+// Layout, little-endian: [version:u8 = 1][intervalMs:u32]. Later versions may
+// append fields; a reader ignores what it doesn't know. Only the interval is
+// kept, not the enabled flag: a restored script always starts running (see
+// setup(), Section 8), and SCRIPTLOAD leaves a slot disabled, so saving the
+// flag would make "upload, then SCRIPTSAVE" come back stopped. A .bin with no
+// .cfg (saved before this existed) restores at whatever interval the slot has.
+#define SCRIPT_CFG_VERSION      1
+#define SCRIPT_MIN_INTERVAL_MS  5UL         // bounds applied on restore only
+#define SCRIPT_MAX_INTERVAL_MS  3600000UL
+
+static void scriptCfgPath(uint8_t slot, char *buf, size_t bufLen)
+{
+  snprintf(buf, bufLen, "/script%u.cfg", (unsigned)slot);
+}
+
+// Writes the slot's current interval. False if the write failed.
+static bool saveScriptSlotCfg(uint8_t slot)
+{
+  char cfgPath[20];
+  scriptCfgPath(slot, cfgPath, sizeof(cfgPath));
+  scriptFS.remove(cfgPath);
+
+  uint32_t ms = (uint32_t)scripts.slots[slot].getInterval();
+  uint8_t cfg[5] = {SCRIPT_CFG_VERSION, (uint8_t)ms, (uint8_t)(ms >> 8),
+                    (uint8_t)(ms >> 16), (uint8_t)(ms >> 24)};
+  File f = scriptFS.open(cfgPath, FILE_WRITE_BEGIN);
+  if (!f) return false;
+  size_t written = f.write(cfg, sizeof(cfg));
+  f.close();
+  return written == sizeof(cfg);
+}
+
+// Applies a saved interval, if the slot has a readable .cfg. A missing,
+// short, or unknown-version file leaves the slot's interval unchanged; an
+// out-of-range interval is clamped to [SCRIPT_MIN_INTERVAL_MS,
+// SCRIPT_MAX_INTERVAL_MS] rather than trusted.
+static void applyScriptSlotCfg(uint8_t slot)
+{
+  char cfgPath[20];
+  scriptCfgPath(slot, cfgPath, sizeof(cfgPath));
+  if (!scriptFS.exists(cfgPath)) return;
+
+  File f = scriptFS.open(cfgPath, FILE_READ);
+  if (!f) return;
+  uint8_t cfg[5];
+  size_t n = f.readBytes((char *)cfg, sizeof(cfg));
+  f.close();
+  if (n != sizeof(cfg) || cfg[0] < SCRIPT_CFG_VERSION) return;
+
+  unsigned long ms = (unsigned long)cfg[1] | ((unsigned long)cfg[2] << 8) |
+                     ((unsigned long)cfg[3] << 16) | ((unsigned long)cfg[4] << 24);
+  if (ms < SCRIPT_MIN_INTERVAL_MS) ms = SCRIPT_MIN_INTERVAL_MS;
+  if (ms > SCRIPT_MAX_INTERVAL_MS) ms = SCRIPT_MAX_INTERVAL_MS;
+  scripts.slots[slot].setInterval(ms);
+}
+
 // finalizeScriptSlot — identical validation/finalization logic to
 // GAACEScriptRuntime.cpp's cmdScriptCommit(), applied directly to a slot
 // whose buffer was just filled by restoreScriptSlotFromFlash() below
@@ -2946,7 +3006,7 @@ bool saveScriptSlotToFlash(uint8_t slot)
     sig.close();
     if (sigWritten != sizeof(hashBytes)) return false;
   }
-  return true;
+  return saveScriptSlotCfg(slot);
 }
 
 // restoreScriptSlotFromFlash — read a slot's file back into its buffer and
@@ -3002,10 +3062,11 @@ ScriptRestoreResult restoreScriptSlotFromFlash(uint8_t slot)
   if (readBytesN != (size_t)fileSize) return SCRIPT_RESTORE_NONE;
   if (!finalizeScriptSlot(slot, (uint16_t)fileSize)) return SCRIPT_RESTORE_NONE;
   s.syscallHash = savedHash;
+  applyScriptSlotCfg(slot);
   return SCRIPT_RESTORE_OK;
 }
 
-// eraseScriptSlotFromFlash — remove a slot's .bin and .sig. True if neither
+// eraseScriptSlotFromFlash — remove a slot's .bin, .sig and .cfg. True if none
 // exists afterwards (including "nothing was saved"); false only if the
 // filesystem isn't mounted or a removal failed.
 bool eraseScriptSlotFromFlash(uint8_t slot)
@@ -3014,11 +3075,14 @@ bool eraseScriptSlotFromFlash(uint8_t slot)
 
   char path[20];
   char sigPath[20];
+  char cfgPath[20];
   scriptSlotPath(slot, path, sizeof(path));
   scriptSigPath(slot, sigPath, sizeof(sigPath));
+  scriptCfgPath(slot, cfgPath, sizeof(cfgPath));
   if (scriptFS.exists(path))    scriptFS.remove(path);
   if (scriptFS.exists(sigPath)) scriptFS.remove(sigPath);
-  return !scriptFS.exists(path) && !scriptFS.exists(sigPath);
+  if (scriptFS.exists(cfgPath)) scriptFS.remove(cfgPath);
+  return !scriptFS.exists(path) && !scriptFS.exists(sigPath) && !scriptFS.exists(cfgPath);
 }
 
 // =============================================================================
@@ -3369,9 +3433,10 @@ void setup()
   //  its saved file. A slot with no saved file (or a filesystem that fails
   //  to mount) just stays unloaded — except slot 0, which falls back to the
   //  compiled-in ADC demo below, exactly as before this feature existed.
-  //  Restored scripts are left at Thread's own default (enabled=true,
-  //  1000 mS interval, from ScriptRuntime's constructor) so a persisted
-  //  script resumes running on its own at boot — the actual point of
+  //  Restored scripts are left enabled (Thread's default, from
+  //  ScriptRuntime's constructor) and run at the interval saved with them
+  //  in /script<N>.cfg, or the default 1000 mS if there is none, so a
+  //  persisted script resumes running on its own at boot — the actual point of
   //  persistence (e.g. a script that sets up DIO direction on load, per the
   //  user's original motivating use case). This differs deliberately from
   //  the compiled-in demo's explicit enabled=false below, which exists for
