@@ -1480,6 +1480,35 @@ a new constraint.
             tested: actually reordering the syscall table and reflashing
             to confirm `SCRIPTRESTORE` NAKs a now-stale saved script
             (`SCRIPT_RESTORE_STALE`) instead of silently misrunning it.
+- [ ] **A saved script comes back at the default 1000 mS interval; its own
+      interval (and enabled state) aren't saved (noted 2026-11-08).**
+      `SCRIPTSAVE` stores the code and string pool (plus the syscall-table
+      `.sig`), nothing about the slot's thread. At boot `setup()` (Section 5b)
+      restores each slot and leaves it at `Thread`'s defaults: enabled, 1000 mS.
+      That is wrong for the most common intended use -- an analog input
+      controlling a parameter, which wants a much shorter interval (say
+      10-50 mS): the loop would run 20-100x slower after every power cycle
+      until a host sends `STINT,Script<n>,<mS>`, and unattended installs have
+      no host. A script cannot fix this itself: `cmd()` arguments are numbers
+      only, and `STINT` takes the slot's name (`Script1`) as a string.
+      Options, simplest first:
+      1. Save the slot's interval and enabled flag with the script -- e.g. a
+         small `/script<N>.cfg` next to the `.bin`/`.sig` (versioned, so a
+         future field can be added), written by `SCRIPTSAVE` from the thread's
+         *current* state and applied after a successful restore. Saves from
+         before this has no `.cfg` and keep today's behaviour (enabled, 1000 mS).
+      2. `SCRIPTSAVE,<slot>[,<mS>]` taking the interval explicitly (less to
+         get wrong, but the host has to remember to pass it).
+      3. A `set_interval(mS)` syscall acting on the calling slot (puts the
+         setting in the script's source, but changes the syscall table and so
+         its hash, and the runtime must know which slot is calling).
+      Also decide: should a slot that was *stopped* when saved come back
+      stopped? (Today a restored script is always enabled; that is deliberate
+      for a "configure and run" script.) Whatever is chosen: bound the interval
+      to what the main loop and the ADC read can service, and test on hardware
+      with `GTINT,Script<n>` after a power cycle. The MIPS app's Device
+      Scripts dialog has no interval control or "save to flash" button yet
+      either (`SCRIPTSAVE` and `STINT` have to be typed in the Terminal tab).
 - [ ] A general "device just rebooted" notification — raised during design
       discussion as a real gap (a host has no way to know a script's state
       was lost to an unexpected reset), but it's a GAACE_Core-level concern
