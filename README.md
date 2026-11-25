@@ -159,11 +159,11 @@ Each port also has its own name, so a host can tell them apart (set by
 `custom_usb_interface_names` in `platformio.ini`; the same script patches them
 into the Teensy core's `usb_desc.c`):
 
-| Port | USB interfaces | macOS (this Mac) | Name |
+| Port | USB interfaces | macOS port name | Name |
 |---|---|---|---|
-| `Serial` (data port 1) | 0, 1 | `/dev/cu.usbmodem…01` | `GAACE Gateway Data 1` |
-| `SerialUSB1` (control) | 2, 3 | `/dev/cu.usbmodem…03` | `GAACE Gateway Control` |
-| `SerialUSB2` (data port 2) | 4, 5 | `/dev/cu.usbmodem…05` | `GAACE Gateway Data 2` |
+| `Serial` (data port 1) | 0, 1 | `/dev/cu.usbmodem<serial>1` | `GAACE Gateway Data 1` |
+| `SerialUSB1` (control) | 2, 3 | `/dev/cu.usbmodem<serial>3` | `GAACE Gateway Control` |
+| `SerialUSB2` (data port 2) | 4, 5 | `/dev/cu.usbmodem<serial>5` | `GAACE Gateway Data 2` |
 
 These are the USB interface strings (and, for Windows, the interface-association
 "function" strings). macOS shows them only in the I/O Registry (`ioreg`, on each
@@ -171,9 +171,17 @@ port's USB interface; System Information doesn't list interfaces); Windows shows
 them in Device Manager as the port's "Bus reported device description". A
 program only sees them if it reads that property itself: a port's usual
 "description" (Qt's `QSerialPortInfo::description()`, pyserial's `description`)
-is the device's product string, so it says `GAACE Gateway` for all three. On
-macOS the port name's last two digits are the interface number (01, 03, 05),
-which is fixed.
+is the device's product string, so it says `GAACE Gateway` for all three.
+
+**Telling the ports apart on macOS: the port name's last digit.** macOS names
+each port `usbmodem` + the board's USB serial number + the number of that
+port's data interface: 1 = data port 1, 3 = control, 5 = data port 2 (this
+board, serial `21142560`: `/dev/cu.usbmodem211425601`, `…3`, `…5`). That
+holds for every Gateway and doesn't change between plug-ins or reboots; only
+the serial-number part differs from board to board. It would change only if
+the firmware's USB layout changed (`USB_TRIPLE_SERIAL` in `platformio.ini`).
+Windows assigns COM numbers its own way, so there the order of COM numbers
+means nothing; use the interface name or ask the port instead.
 
 ## Architecture
 
