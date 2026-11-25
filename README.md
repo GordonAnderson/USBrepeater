@@ -83,8 +83,13 @@ or after 1 s with no complete reply (`GARBSTAT` counts these). When the
 same requester sends its next command and nobody else is waiting, it goes
 out straight away, so a single host app sees no extra delay. Output the
 device sends on its own goes to whoever last talked to it. Lines are
-forwarded when complete, not byte by byte: right for the ASCII command
-traffic hosts send, not for binary transfers (none are used).
+forwarded when complete (ended by `\n` or `\r`), not byte by byte: right
+for the ASCII command traffic hosts send, not for binary transfers (none
+are used). A terminal that sends keystrokes as they're typed works too:
+after 50 ms without a key, the typed part is passed on without waiting
+for a reply, the rest of the line follows straight away, and the Enter
+waits for the reply as usual. `GARBLOG,<slot>` shows the slot's last 16
+exchanges (what was sent, by whom, how long it took, how it ended).
 
 Measured on real hardware (2026-11-05): about 6 ms per command over USB
 and 10 ms over TCP for a single host; with four requesters on two devices
@@ -618,6 +623,7 @@ every registered command and its help string, `HELP,<cmd>` looks up one.
 | `GADCDEV` / `SADCDEV,<n\|name>` | Get/set what `ADCThread`/the script demo targets: a slot (1-8) or an instrument name (its `GNAME`; follows it between connectors). `GADCDEV` replies `<setting>,<effective slot>`, e.g. `QUAD,1` (effective 0 = not connected). Setting a slot clears the name |
 | `GDEVSTAT` | One row per slot (1-8): `dev,connected,bytesWaiting,bytesDropped` |
 | `GARBSTAT` | Per-slot arbiter: `slot,busy,owner,exchanges,timeouts`. `owner` is who has the open exchange (`USB1`, `USB2`, `ETH`, `INT` = the repeater's ADC sends, `SCRIPT` = a script's `dcmd()`, or `-`); `exchanges`/`timeouts` count since boot. A rising `timeouts` means the device isn't answering some commands within 1 s |
+| `GARBLOG,<slot>` | The slot's last 16 exchanges, oldest first: `msAgo,src,durMs,firstRxMs,rxBytes,end,cmd,reply` (`cmd`/`reply` first 27 characters, control characters as `\r`, `\n`, `\xNN`). `end`: `Q` reply + 20 ms quiet, `F` sender's next line sent at once, `R` script request, `T` timeout (no reply line in 1 s), `P` part of a typed line, `B` blank line, `X` device unplugged, `O` still open |
 | `GDEVPATH` | Diagnostic: one row per slot (`slot,connected,connector,innerPort,vid,pid,speed,addr,hubAddr,hubPort`), then one per hub driver (`hub,connected,vid,pid,addr,hubAddr,hubPort,stallRecoveries`). `connector` is the board connector (1-4, matches the labels); `innerPort` is the port on a device's own internal hub, 0 if none. Also lists any attached device left without a slot, as slot 0 |
 | `GDEVLIST` | One row per occupied slot: `slot,connector,role,vid,pid,state,name`. `role` `MAIN` (slot 1-4) or `EXTRA` (5-8); `state` `NAMED`/`PENDING`/`NONAME`/`NOTQUERIED`; `name` from the device's `GNAME`, asked on attach |
 | `GDEVSLOT,<name>` | Slot (1-8) of the device whose `GNAME` is `<name>` (case-insensitive); NAK if none |

@@ -672,6 +672,19 @@ Facts this design relies on (per the user):
      detected, 21 recoveries (about 3 per stalled unplug, one per hub
      request, so about 0.3 s of extra delay). `GDEVPATH`'s hub rows now
      end with a `stallRecoveries` count.
+   - **Fixed (2026-11-25): typing commands in a terminal took seconds.**
+     The MIPS host app's terminal sends each keystroke as it's typed and
+     Enter as a lone `\r`. The arbiter forwarded each keystroke after 50 ms
+     as a "line" and waited 1 s for a reply the device never gives, so
+     `GVER` typed by hand took about 4 s (`GARBLOG,1` showed `"G"`,`"V"`
+     timing out, then `"ER\r"` answered in 20 ms); same with an RF
+     generator. Now `\r` ends a line like `\n` (a `\n` right behind it is
+     kept with it), a partial line opens no reply wait and the rest of the
+     sender's line follows at once (ahead of other requesters), and the
+     Enter that finishes it waits for the reply. Tested: typed `GVER` with
+     150, 300 and 1500 ms between keys answered 0.8 ms after Enter; whole
+     lines ending `\r`, `\r\n`, `\n` 0.7-0.9 ms; no timeouts. Added
+     `GARBLOG,<slot>` (last 16 exchanges per slot) to find it.
    - **Fixed (2026-11-06): commands to instruments went out 3.5 ms late.**
      USBHost_t36 holds a partial USB packet for `DEFAULT_WRITE_TIMEOUT`
      (3500 us) after the last byte, and a command line is always a partial

@@ -330,6 +330,7 @@ void        cmdGetDevList(void);   // Section 6 (device names, GNAME on attach)
 void        cmdGetDevSlot(void);   // Section 6
 void        cmdDevIdent(void);     // Section 6
 void        cmdGetArbStat(void);   // Section 6 (per-slot arbiter)
+void        cmdGetArbLog(void);    // Section 6 (per-slot arbiter)
 static void cmdGetDioDir(void);
 static void cmdSetDioDir(void);
 static void cmdGetDout(void);
@@ -419,6 +420,7 @@ Command cmds[] =
   {"GDEVSLOT", CMDfunction,  1, (void *)cmdGetDevSlot,     NULL, "Slot (" DEVPORT_RANGE_STR ") of the device whose GNAME is <name>, NAK if none"},
   {"DEVIDENT", CMDfunction,  1, (void *)cmdDevIdent,       NULL, "Ask slot <n>'s device its GNAME again (also queries an extra slot 5-8)"},
   {"GARBSTAT", CMDfunction,  0, (void *)cmdGetArbStat,     NULL, "Per-slot arbiter: slot,busy,owner,exchanges,timeouts"},
+  {"GARBLOG",  CMDfunction,  1, (void *)cmdGetArbLog,      NULL, "Slot's last 16 exchanges: msAgo,src,durMs,firstRxMs,rxBytes,end,cmd,reply"},
   {"GLINK2",   CMDfunction,  0, (void *)cmdGetLink2,       NULL, "ActiveDevice2's USB connection state"},
 
   // ── Ethernet (control port + one dedicated data port per device; Section 6c) ─
@@ -2010,10 +2012,13 @@ void cmdDevIdent(void)
 // Fast path: if the requester that owns the open exchange already has its
 // next line ready and nobody else is waiting, it's sent as soon as the reply
 // newline arrives, without the quiet gap, so a single host app sees no
-// added latency per command. Lines are forwarded once complete (newline,
-// ARB_LINE_MAX bytes, or ARB_PARTIAL_MS of silence for a host that doesn't
-// end its lines), never byte by byte: fine for the ASCII command traffic
-// the host apps send (per the user, no binary/firmware transfers).
+// added latency per command. Lines are forwarded once complete ('\n' or
+// '\r', ARB_LINE_MAX bytes, or ARB_PARTIAL_MS of silence), never byte by
+// byte: fine for the ASCII command traffic the host apps send (per the
+// user, no binary/firmware transfers). A line forwarded after the silence
+// is part of a line (a terminal sending keystrokes as typed): it opens no
+// wait for a reply, and the rest of that sender's line follows straight
+// away (see arbService()).
 //
 // Bytes the device sends with no exchange open (unsolicited output) go to
 // whoever last owned an exchange on it, if that requester still targets the
@@ -2049,18 +2054,53 @@ struct LineSrc
   char     buf[ARB_LINE_MAX];
 };
 
+// Per-slot exchange log for GARBLOG: the last ARB_LOG_N exchanges, with the
+// line sent, who sent it, how long it took, and how it ended. For finding
+// which host command stalls a slot (a timeout means no reply newline within
+// ARB_TIMEOUT_MS, and the slot waits that long before serving anyone else).
+#define ARB_LOG_N    16
+#define ARB_LOG_TXT  28
+struct ArbLog
+{
+  uint32_t sentMs;
+  uint16_t durMs;          // 0xFFFF while the exchange is open
+  uint16_t firstRxMs;      // first reply byte after sending; 0xFFFF = none yet
+  uint16_t rxBytes;
+  uint8_t  src;
+  char     how;            // Q newline+quiet, F fast path, R script request, T timeout, B blank, X device gone
+  char     cmd[ARB_LOG_TXT];
+  char     reply[ARB_LOG_TXT];
+};
+
 struct Arb
 {
   uint8_t  owner     = SRC_NONE;   // requester whose exchange is open
   uint8_t  lastOwner = SRC_NONE;   // last non-internal owner: gets unsolicited output
   uint8_t  rr        = 0;          // round-robin start among the slot's requesters
   bool     sawNL     = false;      // the open exchange's reply newline has arrived
+  bool     partial   = false;      // the open exchange sent part of a line (no '\r'/'\n' yet)
+  uint8_t  partialSrc = SRC_NONE;  // sender whose line is half sent: its lone '\r' still gets a reply
   uint8_t  eatNext   = 0;          // drop this byte if it's the next one (a settled script reply's "\n\r" tail)
   uint32_t sentMs    = 0;
   uint32_t lastRxMs  = 0;
   uint32_t exchanges = 0;          // since boot
   uint32_t timeouts  = 0;          // since boot
+  ArbLog   log[ARB_LOG_N] = {};
+  uint8_t  logNext   = 0;          // slot to fill next
+  int8_t   logOpen   = -1;         // entry of the open exchange
 };
+
+// Append text to a log field, showing control characters as \r, \n, \xNN.
+static void arbLogAppend(char *dst, uint8_t c)
+{
+  size_t n = strlen(dst);
+  char tmp[5];
+  if (c == '\r')      strcpy(tmp, "\\r");
+  else if (c == '\n') strcpy(tmp, "\\n");
+  else if (c < 0x20 || c >= 0x7F) snprintf(tmp, sizeof(tmp), "\\x%02X", c);
+  else { tmp[0] = (char)c; tmp[1] = 0; }
+  if (n + strlen(tmp) < ARB_LOG_TXT) strcat(dst, tmp);
+}
 
 LineSrc lineSrc[SRC_COUNT];
 Arb     arb[DEVPORT_COUNT];
@@ -2194,6 +2234,13 @@ static void devPortDrainIncoming(uint8_t idx)
     if (a.owner != SRC_NONE)
     {
       a.lastRxMs = millis();
+      if (a.logOpen >= 0)
+      {
+        ArbLog &lg = a.log[a.logOpen];
+        if (lg.firstRxMs == 0xFFFF) lg.firstRxMs = (uint16_t)min((uint32_t)0xFFFE, a.lastRxMs - lg.sentMs);
+        lg.rxBytes++;
+        arbLogAppend(lg.reply, repeaterBuf[i]);
+      }
       if (repeaterBuf[i] == '\n') a.sawNL = true;
       if (isReqSrc(a.owner)) { reqCaptureByte(a.owner, repeaterBuf[i]); continue; }  // a script's reply
       if (isIntSrc(a.owner)) continue;   // reply to the repeater's own command: not for any host
@@ -2279,7 +2326,12 @@ static void srcFill(uint8_t src)
       if (c < 0) break;
       L.buf[L.len++] = (char)c;
       L.lastByteMs = now;
-      if (c == '\n' || L.len >= ARB_LINE_MAX) { L.ready = true; break; }
+      // '\r' ends a line as well as '\n': terminals (the MIPS host app's
+      // included) send Enter as a lone '\r'. A '\n' right behind it is kept
+      // with the line rather than sent on its own.
+      if (c == '\r' && L.len < ARB_LINE_MAX && st->available() > 0 && st->peek() == '\n')
+        L.buf[L.len++] = (char)st->read();
+      if (c == '\n' || c == '\r' || L.len >= ARB_LINE_MAX) { L.ready = true; break; }
     }
   }
   if (!L.ready && L.len > 0 && (now - L.lastByteMs) >= ARB_PARTIAL_MS) L.ready = true;
@@ -2295,6 +2347,18 @@ static void arbSend(uint8_t idx, uint8_t src)
   bool blank = true;
   for (uint16_t k = 0; k < L.len; k++)
     if (L.buf[k] != '\r' && L.buf[k] != '\n' && L.buf[k] != ' ' && L.buf[k] != '\t') { blank = false; break; }
+  // The Enter that finishes a half-sent line is "blank" on its own, but the
+  // device answers it: wait for that reply like any other command.
+  if (blank && a.partialSrc == src) blank = false;
+  a.partialSrc = SRC_NONE;
+
+  ArbLog &lg = a.log[a.logNext];
+  memset(&lg, 0, sizeof(lg));
+  lg.sentMs = millis(); lg.src = src; lg.durMs = 0xFFFF; lg.firstRxMs = 0xFFFF;
+  for (uint16_t k = 0; k < L.len; k++) arbLogAppend(lg.cmd, (uint8_t)L.buf[k]);
+  if (blank) { lg.how = 'B'; lg.durMs = 0; a.logOpen = -1; }
+  else       { a.logOpen = (int8_t)a.logNext; }
+  a.logNext = (uint8_t)((a.logNext + 1) % ARB_LOG_N);
 
   if (blank)
   {
@@ -2303,6 +2367,8 @@ static void arbSend(uint8_t idx, uint8_t src)
   else
   {
     a.owner    = src;
+    a.partial  = (L.buf[L.len - 1] != '\n' && L.buf[L.len - 1] != '\r');
+    if (a.partial) a.partialSrc = src;
     a.sentMs   = millis();
     a.lastRxMs = a.sentMs;
     a.sawNL    = false;
@@ -2338,6 +2404,7 @@ static void arbService(uint8_t idx)
   Arb &a = arb[idx];
   if (!slotConnected(idx))
   {
+    if (a.logOpen >= 0) { a.log[a.logOpen].how = 'X'; a.logOpen = -1; }
     if (isReqSrc(a.owner)) reqFinish(a.owner, true);   // device gone mid-request
     a.owner = SRC_NONE;
     return;
@@ -2354,7 +2421,20 @@ static void arbService(uint8_t idx)
       if (src != owner && waiting(src)) { othersWaiting = true; break; }
 
     bool done = false, fast = false, timedOut = false;
-    if (a.sawNL)
+    if (a.partial)
+    {
+      // Part of a line, forwarded because the sender paused (a terminal
+      // sending keystrokes as they're typed). The device won't answer half a
+      // command, so don't wait for a reply: the rest of the sender's line
+      // goes straight through when it arrives (ahead of other requesters, so
+      // nobody's line lands in the middle of it), and if the sender goes
+      // quiet the slot is released after ARB_TIMEOUT_MS without counting a
+      // timeout. Was: each keystroke waited the full ARB_TIMEOUT_MS for a
+      // reply (2026-11-25, typing GVER took about 2 s).
+      if (waiting(owner))                               { done = true; fast = true; }
+      else if ((now - a.sentMs) >= ARB_TIMEOUT_MS)      done = true;
+    }
+    else if (a.sawNL)
     {
       // A script's request is a single-line command: its reply is complete
       // at the first newline, so the script isn't held for the quiet gap.
@@ -2362,9 +2442,16 @@ static void arbService(uint8_t idx)
       else if ((now - a.lastRxMs) >= ARB_QUIET_MS) done = true;
       else if (waiting(owner) && !othersWaiting) { done = true; fast = true; }
     }
-    if (!done && (now - a.sentMs) >= ARB_TIMEOUT_MS) { done = true; timedOut = true; a.timeouts++; }
+    if (!done && !a.partial && (now - a.sentMs) >= ARB_TIMEOUT_MS) { done = true; timedOut = true; a.timeouts++; }
     if (!done) return;
 
+    if (a.logOpen >= 0)
+    {
+      ArbLog &lg = a.log[a.logOpen];
+      lg.durMs = (uint16_t)min((uint32_t)0xFFFE, now - lg.sentMs);
+      lg.how   = a.partial ? 'P' : timedOut ? 'T' : fast ? 'F' : isReqSrc(owner) ? 'R' : 'Q';
+      a.logOpen = -1;
+    }
     if (!isOwnSrc(owner)) a.lastOwner = owner;
     if (isReqSrc(owner)) reqFinish(owner, timedOut);
     a.owner = SRC_NONE;
@@ -2394,6 +2481,28 @@ static const char *srcName(uint8_t src)
   if (src < SRC_INT0)  return "ETH";
   if (src < SRC_REQ0)  return "INT";
   return "SCRIPT";
+}
+
+// GARBLOG,<slot> — the slot's last ARB_LOG_N exchanges, oldest first.
+void cmdGetArbLog(void)
+{
+  int slot;
+  if (!cp.getValue(&slot, 1, DEVPORT_COUNT)) { cp.sendNAK(ERR_BADARG); return; }
+  Arb &a = arb[slot - 1];
+  uint32_t now = millis();
+  cp.sendACK(false);
+  cp.println("#msAgo,src,durMs,firstRxMs,rxBytes,end,cmd,reply  (end: Q quiet, F fast, R script, T timeout, P part of a line, B blank, X gone, O open)");
+  for (uint8_t k = 0; k < ARB_LOG_N; k++)
+  {
+    ArbLog &lg = a.log[(a.logNext + k) % ARB_LOG_N];
+    if (lg.src == 0 && lg.sentMs == 0 && lg.cmd[0] == 0) continue;   // never used
+    char b[150];
+    snprintf(b, sizeof(b), "%lu,%s,%d,%d,%u,%c,\"%s\",\"%s\"",
+      (unsigned long)(now - lg.sentMs), srcName(lg.src),
+      lg.durMs == 0xFFFF ? -1 : (int)lg.durMs, lg.firstRxMs == 0xFFFF ? -1 : (int)lg.firstRxMs,
+      lg.rxBytes, lg.durMs == 0xFFFF ? 'O' : lg.how, lg.cmd, lg.reply);
+    cp.println(b);
+  }
 }
 
 void cmdGetArbStat(void)
