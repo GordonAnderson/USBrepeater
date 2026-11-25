@@ -155,6 +155,24 @@ ports — see
 descriptor has one Manufacturer/Product string for the whole composite device,
 not one per port; the script applies the values to the Teensy core at build time).
 
+Each port also has its own name, so a host can tell them apart (set by
+`custom_usb_interface_names` in `platformio.ini`; the same script patches them
+into the Teensy core's `usb_desc.c`):
+
+| Port | USB interfaces | macOS (this Mac) | Name |
+|---|---|---|---|
+| `Serial` (data port 1) | 0, 1 | `/dev/cu.usbmodem…01` | `GAACE Gateway Data 1` |
+| `SerialUSB1` (control) | 2, 3 | `/dev/cu.usbmodem…03` | `GAACE Gateway Control` |
+| `SerialUSB2` (data port 2) | 4, 5 | `/dev/cu.usbmodem…05` | `GAACE Gateway Data 2` |
+
+These are the USB interface strings (and, for Windows, the interface-association
+"function" strings). macOS shows them in System Information and the I/O
+Registry; Windows shows them in Device Manager as the port's "Bus reported device
+description". A program only sees them if it reads that property: port-listing
+calls that report the device's product string (e.g. pyserial's `description`)
+still say `GAACE Gateway` for all three. On macOS the port name's last two
+digits are the interface number (01, 03, 05), which is fixed.
+
 ## Architecture
 
 ### Modes
