@@ -672,6 +672,19 @@ Facts this design relies on (per the user):
      detected, 21 recoveries (about 3 per stalled unplug, one per hub
      request, so about 0.3 s of extra delay). `GDEVPATH`'s hub rows now
      end with a `stallRecoveries` count.
+   - **Fixed (2026-11-25): long control-port replies over TCP lost their end.**
+     Ethernet test on the second unit (serial 21630090, DHCP 192.168.68.68):
+     `GETHSTAT` stopped after the first data-port flag, `GDEVPATH` gave 95 of
+     ~500 bytes, `GARBSTAT` two rows. Command replies are many small
+     `print()`s; QNEthernet queues each as its own piece of a TCP segment,
+     lwIP allows 16 (`TCP_SND_QUEUELEN`), and QNEthernet drops the rest
+     without notice. Now the control client goes through `CtrlTcpStream`
+     (Section 6c), which collects a reply and sends it in one write from
+     `loop()`. Tested: `GETHSTAT` (all 8 data flags), `GARBSTAT`, `GDEVPATH`
+     complete; `GCMDS` (5523 bytes) identical over TCP and USB. Control port
+     `GVER` 3.2 ms median, data port 5001 to the MIPS 3.9 ms median, typed
+     `GVER` on 5001 answered 2.6 ms after Enter. Data ports already wrote
+     whole chunks and weren't affected.
    - **Fixed (2026-11-25): typing commands in a terminal took seconds.**
      The MIPS host app's terminal sends each keystroke as it's typed and
      Enter as a lone `\r`. The arbiter forwarded each keystroke after 50 ms

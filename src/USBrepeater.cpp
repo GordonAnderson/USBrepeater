@@ -3246,6 +3246,57 @@ EthernetServer ethDataServer[DEVPORT_COUNT];        // port i bound from data.Et
 EthernetClient ethCtrlClient;
 EthernetClient ethDataClient[DEVPORT_COUNT];
 
+// The command processor talks to the TCP control client through this buffer,
+// not directly. Command replies are written as many small print()s, and
+// QNEthernet turns each write into its own queued piece of a TCP segment;
+// lwIP allows only TCP_SND_QUEUELEN (16) of those before a send, then
+// rejects further writes, which QNEthernet drops without notice. So any
+// reply longer than ~16 prints lost its end over TCP (GETHSTAT stopped after
+// the first data-port flag, GDEVPATH gave 95 of ~1000 bytes; 2026-11-25).
+// Here a reply collects in RAM and goes out as one write in pump(), called
+// from loop() after the commands run (and when the buffer fills).
+class CtrlTcpStream : public Stream
+{
+public:
+  explicit CtrlTcpStream(EthernetClient &c) : client(c) {}
+  int    available() override { return client.available(); }
+  int    read()      override { return client.read(); }
+  int    peek()      override { return client.peek(); }
+  size_t write(uint8_t b) override { return write(&b, 1); }
+  size_t write(const uint8_t *buf, size_t size) override
+  {
+    for (size_t k = 0; k < size; k++)
+    {
+      if (len == sizeof(out)) pump();
+      out[len++] = buf[k];
+    }
+    return size;
+  }
+  void flush() override { pump(); }
+  // Send everything collected so far, retrying for up to 200 ms while the
+  // connection's send buffer is full; anything left after that is dropped.
+  void pump()
+  {
+    if (len == 0) return;
+    if (!client || !client.connected()) { len = 0; return; }
+    size_t sent = 0;
+    elapsedMillis t;
+    while (sent < len && t < 200)
+    {
+      size_t n = client.write(out + sent, len - sent);
+      if (n == 0) { client.flush(); Ethernet.loop(); continue; }
+      sent += n;
+    }
+    len = 0;
+    client.flush();   // push it out now, not on lwIP's 250 ms timer
+  }
+private:
+  EthernetClient &client;
+  uint8_t out[2048];
+  size_t  len = 0;
+};
+CtrlTcpStream ethCtrlStream(ethCtrlClient);
+
 static void EthernetSetup(void)
 {
   if (data.EthDHCP)
@@ -3265,7 +3316,7 @@ static void EthernetSetup(void)
 
   // Registered once; see the comment above for why the same object is
   // reused across reconnects instead of re-registering a new one.
-  cp.registerStream(&ethCtrlClient);
+  cp.registerStream(&ethCtrlStream);
 }
 
 static void EthernetUpdate(void)
@@ -3592,10 +3643,11 @@ void loop()
 {
   cp.processStreams();
   cp.processCommands();
-  // Push any command reply to the TCP control client out now: QNEthernet
-  // otherwise holds it for lwIP's 250 ms TCP timer (measured ~250 ms per
-  // command on port 5000). Cheap when there's nothing queued.
-  if (ethCtrlClient && ethCtrlClient.connected()) ethCtrlClient.flush();
+  // Send any command reply to the TCP control client now, in one write:
+  // QNEthernet would otherwise hold it for lwIP's 250 ms TCP timer (measured
+  // ~250 ms per command on port 5000), and many small writes overflow lwIP's
+  // send queue (see CtrlTcpStream). Cheap when there's nothing queued.
+  ethCtrlStream.pump();   // send the TCP control client's reply in one piece (Section 6c)
   control.run();
   modeTable[currentMode].loop();
   scripts.poll();   // resume any script whose dcmd()/dcmdf() reply has arrived (Section 6e)
