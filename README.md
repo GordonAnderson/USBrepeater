@@ -166,12 +166,14 @@ into the Teensy core's `usb_desc.c`):
 | `SerialUSB2` (data port 2) | 4, 5 | `/dev/cu.usbmodem…05` | `GAACE Gateway Data 2` |
 
 These are the USB interface strings (and, for Windows, the interface-association
-"function" strings). macOS shows them in System Information and the I/O
-Registry; Windows shows them in Device Manager as the port's "Bus reported device
-description". A program only sees them if it reads that property: port-listing
-calls that report the device's product string (e.g. pyserial's `description`)
-still say `GAACE Gateway` for all three. On macOS the port name's last two
-digits are the interface number (01, 03, 05), which is fixed.
+"function" strings). macOS shows them only in the I/O Registry (`ioreg`, on each
+port's USB interface; System Information doesn't list interfaces); Windows shows
+them in Device Manager as the port's "Bus reported device description". A
+program only sees them if it reads that property itself: a port's usual
+"description" (Qt's `QSerialPortInfo::description()`, pyserial's `description`)
+is the device's product string, so it says `GAACE Gateway` for all three. On
+macOS the port name's last two digits are the interface number (01, 03, 05),
+which is fixed.
 
 ## Architecture
 
