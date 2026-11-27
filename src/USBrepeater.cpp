@@ -1787,6 +1787,14 @@ DevPort devPort[DEVPORT_COUNT];
 // still be booting) up to IDENT_MAX_TRIES, then NONAME. Lines that aren't an
 // ACK/NAK reply (a boot banner, an echoed command) are ignored.
 //
+// A device that never answered at all (not even a NAK) is still asked again,
+// once every IDENT_LATE_RETRY_MS, until IDENT_GIVEUP_MS after it attached: a
+// MIPS can take longer than the first ~8 s to boot (about 11 s with no SD
+// card, longer with a long startup delay). The slot stays usable (NONAME)
+// between these late queries; each one holds it out for at most
+// IDENT_REPLY_TIMEOUT_MS, and only starts when the slot's arbiter is idle.
+// A device that NAKs GNAME is not asked again. DEVIDENT starts over.
+//
 // While identification is PENDING the slot is held out of everything else:
 // its incoming bytes go to the reply parser instead of its ring buffer, and
 // host passthrough, ADCUpdate() and script sends to it wait (slotReady()).
@@ -1800,7 +1808,9 @@ DevPort devPort[DEVPORT_COUNT];
 #define IDENT_FIRST_DELAY_MS   300   // after attach, before the first GNAME
 #define IDENT_REPLY_TIMEOUT_MS 300   // wait this long for each reply
 #define IDENT_RETRY_MS         700   // gap before retrying a query that got no reply
-#define IDENT_MAX_TRIES        8     // ~8 s in total, enough for a MIPS to boot
+#define IDENT_MAX_TRIES        8     // ~8 s of fast retries after attach
+#define IDENT_LATE_RETRY_MS    2000  // then one query this often for a device that never answered
+#define IDENT_GIVEUP_MS        120000 // until this long after attach (MIPS startup delay is up to 100 s)
 #define DEV_NAME_LEN           24
 
 enum IdentState : uint8_t
@@ -1817,6 +1827,8 @@ struct DevIdent
   IdentState state      = IDENT_EMPTY;
   uint8_t    tries      = 0;
   bool       awaiting   = false;   // a GNAME is outstanding
+  bool       silent     = false;   // NONAME because it never answered: late retries apply
+  uint32_t   giveUpMs   = 0;       // no late retries after this
   uint8_t    eatChar    = 0;       // reply settled on one line-ending char: drop the other if it's next
   uint32_t   nextMs     = 0;       // when to send the next GNAME
   uint32_t   deadlineMs = 0;       // when the outstanding one times out
@@ -1841,9 +1853,11 @@ static void identStart(uint8_t idx, bool force)
   id.awaiting = false;
   id.eatChar  = 0;
   id.lineLen  = 0;
+  id.silent   = false;
   if (!force && idx >= 4) { id.state = IDENT_SKIPPED; return; }
-  id.state  = IDENT_PENDING;
-  id.nextMs = millis() + IDENT_FIRST_DELAY_MS;
+  id.state    = IDENT_PENDING;
+  id.nextMs   = millis() + IDENT_FIRST_DELAY_MS;
+  id.giveUpMs = millis() + IDENT_GIVEUP_MS;
 }
 
 static bool arbIdle(uint8_t idx);   // per-slot arbiter, defined below
@@ -1852,12 +1866,24 @@ static bool arbIdle(uint8_t idx);   // per-slot arbiter, defined below
 static void identPoll(uint8_t idx)
 {
   DevIdent &id = devIdent[idx];
+  uint32_t now = millis();
+
+  // Late retry for a device that never answered: one more query, when due
+  // and nobody is mid-exchange with it.
+  if (id.state == IDENT_NONAME && id.silent)
+  {
+    if ((int32_t)(now - id.giveUpMs) >= 0) { id.silent = false; return; }
+    if ((int32_t)(now - id.nextMs) < 0 || !arbIdle(idx)) return;
+    id.state    = IDENT_PENDING;
+    id.tries    = IDENT_MAX_TRIES - 1;   // a single query
+    id.awaiting = false;
+    id.lineLen  = 0;
+  }
   if (id.state != IDENT_PENDING) return;
 
   SlotSerial *s = slotSerial(idx);
   if (s == NULL || !(bool)(*s)) return;   // detach is handled by devPortUpdateConnection()
 
-  uint32_t now = millis();
   if (!id.awaiting)
   {
     if ((int32_t)(now - id.nextMs) < 0) return;
@@ -1871,7 +1897,12 @@ static void identPoll(uint8_t idx)
   else if ((int32_t)(now - id.deadlineMs) >= 0)
   {
     id.awaiting = false;
-    if (id.tries >= IDENT_MAX_TRIES) id.state = IDENT_NONAME;
+    if (id.tries >= IDENT_MAX_TRIES)
+    {
+      id.state  = IDENT_NONAME;
+      id.silent = true;                  // never answered: try again later
+      id.nextMs = now + IDENT_LATE_RETRY_MS;
+    }
     else id.nextMs = now + IDENT_RETRY_MS;
   }
 }
@@ -1905,11 +1936,13 @@ static void identFeed(uint8_t idx, uint8_t b)
     for (int i = (int)strlen(id.name) - 1; i >= 0 && id.name[i] == ' '; i--) id.name[i] = '\0';
     id.state = (id.name[0] != '\0') ? IDENT_NAMED : IDENT_NONAME;
     id.awaiting = false;
+    id.silent   = false;
   }
   else if ((uint8_t)id.line[0] == 0x15)
   {
     id.state = IDENT_NONAME;
     id.awaiting = false;
+    id.silent   = false;   // answers, just isn't a GAACE device: don't ask again
   }
   // anything else (unsolicited output, echoed "GNAME"): keep waiting
 }

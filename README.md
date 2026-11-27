@@ -286,7 +286,11 @@ slot 1-4, the repeater sends it `GNAME` (every GAACE device answers with
 its system name) and retries for about 8 s while a MIPS boots. The reply
 is swallowed, never forwarded. While that's in progress (typically well
 under a second) the slot is held out of passthrough, ADC and script sends;
-host bytes simply wait. Slots 5-8 (a MIPS's RS-485 temperature-controller
+host bytes simply wait. A device that hasn't answered at all by then
+(a MIPS with no SD card takes about 11 s to boot, longer with a long
+startup delay) is marked `NONAME` but still asked once every 2 s, for up
+to 2 minutes after it was plugged in; the slot works normally between
+those queries, and each holds it for at most 0.3 s. Slots 5-8 (a MIPS's RS-485 temperature-controller
 adapter) are not queried, so `GNAME` never goes out onto that RS-485 bus.
 
 ```
@@ -296,8 +300,8 @@ GDEVLIST          -> #slot,connector,role,vid,pid,state,name
 GDEVSLOT,QUAD     -> 1          (case-insensitive; NAK if no such name)
 ```
 
-`state` is `NAMED`, `PENDING` (still asking), `NONAME` (NAKed `GNAME` or
-never answered: not a GAACE device) or `NOTQUERIED` (slot 5-8).
+`state` is `NAMED`, `PENDING` (still asking), `NONAME` (NAKed `GNAME`, or
+never answered within 2 minutes: not a GAACE device) or `NOTQUERIED` (slot 5-8).
 `DEVIDENT,<slot>` asks again, for example after renaming an instrument
 with `SNAME` through the passthrough; on a slot 5-8 it forces a query.
 If two devices report the same name, `GDEVSLOT` returns the lower slot.
